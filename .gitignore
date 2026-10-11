@@ -12,3 +12,8 @@ plans/
 .vscode/
 htmlcov/
 .coverage
+.claude/
+*.pdf
+experiments/
+fault_tolerance.md
+upgrade.md

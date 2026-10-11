@@ -9,6 +9,8 @@ usage() {
   echo "Usage: $0 <command> [options]"
   echo ""
   echo "Commands:"
+  echo "  build          Build only the axo-endpoint node image and the"
+  echo "                 axo-runner image (no compose services touched)"
   echo "  up [--build]   Start all services (add --build to rebuild compose"
   echo "                 images plus the axo-endpoint node image used for"
   echo "                 dynamically-launched endpoints, and pre-build the"
@@ -30,7 +32,37 @@ BASE_CMD=(docker compose
   --env-file "$COMPOSE_ENV_FILE"
 )
 
+build_node_images() {
+  # Bring AXO_ENDPOINT_DOCKERFILE/AXO_ENDPOINT_IMAGE/runner vars into
+  # the shell -- plain `docker build` below doesn't get compose's
+  # --env-file substitution, so the env file needs sourcing directly.
+  set -a
+  # shellcheck disable=SC1090
+  source "$COMPOSE_ENV_FILE"
+  set +a
+  docker build \
+    --file "${SCRIPT_DIR}/${AXO_ENDPOINT_DOCKERFILE:-Dockerfile}" \
+    --tag "${AXO_ENDPOINT_IMAGE:-axo-endpoint:local}" \
+    "$SCRIPT_DIR"
+
+  # Matches ContainerSummoner._runner_image()'s own tag convention
+  # (AXO_ENDPOINT_CONTAINER_RUNNER_IMAGE:py<python_version>) -- keep
+  # AXO_ENDPOINT_RUNNER_PYTHON_VERSION in sync with whatever
+  # python_version your functions actually register with (default
+  # "3.11") if you rely on this pre-build to cover them.
+  docker build \
+    --file "${SCRIPT_DIR}/axo_endpoint/runner/Dockerfile" \
+    --tag "${AXO_ENDPOINT_RUNNER_IMAGE:-axo-runner}:py${AXO_ENDPOINT_RUNNER_PYTHON_VERSION:-3.11}" \
+    --build-arg "PYTHON_VERSION=${AXO_ENDPOINT_RUNNER_PYTHON_VERSION:-3.11}" \
+    "$SCRIPT_DIR"
+}
+
 case "$CMD" in
+  build)
+    # Builds only the images compose never builds itself (see `up` below):
+    # the axo-endpoint node image and the axo-runner image.
+    build_node_images
+    ;;
   up)
     # --build rebuilds compose services (axo-vem, ...) via the flag passed
     # straight through in "$@" below, PLUS two images compose can never
@@ -53,28 +85,7 @@ case "$CMD" in
     #     `docker build`s of the same image at once.
     for arg in "$@"; do
       if [ "$arg" == "--build" ]; then
-        # Bring AXO_ENDPOINT_DOCKERFILE/AXO_ENDPOINT_IMAGE/runner vars into
-        # the shell -- plain `docker build` below doesn't get compose's
-        # --env-file substitution, so the env file needs sourcing directly.
-        set -a
-        # shellcheck disable=SC1090
-        source "$COMPOSE_ENV_FILE"
-        set +a
-        docker build \
-          --file "${SCRIPT_DIR}/${AXO_ENDPOINT_DOCKERFILE:-Dockerfile}" \
-          --tag "${AXO_ENDPOINT_IMAGE:-axo-endpoint:local}" \
-          "$SCRIPT_DIR"
-
-        # Matches ContainerSummoner._runner_image()'s own tag convention
-        # (AXO_ENDPOINT_CONTAINER_RUNNER_IMAGE:py<python_version>) -- keep
-        # AXO_ENDPOINT_RUNNER_PYTHON_VERSION in sync with whatever
-        # python_version your functions actually register with (default
-        # "3.11") if you rely on this pre-build to cover them.
-        docker build \
-          --file "${SCRIPT_DIR}/axo_endpoint/runner/Dockerfile" \
-          --tag "${AXO_ENDPOINT_RUNNER_IMAGE:-axo-runner}:py${AXO_ENDPOINT_RUNNER_PYTHON_VERSION:-3.11}" \
-          --build-arg "PYTHON_VERSION=${AXO_ENDPOINT_RUNNER_PYTHON_VERSION:-3.11}" \
-          "$SCRIPT_DIR"
+        build_node_images
         break
       fi
     done

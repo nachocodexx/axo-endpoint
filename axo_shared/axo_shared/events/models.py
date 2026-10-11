@@ -596,6 +596,9 @@ class ChoreographyNode(BaseModel):
     # kind == "function"
     function_id: Optional[str] = None
     function_version: Optional[int] = None
+    # Display-only, captured at design time -- not looked up again, so it can
+    # go stale if the function is later renamed. function_id stays the key.
+    function_name: Optional[str] = None
     max_retries: int = 3
     retry_policy: Literal["constant", "exponential_backoff", "jitter"] = "constant"
     # kind == "bucket"

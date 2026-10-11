@@ -7,6 +7,8 @@ export interface ChoreographyNode {
   // kind === 'function'
   function_id?: string | null
   function_version?: number | null
+  // Display-only, captured at design time.
+  function_name?: string | null
   max_retries?: number
   retry_policy?: 'constant' | 'exponential_backoff' | 'jitter'
   // kind === 'bucket'

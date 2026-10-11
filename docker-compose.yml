@@ -38,49 +38,6 @@ x-axo-endpoint-common: &axo-endpoint-common
   restart: unless-stopped
 
 services:
-  # axo-endpoint-0:
-  #   <<: *axo-endpoint-common
-  #   container_name: axo-endpoint-0
-  #   hostname: axo-endpoint-0
-  #   environment:
-  #     AXO_ENDPOINT_ID: axo-endpoint-0
-  #     AXO_ENDPOINT_SUB_CONNECT: tcp://axo-endpoint-1:5556,tcp://axo-endpoint-2:5556
-  #     AXO_ENDPOINT_API_URI: tcp://axo-vem:6000
-  #   ports:
-  #     - "5555:5555"
-  #     - "5556:5556"
-  #     - "5557:5557"
-  #   volumes:
-  #     - /var/run/docker.sock:/var/run/docker.sock:ro
-
-  # axo-endpoint-1:
-  #   <<: *axo-endpoint-common
-  #   container_name: axo-endpoint-1
-  #   hostname: axo-endpoint-1
-  #   environment:
-  #     AXO_ENDPOINT_ID: axo-endpoint-1
-  #     AXO_ENDPOINT_SUB_CONNECT: tcp://axo-endpoint-0:5556,tcp://axo-endpoint-2:5556
-  #     AXO_ENDPOINT_API_URI: tcp://axo-vem:6000
-  #   ports:
-  #     - "5565:5555"
-  #     - "5566:5556"
-  #     - "5567:5557"
-  #   volumes:
-  #     - /var/run/docker.sock:/var/run/docker.sock:ro
-  # axo-endpoint-2:
-  #   <<: *axo-endpoint-common
-  #   container_name: axo-endpoint-2
-  #   hostname: axo-endpoint-2
-  #   environment:
-  #     AXO_ENDPOINT_ID: axo-endpoint-2
-  #     AXO_ENDPOINT_SUB_CONNECT: tcp://axo-endpoint-0:5556,tcp://axo-endpoint-1:5556
-  #     AXO_ENDPOINT_API_URI: tcp://axo-vem:6000
-  #   ports:
-  #     - "5575:5555"
-  #     - "5576:5556"
-  #     - "5577:5577"
-  #   volumes:
-  #     - /var/run/docker.sock:/var/run/docker.sock:ro
 
   kurrentdb:
     image: eventstore/eventstore:${AXO_KURRENTDB_IMAGE_TAG:-24.10.0-jammy}

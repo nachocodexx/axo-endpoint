@@ -49,7 +49,7 @@
       class="mb-4"
     >
       <div v-for="v in validation.violations" :key="v.node_id">
-        Node "{{ v.node_id }}" ({{ v.function_id }}) needs {{ v.required_concurrency }} concurrent slots,
+        Node "{{ v.node_id }}" ({{ nodes.find(n => n.id === v.node_id)?.data?.function_name || v.function_id }}) needs {{ v.required_concurrency }} concurrent slots,
         but max_concurrency is {{ v.max_concurrency }}.
       </div>
     </v-alert>
@@ -117,7 +117,7 @@
       <v-card v-if="selectedNode || selectedEdge" class="pa-4" width="300" style="overflow-y: auto;">
         <template v-if="selectedNode && selectedNode.data.kind === 'function'">
           <h3 class="text-subtitle-1 mb-3">
-            {{ selectedNode.data.function_id }} v{{ selectedNode.data.function_version }}
+            {{ selectedNode.data.function_name || selectedNode.data.function_id }} v{{ selectedNode.data.function_version }}
           </h3>
           <v-text-field
             v-model.number="selectedNode.data.max_retries"
@@ -351,7 +351,7 @@ onMounted(async () => {
       nodes.value = loaded.graph.nodes.map(n => ({
         id: n.node_id,
         position: n.position,
-        label: n.kind === 'function' ? `${n.function_id} v${n.function_version}` : `Bucket: ${n.bucket_name}`,
+        label: n.kind === 'function' ? `${n.function_name || n.function_id} v${n.function_version}` : `Bucket: ${n.bucket_name}`,
         class: n.kind === 'bucket' ? 'choreo-node choreo-node--bucket' : 'choreo-node choreo-node--function',
         data: { ...n, kind: n.kind },
       }))
@@ -375,7 +375,7 @@ function addFunctionNode(fn: FunctionRecord) {
     class: 'choreo-node choreo-node--function',
     data: {
       node_id: id, kind: 'function', function_id: fn.function_id, function_version: fn.version,
-      max_retries: 3, retry_policy: 'constant',
+      function_name: fn.name || null, max_retries: 3, retry_policy: 'constant',
     },
   })
 }
@@ -547,6 +547,7 @@ function buildGraph(): ChoreographyGraph {
       position: { x: n.position.x, y: n.position.y },
       function_id: n.data.function_id ?? null,
       function_version: n.data.function_version ?? null,
+      function_name: n.data.function_name ?? null,
       max_retries: n.data.max_retries ?? 3,
       retry_policy: n.data.retry_policy ?? 'constant',
       bucket_name: n.data.bucket_name ?? null,

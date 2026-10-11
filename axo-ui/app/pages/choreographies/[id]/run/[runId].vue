@@ -112,7 +112,7 @@ function rebuildElements() {
   nodes.value = graph.nodes.map(n => ({
     id: n.node_id,
     position: n.position,
-    label: n.kind === 'function' ? `${n.function_id} v${n.function_version}` : `Bucket: ${n.bucket_name}`,
+    label: n.kind === 'function' ? `${n.function_name || n.function_id} v${n.function_version}` : `Bucket: ${n.bucket_name}`,
     class: nodeClass(run.value?.node_states[n.node_id]?.status),
   }))
   edges.value = graph.edges.map(e => ({
