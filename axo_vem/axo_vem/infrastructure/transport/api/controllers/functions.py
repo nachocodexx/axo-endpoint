@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, List, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 from pymongo.collection import Collection
-from xolo.client.models import UserDTO
+from axo_vem.infrastructure.auth.service_token import ActingUser
 
 from axo_shared.functions.source import FunctionSourceError, validate_function_source
 
@@ -24,7 +24,7 @@ class _FunctionUpdateRequest(BaseModel):
 
 def build_router(
     functions: Collection,
-    current_user_dependency: Callable[..., UserDTO],
+    current_user_dependency: Callable[..., ActingUser],
     register_use_case: RegisterFunctionUseCase,
     delete_use_case: DeleteFunctionUseCase,
     update_use_case: UpdateFunctionUseCase,
@@ -33,11 +33,11 @@ def build_router(
     router = APIRouter(tags=["function registries"])
 
     @router.get("/functions")
-    def list_functions(_current_user: UserDTO = Depends(current_user_dependency)):
+    def list_functions(_current_user: ActingUser = Depends(current_user_dependency)):
         return [strip_id(doc) for doc in functions.find()]
 
     @router.get("/functions/{function_id}")
-    def get_function_versions(function_id: str, _current_user: UserDTO = Depends(current_user_dependency)):
+    def get_function_versions(function_id: str, _current_user: ActingUser = Depends(current_user_dependency)):
         """Every version of one function -- _id is f"{function_id}:{version}",
         so a prefix match on the function_id field (not _id) finds them all."""
         docs = list(functions.find({"function_id": function_id}))
@@ -47,12 +47,11 @@ def build_router(
 
     @router.post("/functions", status_code=201)
     async def register_function(
-        virtual_environment_id: str = Form(...),
         name: str = Form(...),
         runtime_spec: Optional[str] = Form(None),
         params_schema: Optional[str] = Form(None),
         code: UploadFile = File(...),
-        current_user: UserDTO = Depends(current_user_dependency),
+        current_user: ActingUser = Depends(current_user_dependency),
     ):
         """Registers a function into a virtual environment the caller owns --
         no endpoint_id from the caller; RegisterFunctionUseCase auto-picks
@@ -90,7 +89,6 @@ def build_router(
             raise HTTPException(status_code=422, detail=str(exc))
 
         return register_use_case.execute(
-            virtual_environment_id=virtual_environment_id,
             current_user_id=current_user.key,
             name=name,
             code=source,
@@ -102,7 +100,7 @@ def build_router(
     def delete_function(
         function_id: str,
         version: int,
-        current_user: UserDTO = Depends(current_user_dependency),
+        current_user: ActingUser = Depends(current_user_dependency),
     ):
         """Routes FUNCTION_DELETE to the function version's own recorded
         endpoint -- no endpoint_id from the caller."""
@@ -113,7 +111,7 @@ def build_router(
         function_id: str,
         version: int,
         body: _FunctionUpdateRequest,
-        current_user: UserDTO = Depends(current_user_dependency),
+        current_user: ActingUser = Depends(current_user_dependency),
     ):
         """In-place params_schema/env_vars mutation, no new version, no code
         change -- same endpoint resolution as delete_function above."""
@@ -129,7 +127,7 @@ def build_router(
     def purge_function_version(
         function_id: str,
         version: int,
-        _current_user: UserDTO = Depends(current_user_dependency),
+        _current_user: ActingUser = Depends(current_user_dependency),
     ):
         """Hard-deletes this function version's read-model doc and its
         unified_activity history, and permanently deletes its isolated

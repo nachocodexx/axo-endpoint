@@ -34,16 +34,7 @@ class MongoFunctionRepository(FunctionRepository):
         doc = self._collection.find_one({"_id": f"{function_id}:{version}"})
         if doc is None:
             return None
-        return Function(
-            function_id=doc["function_id"],
-            version=doc["version"],
-            runtime_spec=doc.get("runtime_spec"),
-            owner_user_id=doc.get("owner_user_id"),
-            deleted_at=doc.get("deleted_at"),
-            endpoint_id=doc.get("endpoint_id") or [],
-            virtual_environment_id=doc.get("virtual_environment_id"),
-            container_status=doc.get("container_status"),
-        )
+        return _doc_to_function(doc)
 
     def mark_deleted(self, function_id: str, version: int, deleted_at) -> None:
         key = f"{function_id}:{version}"
@@ -90,16 +81,25 @@ class MongoFunctionRepository(FunctionRepository):
         # Equality match against an array field means "array contains" in
         # Mongo, so this needs no change for endpoint_id's string -> list migration.
         docs = self._collection.find({"endpoint_id": endpoint_id, "deleted_at": None})
-        return [
-            Function(
-                function_id=doc["function_id"],
-                version=doc["version"],
-                runtime_spec=doc.get("runtime_spec"),
-                owner_user_id=doc.get("owner_user_id"),
-                deleted_at=doc.get("deleted_at"),
-                endpoint_id=doc.get("endpoint_id") or [],
-                virtual_environment_id=doc.get("virtual_environment_id"),
-                container_status=doc.get("container_status"),
-            )
-            for doc in docs
-        ]
+        return [_doc_to_function(doc) for doc in docs]
+
+    def list_active(self) -> List[Function]:
+        """Every function version not soft-deleted, oldest version first per
+        function -- what Restoring re-registers after a VE start."""
+        docs = self._collection.find({"deleted_at": None}).sort([("function_id", 1), ("version", 1)])
+        return [_doc_to_function(doc) for doc in docs]
+
+
+def _doc_to_function(doc: Dict[str, Any]) -> Function:
+    return Function(
+        function_id=doc["function_id"],
+        version=doc["version"],
+        runtime_spec=doc.get("runtime_spec"),
+        owner_user_id=doc.get("owner_user_id"),
+        deleted_at=doc.get("deleted_at"),
+        endpoint_id=doc.get("endpoint_id") or [],
+        virtual_environment_id=doc.get("virtual_environment_id"),
+        container_status=doc.get("container_status"),
+        name=doc.get("name"),
+        params_schema=doc.get("params_schema"),
+    )

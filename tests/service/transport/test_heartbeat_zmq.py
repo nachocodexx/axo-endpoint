@@ -70,3 +70,30 @@ def test_run_heartbeat_gc_calls_evict_stale_on_the_expected_cadence():
 
     stop_event.set()
     thread.join(timeout=2.0)
+
+
+def _frames(peer_id, ve_id):
+    import json as _json
+    from axo_endpoint.service.transport.heartbeat_zmq import HB_TOPIC
+    metrics = {"__pub_bind__": "tcp://0.0.0.0:5556", "__sent_at__": 99.0}
+    if ve_id is not None:
+        metrics["__ve_id__"] = ve_id
+    return [HB_TOPIC, peer_id.encode(), b"axo-endpoint", b"tcp://0.0.0.0:5555", _json.dumps(metrics).encode()]
+
+
+def test_heartbeats_from_another_virtual_environment_are_ignored():
+    subscriber = ZmqHeartbeatSubscriber(connect_addresses=[], now_fn=lambda: 100.0, virtual_environment_id="ve-a")
+    subscriber._handle_frames(_frames("same-ve", "ve-a"))
+    subscriber._handle_frames(_frames("other-ve", "ve-b"))
+    subscriber._handle_frames(_frames("no-ve", None))
+    assert [p.peer_id for p in subscriber.list_peers()] == ["same-ve"]
+    assert "__ve_id__" not in subscriber.get_peer("same-ve").metrics
+    subscriber.stop()
+
+
+def test_endpoint_without_virtual_environment_only_meshes_with_peers_without_one():
+    subscriber = ZmqHeartbeatSubscriber(connect_addresses=[], now_fn=lambda: 100.0)
+    subscriber._handle_frames(_frames("no-ve", None))
+    subscriber._handle_frames(_frames("in-ve", "ve-a"))
+    assert [p.peer_id for p in subscriber.list_peers()] == ["no-ve"]
+    subscriber.stop()

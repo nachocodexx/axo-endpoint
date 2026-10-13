@@ -5,7 +5,7 @@ from typing import Dict, List, Optional
 
 from option import Err, Ok, Result
 
-from axo_endpoint.core.errors import AxoError
+from axo_endpoint.core.errors import AxoError, FunctionVersionExistsError
 from axo_endpoint.core.events.bus import Event, EventBus
 from axo_shared.activity.models import FUNCTION_DELETED_EVENT, FUNCTION_UPDATED_EVENT
 from axo_shared.functions.lifecycle import FunctionState, is_valid_transition
@@ -38,19 +38,31 @@ class FunctionRegistry:
         runtime_spec: Optional[RuntimeSpec] = None,
         code_format: str = "cloudpickle",
         params_schema: Optional[List[ParamSpec]] = None,
+        restore_version: Optional[int] = None,
     ) -> Result[StorageKey, StorageError]:
         """Saves a new function's code under function_id, auto-assigning the
         next version (max(existing versions for this function_id, default=0)
-        + 1) -- version is never caller-supplied, guaranteeing the "versions
-        increment" invariant rather than trusting callers to pass a strictly
-        increasing value. function_id is the caller's derived
+        + 1) -- callers never pick versions, guaranteeing the "versions
+        increment" invariant. The one exception is ``restore_version``: the
+        VEM re-registering a function into empty endpoints after a VE start
+        (Restoring) must get back the exact version it had -- allowed only
+        when that version doesn't exist yet, so a version still never
+        changes once written. function_id is the caller's derived
         (user_id, virtual_environment_id, name) identity; name is kept only
         as a separate display field."""
         list_result = self._backend.list_versions(function_id)
         if list_result.is_err:
             return Err(list_result.unwrap_err())
         existing_versions = [k.version or 0 for k in list_result.unwrap()]
-        next_version = max(existing_versions, default=0) + 1
+        if restore_version is not None:
+            if restore_version in existing_versions:
+                return Err(FunctionVersionExistsError(
+                    f"{function_id} v{restore_version} already exists",
+                    context={"function_id": function_id, "version": restore_version},
+                ))
+            next_version = restore_version
+        else:
+            next_version = max(existing_versions, default=0) + 1
 
         key = StorageKey(id=function_id, version=next_version, alias=function_id)
         record = FunctionRecord(
@@ -71,7 +83,7 @@ class FunctionRegistry:
         self._event_bus.emit(
             Event(
                 event_type=FunctionState.REGISTERED.value,
-                payload={"function_id": key.id, "version": key.version},
+                payload={"function_id": key.id, "version": key.version, "restored": restore_version is not None},
                 timestamp=now,
             )
         )
@@ -113,8 +125,11 @@ class FunctionRegistry:
         now: float,
         params_schema: Optional[List[ParamSpec]] = None,
         env_vars: Optional[Dict[str, str]] = None,
+        max_concurrency: Optional[int] = None,
     ) -> Result[FunctionRecord, RegistryError]:
-        """In-place mutation of an existing version's params_schema/env_vars
+        """In-place mutation of an existing version's params_schema/env_vars/
+        max_concurrency (a runner policy raising or lowering how many copies
+        may run at once -- the same version, never a new one)
         -- orthogonal to state (not a FunctionState transition), distinct
         from register() (no new version created). params_schema entries are
         merged additively: new names are appended, already-declared ones are
@@ -139,6 +154,9 @@ class FunctionRegistry:
         if env_vars:
             base_spec = current.runtime_spec or RuntimeSpec()
             merged_runtime_spec = dataclasses.replace(base_spec, env_vars={**base_spec.env_vars, **env_vars})
+        if max_concurrency is not None:
+            base_spec = merged_runtime_spec or RuntimeSpec()
+            merged_runtime_spec = dataclasses.replace(base_spec, max_concurrency=max(1, int(max_concurrency)))
 
         updated = dataclasses.replace(
             current, params_schema=merged_params_schema, runtime_spec=merged_runtime_spec,

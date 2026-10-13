@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import time
-from typing import Callable, Union
+from typing import Callable, Optional, Union
 
-from axo_endpoint.core.errors import MissingFieldError
+from axo_endpoint.core.errors import EndpointDrainingError, MissingFieldError
 from axo_endpoint.core.events.bus import EventBus
 from axo_endpoint.core.functions import FunctionRegistry
 from axo_shared.protocol import Command, CommandHandler, CommandResult
 from axo_endpoint.core.runtime import FunctionRuntime
+from axo_endpoint.core.runtime.queue_deadlines import QueueDeadlines
 from axo_endpoint.core.storage.backend import StorageBackend
 from axo_endpoint.log import DumbLogger, Log
 from axo_endpoint.log.catalog import Component, Event
@@ -31,8 +32,12 @@ class JobForwardHandler(CommandHandler):
         function_registry: FunctionRegistry,
         now_fn: Callable[[], float] = time.time,
         logger: _Logger = None,
+        queue_deadlines: Optional[QueueDeadlines] = None,
+        is_draining: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._runtime = runtime
+        self._is_draining = is_draining
+        self._queue_deadlines = queue_deadlines
         self._results = results
         self._event_bus = event_bus
         self._function_registry = function_registry
@@ -40,6 +45,8 @@ class JobForwardHandler(CommandHandler):
         self._logger: _Logger = logger or DumbLogger()
 
     def handle(self, command: Command) -> CommandResult:
+        if self._is_draining is not None and self._is_draining():
+            return CommandResult.from_error(EndpointDrainingError("endpoint is draining; place the job elsewhere"))
         job_id = command.envelope.get("job_id")
         if not job_id:
             err = MissingFieldError("job_id is required", context={"fields": ["job_id"]})
@@ -60,4 +67,5 @@ class JobForwardHandler(CommandHandler):
             self._function_registry,
             self._now_fn,
             self._logger,
+            self._queue_deadlines,
         )

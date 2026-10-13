@@ -6,6 +6,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
+from axo_shared.virtual_environment.states import VeHealth, VeLifecycle
+
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
@@ -299,6 +301,9 @@ class FunctionUpdated(EventEnvelope):
     version: int
     params_schema: Optional[List[Dict[str, Any]]] = None
     env_vars: Optional[Dict[str, str]] = None
+    # The whole current RuntimeSpec (e.g. a runner policy changed
+    # max_concurrency) -- the VEM's read model replaces its copy with it.
+    runtime_spec: Optional[Dict[str, Any]] = None
 
 
 class FunctionStopped(EventEnvelope):
@@ -308,7 +313,11 @@ class FunctionStopped(EventEnvelope):
 
     function_id: str
     version: int
-    reason: Literal["idle_ttl", "max_invocations", "dismissed"]
+    # runner_budget = evicted (idle) to make room for another function's
+    # runner; stale_before_respawn / cancelled = container-runtime cleanup.
+    reason: Literal[
+        "idle_ttl", "max_invocations", "dismissed", "stale_before_respawn", "cancelled", "runner_budget",
+    ]
 
 
 class FunctionCrashed(EventEnvelope):
@@ -394,6 +403,55 @@ class JobFailed(EventEnvelope):
     duration_ms: Optional[float] = None
 
 
+# ── Job attempt usage (metering / billing) ──────────────────────────────────
+# One record per attempt, delivered reliably (axo_shared.messaging) up to the
+# Control Plane, where it is the permanent billing record. event_id doubles as
+# the reliable-channel message_id.
+JOB_ATTEMPT_RECORDED = "JobAttemptRecorded"
+
+JobAttemptOutcome = Literal["completed", "failed_user", "failed_platform", "cancelled", "timed_out_in_queue"]
+BILLABLE_OUTCOMES = ("completed", "failed_user", "cancelled")
+
+
+def is_billable(outcome: str) -> bool:
+    """Every attempt that ran is billed -- completed, failed by user code, or
+    cancelled (for the time it ran). Platform failures and jobs that timed
+    out in a queue (never ran) are not."""
+    return outcome in BILLABLE_OUTCOMES
+
+
+class JobAttemptRecorded(EventEnvelope):
+    job_id: str
+    attempt: int
+    trace_id: str
+    outcome: JobAttemptOutcome
+    # Who owns the VE (pays) and who started the job.
+    owner_type: Literal["user", "team"]
+    owner_id: str
+    started_by_type: Literal["user", "api_key", "choreography", "policy"]
+    started_by_id: str
+    function_id: str
+    function_version: int
+    # Size of the endpoint the attempt ran on (billing: execution time x size).
+    endpoint_cores: float
+    endpoint_ram_mb: int
+    received_at: datetime
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    # Wait per layer, e.g. {"control_plane": 5, "vem": 3, "endpoint": 120, "runner": 40}.
+    layer_waits_ms: Dict[str, float] = Field(default_factory=dict)
+    execution_ms: float = 0.0
+    # Per bucket name.
+    bytes_read: Dict[str, int] = Field(default_factory=dict)
+    bytes_written: Dict[str, int] = Field(default_factory=dict)
+    cache_hits: int = 0
+    cache_misses: int = 0
+
+    @property
+    def billable(self) -> bool:
+        return is_billable(self.outcome)
+
+
 # ── Data & buckets ───────────────────────────────────────────────────────────
 DATA_BUCKET_CREATED = "DataBucketCreated"
 DATA_REGISTERED = "DataRegistered"
@@ -411,9 +469,8 @@ class DataBucketCreated(EventEnvelope):
 
 
 class DataRegistered(EventEnvelope):
-    """One piece of data's metadata was declared via DATA_REGISTER. ``name``
-    follows the "{bucket}/{key}" convention when registered into a bucket,
-    or is a bare name for unbucketed data -- no separate bucket field."""
+    """A new object version was uploaded to a bucket (axo_storage). ``name``
+    is "{bucket}/{key}" -- every object lives in a bucket."""
 
     name: str
     version: int
@@ -434,7 +491,7 @@ class DataUploadCompleted(EventEnvelope):
 
 
 class DataDeleted(EventEnvelope):
-    """A previously-registered data record was removed (DATA_DELETE) --
+    """An object version was removed from its bucket (OBJECT_DELETE) --
     drives removing the DataItem read-model row. Deliberately thin, same
     reasoning as DataUploadCompleted."""
 
@@ -648,3 +705,141 @@ class ChoreographyUpdated(EventEnvelope):
 
 class ChoreographyDeleted(EventEnvelope):
     choreography_id: str
+
+
+# ── VE settings (inside one VE's own VEM) ───────────────────────────────────
+VE_SETTINGS_CHANGED = "VirtualEnvironmentSettingsChanged"
+
+
+class VirtualEnvironmentSettingsChanged(EventEnvelope):
+    """One change to a VE's settings (target/min endpoints, auto-replace,
+    idle and wake times, default max_wait, queue limits, retention). The VEM
+    rebuilds its current settings by replaying these, so every value has a
+    who/when/why history. ``changes`` holds only the fields that changed."""
+
+    changes: Dict[str, Any]
+    changed_by_type: Literal["user", "policy", "system"] = "user"
+    changed_by_id: Optional[str] = None
+    reason: Optional[str] = None
+
+
+VE_LIFECYCLE_CHANGED = "VirtualEnvironmentLifecycleChanged"
+
+
+class VirtualEnvironmentLifecycleChanged(EventEnvelope):
+    """What the whole VE is doing changed (Running, Stopping, Stopped,
+    Starting, Restoring, Deleting, ...), recorded by its VEM so a restarted
+    VEM knows where it left off."""
+
+    lifecycle: VeLifecycle
+    reason: Optional[str] = None
+
+
+# ── Scaling policies (inside one VE's own VEM) ──────────────────────────────
+POLICY_SAVED = "ScalingPolicySaved"
+POLICY_DELETED = "ScalingPolicyDeleted"
+POLICIES_PAUSED = "ScalingPoliciesPaused"
+POLICY_DECISION_RECORDED = "ScalingPolicyDecisionRecorded"
+
+
+class ScalingPolicySaved(EventEnvelope):
+    """A policy was created or changed (the whole policy, as a dict)."""
+
+    policy: Dict[str, Any]
+
+
+class ScalingPolicyDeleted(EventEnvelope):
+    policy_id: str
+
+
+class ScalingPoliciesPaused(EventEnvelope):
+    """Policies won't act until ``until`` (epoch seconds) -- e.g. after a
+    manual change, so a person's choice isn't immediately undone."""
+
+    until: float
+    reason: Optional[str] = None
+
+
+class ScalingPolicyDecisionRecorded(EventEnvelope):
+    """What a policy did (or, in dry run, would have done) and why, e.g.
+    "fast-responses added 1 endpoint: p95 job.total_ms = 820 > 500 for 120 s"."""
+
+    policy_id: str
+    policy_name: str
+    kind: Literal["endpoint", "runner"]
+    function_id: Optional[str] = None
+    function_version: Optional[int] = None
+    before: int
+    after: int
+    dry_run: bool = False
+    reason: str
+
+
+ENDPOINT_LIFECYCLE_CHANGED = "EndpointLifecycleChanged"
+
+EndpointLifecycleState = Literal[
+    "creating", "starting", "running", "sleeping", "draining", "removing", "removed", "stopped", "failed",
+]
+
+
+class EndpointLifecycleChanged(EventEnvelope):
+    """One endpoint the VEM manages moved to a new state (written by the VEM,
+    not the endpoint). The VEM rebuilds its fleet by replaying these, and
+    every move has a reason, e.g. "idle 20 min" or "replacing ep-3"."""
+
+    state: EndpointLifecycleState
+    cpu_cores: float
+    memory_mb: int
+    failures: int = 0          # consecutive failures of this slot (auto-replace gives up after a few)
+    replaces: Optional[str] = None
+    reason: Optional[str] = None
+
+
+# ── VE status + metric summaries (VEM -> Control Plane, reliable) ───────────
+VE_HEARTBEAT = "VirtualEnvironmentHeartbeat"
+METRIC_SUMMARY_REPORTED = "MetricSummaryReported"
+
+
+class VirtualEnvironmentHeartbeat(EventEnvelope):
+    """Sent by a VE's VEM every few seconds. Endpoint counts follow the health
+    rules: starting/leaving are neutral, only ``failed`` counts against health."""
+
+    lifecycle: VeLifecycle
+    health: Optional[VeHealth] = None  # None while Stopped / Sleeping
+    target_endpoints: int
+    min_endpoints: int
+    running: int = 0
+    starting: int = 0
+    leaving: int = 0
+    failed: int = 0
+    sleeping: int = 0
+    # When the VE last had nothing to do (None = busy now) -- the Control
+    # Plane puts a Free-plan VE to sleep after 30 idle minutes.
+    idle_since: Optional[datetime] = None
+    # Messages the VEM still has to deliver to the CP (its outbox). Deleting
+    # a VE waits for 0 so no billing record is lost.
+    outbox_pending: int = 0
+    vem_version: Optional[str] = None
+    endpoint_version: Optional[str] = None
+
+
+class MetricSummary(BaseModel):
+    """One metric for one dims combination: axo_shared.metrics.MetricRecord's
+    metric/dims plus StatSummary.to_dict() (count, sums, min/max, sketch)."""
+
+    model_config = {"frozen": True}
+
+    metric: str
+    dims: Dict[str, str] = Field(default_factory=dict)
+    stats: Dict[str, Any]
+
+
+class MetricSummaryReported(EventEnvelope):
+    """Every metric of one component for one finished time bin. Queue metrics
+    travel here as ordinary metrics -- there is no separate queue event."""
+
+    component_kind: Literal["control_plane", "vem", "endpoint", "runner"]
+    component_id: str
+    bin_start: float
+    bin_width_s: int
+    summaries: List[MetricSummary] = Field(default_factory=list)

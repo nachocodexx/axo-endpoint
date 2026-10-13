@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-from axo_vem.domain.workspace.value_objects import ResourceCapacity
+from axo_vem.domain.compute.value_objects import ResourceCapacity
 
 
 @dataclass

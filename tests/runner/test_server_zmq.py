@@ -118,7 +118,7 @@ def _fn_reads_dataio(params, ctx):
     from axo_endpoint import dataio
     from axo_endpoint.core.dataio import IORef
 
-    value = dataio.read(IORef(kind="fs", location=params["location"], format="raw"))
+    value = dataio.read(IORef(bucket="lab", name=params["location"], format="raw"))
     return value.decode("utf-8")
 
 
@@ -136,7 +136,7 @@ def test_fn_dataio_read_triggers_io_request_and_resumes_on_reply():
         _, request_id_b, op_b, ref_json_b, data_b = frames
         assert op_b == b"read"
         ref = json.loads(ref_json_b.decode())
-        assert ref == {"kind": "fs", "location": "in.bin", "format": "raw", "chunk_index": None}
+        assert ref == {"bucket": "lab", "name": "in.bin", "version": None, "format": "raw", "chunk_index": None}
 
         sock.send_multipart([b"io_reply", request_id_b, b"ok", b"canned-bytes"])
 
@@ -154,7 +154,7 @@ def _fn_writes_dataio(params, ctx):
     from axo_endpoint import dataio
     from axo_endpoint.core.dataio import IORef
 
-    dataio.write(b"payload-bytes", IORef(kind="fs", location=params["location"], format="raw"))
+    dataio.write(b"payload-bytes", IORef(bucket="lab", name=params["location"], format="raw"))
     return "written"
 
 
@@ -185,7 +185,7 @@ def test_direct_invoke_http_path_has_no_dataio_channel():
     def fn(params, ctx):
         from axo_endpoint import dataio
         from axo_endpoint.core.dataio import IORef
-        return dataio.read(IORef(kind="fs", location="x", format="raw")).decode()
+        return dataio.read(IORef(bucket="lab", name="x", format="raw")).decode()
 
     server = RunnerServer(
         fn=fn,

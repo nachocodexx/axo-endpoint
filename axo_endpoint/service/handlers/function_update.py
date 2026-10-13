@@ -52,10 +52,16 @@ class FunctionUpdateHandler(CommandHandler):
 
         params_schema = parse_params_schema(command.envelope.get("params_schema")) or None
         env_vars = command.envelope.get("env_vars") or None
+        max_concurrency = command.envelope.get("max_concurrency")
+        if max_concurrency is not None and (not isinstance(max_concurrency, int) or max_concurrency < 1):
+            return CommandResult.from_error(MissingFieldError(
+                "max_concurrency must be a whole number ≥ 1", context={"fields": ["max_concurrency"]},
+            ))
 
         key = StorageKey(id=function_id, version=version, alias=function_id)
         result = self._registry.update(
             key, now=self._now_fn(), params_schema=params_schema, env_vars=env_vars,
+            max_concurrency=max_concurrency,
         )
         if result.is_err:
             raw = result.unwrap_err()

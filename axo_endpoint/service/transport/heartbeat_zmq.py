@@ -52,8 +52,14 @@ class ZmqHeartbeatSubscriber(HeartbeatSubscriber):
         now_fn: Callable[[], float] = time.time,
         logger: _Logger = None,
         on_new_peer: Optional[Callable[[PeerInfo], None]] = None,
+        virtual_environment_id: Optional[str] = None,
     ) -> None:
-        """Connects to one or more peers to start receiving their heartbeats."""
+        """Connects to one or more peers to start receiving their heartbeats.
+
+        Only heartbeats carrying this same ``virtual_environment_id`` (sent as
+        the ``__ve_id__`` metrics key) are accepted: endpoints of different VEs
+        never see each other, even if a network is misconfigured. None matches
+        only peers that also report no VE (plain local dev)."""
         self._context = context or zmq.Context.instance()
         self._socket = self._context.socket(zmq.SUB)
         self._socket.setsockopt(zmq.SUBSCRIBE, HB_TOPIC)
@@ -71,6 +77,7 @@ class ZmqHeartbeatSubscriber(HeartbeatSubscriber):
         self._logger: _Logger = logger or DumbLogger()
         self._connect_addresses = connect_addresses
         self._on_new_peer = on_new_peer
+        self._virtual_environment_id = virtual_environment_id
 
     def start(self) -> None:
         """Starts listening for heartbeats in a background thread."""
@@ -137,6 +144,16 @@ class ZmqHeartbeatSubscriber(HeartbeatSubscriber):
         now = self._now_fn()
         sent_at = metrics.pop("__sent_at__", None)
         pub_bind = metrics.pop("__pub_bind__", "")
+        peer_ve_id = metrics.pop("__ve_id__", None)
+        if peer_ve_id != self._virtual_environment_id:
+            self._logger.debug_event(
+                Event.Heartbeat.FOREIGN_VE_DROPPED,
+                component=Component.HEARTBEAT,
+                peer_id=peer_id_b.decode("utf-8", errors="replace"),
+                peer_virtual_environment_id=peer_ve_id,
+                virtual_environment_id=self._virtual_environment_id,
+            )
+            return
         latency_ms = round((now - sent_at) * 1000, 2) if sent_at is not None else 0.0
 
         self.on_heartbeat(

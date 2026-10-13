@@ -6,12 +6,13 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from axo_shared import wire
 from axo_shared.protocol import Command
 
 from axo_vem.application.compute.submit_function_job import SubmitFunctionJobUseCase
+from axo_vem.application.data.bucket_storage import BucketStorage
 from axo_vem.domain.choreography.choreography import Choreography
 from axo_vem.domain.choreography.concurrency_check import check_concurrency
 from axo_vem.domain.choreography.graph_ops import downstream_of, topological_waves
@@ -28,7 +29,6 @@ from axo_vem.domain.choreography.run import (
 )
 from axo_vem.domain.choreography.run_repository import ChoreographyRunRepository
 from axo_vem.domain.compute.repository import EndpointRepository, FunctionRepository
-from axo_vem.domain.data.repository import DataItemRepository
 from axo_vem.domain.errors import ConflictError, NotFoundError
 from axo_vem.infrastructure.transport.ws.broadcaster import Broadcaster
 from axo_vem.infrastructure.transport.zmq_command.endpoint_client import resolve_rpc_uri, send_command
@@ -68,8 +68,8 @@ class RunChoreographyUseCase:
         run_repository: ChoreographyRunRepository,
         function_repository: FunctionRepository,
         endpoint_repository: EndpointRepository,
-        data_item_repository: DataItemRepository,
         submit_function_job_use_case: SubmitFunctionJobUseCase,
+        bucket_storage: Optional["BucketStorage"] = None,
         broadcaster: Optional[Broadcaster] = None,
         command_timeout_seconds: float = 3.0,
         poll_interval_seconds: float = 0.5,
@@ -79,8 +79,8 @@ class RunChoreographyUseCase:
         self._runs = run_repository
         self._functions = function_repository
         self._endpoints = endpoint_repository
-        self._data_items = data_item_repository
         self._submit_use_case = submit_function_job_use_case
+        self._bucket_storage = bucket_storage
         self._broadcaster = broadcaster
         self._command_timeout_seconds = command_timeout_seconds
         self._poll_interval_seconds = poll_interval_seconds
@@ -90,8 +90,22 @@ class RunChoreographyUseCase:
         # without re-deriving endpoint resolution itself.
         self.live_jobs_by_run: Dict[str, Dict[str, str]] = {}
         self.stop_flags: Dict[str, threading.Event] = {}
+        # run_id -> (user who started it, choreography_id): every job of the
+        # run acts for that user (axo_storage checks their bucket access for
+        # the jobs' dataio) and is recorded as started by the choreography.
+        self.run_starters: Dict[str, Tuple[str, str]] = {}
+        # run_id -> node_id -> the buckets its FN -> bucket edges point at.
+        self.output_buckets_by_node: Dict[str, Dict[str, List[str]]] = {}
 
-    def execute(self, *, choreography_id: str, current_user_id: str) -> Dict[str, Any]:
+    def execute(self, *, choreography_id: str, current_user_id: str, run_id: Optional[str] = None) -> Dict[str, Any]:
+        """``run_id``: the caller's own id (the Control Plane brings one for a
+        run it accepted while the VE was asleep). The same id twice = one run."""
+        if run_id is not None:
+            existing = self._runs.get(run_id)
+            if existing is not None:
+                if existing.choreography_id != choreography_id:
+                    raise ConflictError("run id already used by another choreography")
+                return existing.to_dict()
         choreography = self._choreographies.get(choreography_id)
         if choreography is None:
             raise NotFoundError("choreography not found")
@@ -109,7 +123,7 @@ class RunChoreographyUseCase:
             raise ConflictError(f"concurrency validation failed: {detail}")
 
         run = ChoreographyRun(
-            run_id=str(uuid.uuid4()),
+            run_id=run_id or str(uuid.uuid4()),
             choreography_id=choreography_id,
             status=PENDING,
             node_states={n.node_id: NodeRunState(node_id=n.node_id) for n in choreography.graph.nodes},
@@ -117,6 +131,8 @@ class RunChoreographyUseCase:
         )
         self._runs.save(run)
         self.live_jobs_by_run[run.run_id] = {}
+        self.run_starters[run.run_id] = (current_user_id, choreography_id)
+        self.output_buckets_by_node[run.run_id] = self._output_buckets(choreography)
         self.stop_flags[run.run_id] = threading.Event()
 
         threading.Thread(target=self._execute_run, args=(choreography, run), daemon=True).start()
@@ -194,6 +210,8 @@ class RunChoreographyUseCase:
         self._broadcast(run.run_id, {"type": "run_status", "run_id": run.run_id, "status": run.status})
         self.live_jobs_by_run.pop(run.run_id, None)
         self.stop_flags.pop(run.run_id, None)
+        self.run_starters.pop(run.run_id, None)
+        self.output_buckets_by_node.pop(run.run_id, None)
 
     def _run_node(
         self,
@@ -231,7 +249,7 @@ class RunChoreographyUseCase:
             ok, value, error = self._dispatch_with_retries(run.run_id, node, base_params, state, stop_flag)
             if ok:
                 node_results[node.node_id] = value
-                self._write_fn_to_bucket_edges(choreography, node, value)
+                self._write_fn_to_bucket_edges(choreography, node, value, run.run_id)
             state.status = COMPLETED if ok else FAILED
             state.error = error
             self._save_and_broadcast_node(run, node.node_id)
@@ -248,13 +266,17 @@ class RunChoreographyUseCase:
         for edge in bucket_edges:
             source_node = next((n for n in choreography.graph.nodes if n.node_id == edge.source_node_id), None)
             bucket_name = source_node.bucket_name if source_node else None
-            items = self._resolve_bucket_items(bucket_name, source_node)
+            items = self._resolve_bucket_items(bucket_name, source_node, run.run_id)
             if not edge.target_param or not items:
                 continue
 
             def _process_item(item):
                 params = dict(base_params)
-                params[edge.target_param] = {"kind": item.kind, "location": item.name, "format": item.format}
+                # An IORef the function hands straight to dataio.read.
+                params[edge.target_param] = {
+                    "bucket": bucket_name, "name": item["name"], "version": item["version"],
+                    "format": item.get("format", "raw"),
+                }
                 return self._dispatch_with_retries(run.run_id, node, params, state, stop_flag)
 
             with ThreadPoolExecutor(max_workers=max(1, edge.parallelism)) as pool:
@@ -267,20 +289,25 @@ class RunChoreographyUseCase:
 
         if all_ok:
             node_results[node.node_id] = item_results
-            self._write_fn_to_bucket_edges(choreography, node, item_results)
+            self._write_fn_to_bucket_edges(choreography, node, item_results, run.run_id)
         state.status = COMPLETED if all_ok else FAILED
         self._save_and_broadcast_node(run, node.node_id)
         return all_ok
 
-    def _resolve_bucket_items(self, bucket_name: Optional[str], source_node) -> List[Any]:
-        if not bucket_name:
+    def _resolve_bucket_items(self, bucket_name: Optional[str], source_node, run_id: str) -> List[Dict[str, Any]]:
+        """The bucket's complete objects (only the ones selected on the node,
+        if any), listed live from axo_storage as the run's user."""
+        user_id = self.run_starters.get(run_id, (None, None))[0]
+        if not bucket_name or self._bucket_storage is None or not user_id:
             return []
-        items = self._data_items.list_by_bucket(bucket_name)
+        items = self._bucket_storage.list_objects(user_id, bucket_name)
         selected = getattr(source_node, "selected_items", None) if source_node else None
         if selected:
-            wanted = {(s["name"], s["version"]) for s in selected}
-            items = [item for item in items if (item.name, item.version) in wanted]
-        return [item for item in items if item.status == "ready"]
+            # Older selections stored "{bucket}/{key}" names.
+            wanted = {(s["name"].split("/", 1)[1] if s["name"].startswith(f"{bucket_name}/") else s["name"], s["version"])
+                      for s in selected}
+            items = [item for item in items if (item["name"], item["version"]) in wanted]
+        return items
 
     def _dispatch_with_retries(
         self, run_id: str, node, params: Dict[str, Any], state: NodeRunState, stop_flag: threading.Event,
@@ -309,6 +336,9 @@ class RunChoreographyUseCase:
         try:
             submitted = self._submit_use_case.execute(
                 function_id=node.function_id, version=node.function_version, params=params,
+                acting_user_id=self.run_starters.get(run_id, (None, None))[0],
+                started_by_type="choreography", started_by_id=self.run_starters.get(run_id, (None, None))[1],
+                output_buckets=self.output_buckets_by_node.get(run_id, {}).get(node.node_id, []),
             )
         except Exception as exc:  # ConflictError/NotFoundError/UpstreamTimeoutError from the use case
             return False, None, str(exc)
@@ -368,60 +398,40 @@ class RunChoreographyUseCase:
             self._command_timeout_seconds,
         )
 
-    def _write_fn_to_bucket_edges(self, choreography: Choreography, node, value: Any) -> None:
-        """A -> Bucket edges persist A's JSON result as a new bucket item,
-        auto-named "{bucket}/{choreography_name}-{node_id}", a new version
-        per run. Reuses the exact DATA_REGISTER + DATA_CHUNK_PUT dance
-        buckets.py's upload_data route already drives, targeting the same
-        endpoint this node's own job just ran on (buckets aren't tied to a
-        specific VE the way functions are, so there's no independent
-        endpoint to resolve for them -- the node's own endpoint is reused)."""
+    @staticmethod
+    def _output_buckets(choreography: Choreography) -> Dict[str, List[str]]:
+        bucket_of = {n.node_id: n.bucket_name for n in choreography.graph.nodes if n.kind == "bucket" and n.bucket_name}
+        by_node: Dict[str, List[str]] = {}
+        for edge in choreography.graph.edges:
+            if edge.kind == "fn_to_bucket" and edge.target_node_id in bucket_of:
+                buckets = by_node.setdefault(edge.source_node_id, [])
+                if bucket_of[edge.target_node_id] not in buckets:
+                    buckets.append(bucket_of[edge.target_node_id])
+        return by_node
+
+    def _write_fn_to_bucket_edges(self, choreography: Choreography, node, value: Any, run_id: str = "") -> None:
+        """A -> Bucket edges save A's JSON result into that bucket as
+        "{choreography_name}-{node_id}", a new version per run, in
+        axo_storage, as the user who started the run. (The other half: the
+        function itself gets the same bucket names as ctx.output_buckets to
+        write its own objects via dataio.)"""
+        if self._bucket_storage is None:
+            return
         outbound = [
             e for e in choreography.graph.edges
             if e.source_node_id == node.node_id and e.kind == "fn_to_bucket"
         ]
-        if not outbound:
+        user_id = self.run_starters.get(run_id, (None, None))[0]
+        if not outbound or not user_id:
             return
-
-        function = self._functions.get(node.function_id, node.function_version)
-        if function is None or not function.endpoint_id:
-            return
-        endpoint_id = function.endpoint_id[0]
-        endpoint = self._endpoints.get(endpoint_id)
-        if endpoint is None or not endpoint.router_bind:
-            return
-        rpc_uri = resolve_rpc_uri(endpoint.router_bind, endpoint_id)
-
+        payload = json.dumps(value).encode("utf-8")
         for edge in outbound:
             target = next((n for n in choreography.graph.nodes if n.node_id == edge.target_node_id), None)
             if target is None or not target.bucket_name:
                 continue
-
-            name = f"{target.bucket_name}/{choreography.name}-{node.node_id}"
-            existing_versions = [
-                item.version for item in self._data_items.list_by_bucket(target.bucket_name) if item.name == name
-            ]
-            version = (max(existing_versions) + 1) if existing_versions else 1
-            payload = json.dumps(value).encode("utf-8")
-
-            register_result = send_command(
-                rpc_uri,
-                Command(
-                    operation=wire.DATA_REGISTER, content_type="application/json",
-                    envelope={
-                        "name": name, "version": version, "format": "raw", "kind": "fs",
-                        "total_size": len(payload), "chunk_bytes": len(payload) or 1,
-                    },
-                ),
-                self._command_timeout_seconds,
-            )
-            if register_result.is_err or not register_result.unwrap().ok:
+            try:
+                self._bucket_storage.upload(
+                    user_id, target.bucket_name, f"{choreography.name}-{node.node_id}", payload, format="raw",
+                )
+            except Exception:  # a failed save must not fail the node; it ran fine
                 continue
-            send_command(
-                rpc_uri,
-                Command(
-                    operation=wire.DATA_CHUNK_PUT, content_type="application/octet-stream",
-                    envelope={"name": name, "version": version, "chunk_index": 0}, payload=payload,
-                ),
-                self._command_timeout_seconds,
-            )

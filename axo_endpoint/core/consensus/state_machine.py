@@ -4,7 +4,7 @@ import json
 import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Dict, FrozenSet, Optional, Tuple
+from typing import Dict, FrozenSet, Optional
 
 from axo_endpoint.core.consensus.elector import LeaderView
 
@@ -12,22 +12,18 @@ from axo_endpoint.core.consensus.elector import LeaderView
 @dataclass(frozen=True)
 class ClusterState:
     """Everything that must survive node failure: membership/leader metadata,
-    plus a snapshot of function-registry, data-registry, and bucket-registry
-    entries.
+    plus a snapshot of function-registry entries. (Data and buckets are not
+    here: they live in axo_storage, never on endpoints.)
 
-    ``functions``/``data`` hold opaque serialized blobs ("name:version" ->
-    bytes) not live FunctionRecord/DataRecord objects, so core.consensus never
-    depends on core.functions or core.data — layering stays one-directional.
-    ``buckets`` is keyed by bucket name alone (no version -- buckets aren't
-    versioned).
+    ``functions`` holds opaque serialized blobs ("name:version" -> bytes),
+    not live FunctionRecord objects, so core.consensus never depends on
+    core.functions — layering stays one-directional.
     """
 
     term: int = 0
     leader_ids: FrozenSet[str] = field(default_factory=frozenset)
     members: FrozenSet[str] = field(default_factory=frozenset)
     functions: Dict[str, bytes] = field(default_factory=dict)
-    data: Dict[str, bytes] = field(default_factory=dict)
-    buckets: Dict[str, bytes] = field(default_factory=dict)
     version: int = 0
 
 
@@ -36,8 +32,6 @@ class StateMutation:
     """A diff to fold into ClusterState."""
 
     function_changes: Dict[str, bytes] = field(default_factory=dict)
-    data_changes: Dict[str, bytes] = field(default_factory=dict)
-    bucket_changes: Dict[str, bytes] = field(default_factory=dict)
     leader_view: Optional[LeaderView] = None
 
 
@@ -80,10 +74,6 @@ class InMemoryReplicatedStateMachine(ReplicatedStateMachine):
         with self._lock:
             functions = dict(self._state.functions)
             functions.update(mutation.function_changes)
-            data = dict(self._state.data)
-            data.update(mutation.data_changes)
-            buckets = dict(self._state.buckets)
-            buckets.update(mutation.bucket_changes)
             leader_ids = self._state.leader_ids
             term = self._state.term
             if mutation.leader_view is not None:
@@ -94,8 +84,6 @@ class InMemoryReplicatedStateMachine(ReplicatedStateMachine):
                 leader_ids=leader_ids,
                 members=self._state.members,
                 functions=functions,
-                data=data,
-                buckets=buckets,
                 version=self._state.version + 1,
             )
 
@@ -130,71 +118,20 @@ def decode_function_changes(payload: bytes) -> Dict[str, bytes]:
     return {key: json.dumps(record_dict).encode("utf-8") for key, record_dict in decoded.items()}
 
 
-def encode_data_changes(data_changes: Dict[str, bytes]) -> bytes:
-    """Encodes a diff of data changes for the STATE_SYNC_PUSH payload.
-
-    Deliberate duplicate of encode_function_changes rather than a shared
-    generic helper -- two domains isn't enough signal to justify genericizing
-    this, matching the same call on ClusterState/StateMutation themselves.
-    """
+def encode_state_changes(function_changes: Dict[str, bytes]) -> bytes:
+    """The single payload frame a STATE_SYNC_PUSH command carries."""
     return json.dumps(
-        {key: json.loads(blob.decode("utf-8")) for key, blob in data_changes.items()}
+        {"functions": {key: json.loads(blob.decode("utf-8")) for key, blob in function_changes.items()}}
     ).encode("utf-8")
 
 
-def decode_data_changes(payload: bytes) -> Dict[str, bytes]:
-    """Decodes a STATE_SYNC_PUSH payload back into per-key serialized blobs."""
+def decode_state_changes(payload: bytes) -> Dict[str, bytes]:
+    """Decodes a STATE_SYNC_PUSH payload back into function_changes. Any
+    other domain an older peer still sends (data/buckets) is ignored."""
     if not payload:
         return {}
-    decoded = json.loads(payload.decode("utf-8"))
-    return {key: json.dumps(record_dict).encode("utf-8") for key, record_dict in decoded.items()}
-
-
-def encode_bucket_changes(bucket_changes: Dict[str, bytes]) -> bytes:
-    """Encodes a diff of bucket changes for the STATE_SYNC_PUSH payload.
-
-    Deliberate duplicate of encode_data_changes/encode_function_changes
-    rather than a shared generic helper -- same reasoning as those two.
-    """
-    return json.dumps(
-        {key: json.loads(blob.decode("utf-8")) for key, blob in bucket_changes.items()}
-    ).encode("utf-8")
-
-
-def decode_bucket_changes(payload: bytes) -> Dict[str, bytes]:
-    """Decodes a STATE_SYNC_PUSH payload back into per-key serialized blobs."""
-    if not payload:
-        return {}
-    decoded = json.loads(payload.decode("utf-8"))
-    return {key: json.dumps(record_dict).encode("utf-8") for key, record_dict in decoded.items()}
-
-
-def encode_state_changes(
-    function_changes: Dict[str, bytes], data_changes: Dict[str, bytes], bucket_changes: Dict[str, bytes],
-) -> bytes:
-    """Combines all three domains' diffs into the single payload frame a
-    STATE_SYNC_PUSH command carries -- a fixed 3-field combiner, not a
-    generic domain map, so encode_function_changes/encode_data_changes/
-    encode_bucket_changes stay independently simple and testable."""
-    return json.dumps(
-        {
-            "functions": {key: json.loads(blob.decode("utf-8")) for key, blob in function_changes.items()},
-            "data": {key: json.loads(blob.decode("utf-8")) for key, blob in data_changes.items()},
-            "buckets": {key: json.loads(blob.decode("utf-8")) for key, blob in bucket_changes.items()},
-        }
-    ).encode("utf-8")
-
-
-def decode_state_changes(payload: bytes) -> Tuple[Dict[str, bytes], Dict[str, bytes], Dict[str, bytes]]:
-    """Decodes a STATE_SYNC_PUSH payload back into
-    (function_changes, data_changes, bucket_changes)."""
-    if not payload:
-        return {}, {}, {}
     d = json.loads(payload.decode("utf-8"))
-    functions = {key: json.dumps(v).encode("utf-8") for key, v in d.get("functions", {}).items()}
-    data = {key: json.dumps(v).encode("utf-8") for key, v in d.get("data", {}).items()}
-    buckets = {key: json.dumps(v).encode("utf-8") for key, v in d.get("buckets", {}).items()}
-    return functions, data, buckets
+    return {key: json.dumps(v).encode("utf-8") for key, v in d.get("functions", {}).items()}
 
 
 def encode_cluster_state(state: ClusterState) -> bytes:
@@ -206,12 +143,6 @@ def encode_cluster_state(state: ClusterState) -> bytes:
             "members": list(state.members),
             "functions": {
                 key: json.loads(blob.decode("utf-8")) for key, blob in state.functions.items()
-            },
-            "data": {
-                key: json.loads(blob.decode("utf-8")) for key, blob in state.data.items()
-            },
-            "buckets": {
-                key: json.loads(blob.decode("utf-8")) for key, blob in state.buckets.items()
             },
             "version": state.version,
         }
@@ -226,7 +157,5 @@ def decode_cluster_state(payload: bytes) -> ClusterState:
         leader_ids=frozenset(d["leader_ids"]),
         members=frozenset(d["members"]),
         functions={key: json.dumps(v).encode("utf-8") for key, v in d["functions"].items()},
-        data={key: json.dumps(v).encode("utf-8") for key, v in d.get("data", {}).items()},
-        buckets={key: json.dumps(v).encode("utf-8") for key, v in d.get("buckets", {}).items()},
         version=d["version"],
     )

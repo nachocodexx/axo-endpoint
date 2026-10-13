@@ -15,7 +15,10 @@ class RuntimeSpec:
     requirements: List[str] = field(default_factory=list)
     image: Optional[str] = None
     env_vars: Dict[str, str] = field(default_factory=dict)
-    idle_ttl_seconds: float = 300.0
+    # How long an idle worker/container is kept warm before it is stopped.
+    # None = the endpoint's default (AXO_ENDPOINT_WORKER_IDLE_TTL_SECONDS);
+    # -1 = never (always warm, avoids cold starts).
+    idle_ttl_seconds: Optional[float] = None
     max_invocations: int = 0
     memory_limit_bytes: Optional[int] = None
     cpu_limit: Optional[float] = None
@@ -36,13 +39,14 @@ class RuntimeSpec:
         """Deserializes a RuntimeSpec from a plain dict (e.g. from the wire envelope)."""
         memory_limit_bytes = d.get("memory_limit_bytes")
         cpu_limit = d.get("cpu_limit")
+        idle_ttl_seconds = d.get("idle_ttl_seconds")
         return RuntimeSpec(
             type=d.get("type", "process"),
             python_version=d.get("python_version", "3.11"),
             requirements=list(d.get("requirements", [])),
             image=d.get("image"),
             env_vars=dict(d.get("env_vars", {})),
-            idle_ttl_seconds=float(d.get("idle_ttl_seconds", 300.0)),
+            idle_ttl_seconds=float(idle_ttl_seconds) if idle_ttl_seconds is not None else None,
             max_invocations=int(d.get("max_invocations", 0)),
             memory_limit_bytes=int(memory_limit_bytes) if memory_limit_bytes is not None else None,
             cpu_limit=float(cpu_limit) if cpu_limit is not None else None,

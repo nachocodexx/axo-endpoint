@@ -15,11 +15,12 @@ from axo_shared.activity.models import JOB_STARTED_EVENT
 from axo_shared.errors import AxoError
 from axo_shared.runtime.spec import RuntimeSpec
 from axo_endpoint.config import Config
-from axo_endpoint.core.data import DataRegistry
-from axo_endpoint.core.dataio import IORef, resolve_io_request
+from axo_endpoint.core.dataio import DataIOResolver, DataIOUnavailableError, IORef
 from axo_endpoint.core.errors import (
     ContainerCrashError,
     ContainerError,
+    RunnerBudgetExhaustedError,
+    FunctionExecError,
     InvocationError,
     JobCancelledError,
     JobTimeoutError,
@@ -27,6 +28,7 @@ from axo_endpoint.core.errors import (
 from axo_endpoint.core.events.bus import Event as BusEvent, EventBus
 from axo_endpoint.core.functions import FunctionRegistry
 from axo_endpoint.core.runtime.base import FunctionRuntime, FunctionRuntimeError, InvocationHandle
+from axo_endpoint.core.runtime.queue_deadlines import QueueDeadlines
 from axo_endpoint.core.storage.backend import StorageBackend, StorageKey
 from axo_endpoint.log import DumbLogger, Log
 from axo_endpoint.log.catalog import Component, Event
@@ -70,17 +72,21 @@ class ContainerFunctionRuntime(FunctionRuntime):
         summoner: ContainerSummoner,
         on_complete: OnComplete,
         config: Config,
-        storage_backends: Optional[Dict[str, StorageBackend]] = None,
-        data_registry: Optional[DataRegistry] = None,
+        dataio: Optional[DataIOResolver] = None,
         event_bus: Optional[EventBus] = None,
+        queue_deadlines: Optional[QueueDeadlines] = None,
         logger: _Logger = None,
     ) -> None:
         self._registry = function_registry
+        self._queue_deadlines = queue_deadlines or QueueDeadlines()
+        # Jobs waiting for room in the runner budget (see _wait_for_room).
+        self._room_waiters: Dict[str, StorageKey] = {}
+        self._room_waiters_lock = threading.Lock()
+        self._room_poll_seconds = 0.5
         self._summoner = summoner
         self._on_complete = on_complete
         self._config = config
-        self._storage_backends = storage_backends or {}
-        self._data_registry = data_registry
+        self._dataio = dataio
         self._event_bus = event_bus
         self._logger: _Logger = logger or DumbLogger()
 
@@ -108,6 +114,7 @@ class ContainerFunctionRuntime(FunctionRuntime):
         self._concurrency_client: Optional[ConcurrencyClient] = None
         self._forward_job_fn: Optional[ForwardJobFn] = None
         self._on_forwarded: Optional[OnForwarded] = None
+        self._on_attempt_retried: Optional[Callable[[str, AxoError, Optional[float]], None]] = None
 
     def attach_cluster_placement(
         self,
@@ -122,6 +129,12 @@ class ContainerFunctionRuntime(FunctionRuntime):
         self._concurrency_client = concurrency_client
         self._forward_job_fn = forward_job_fn
         self._on_forwarded = on_forwarded
+
+    def attach_usage_hook(self, on_attempt_retried: Callable[[str, AxoError, Optional[float]], None]) -> None:
+        """Called with (job_id, error, started_at) for every failed attempt
+        that is about to be retried, so it can be metered on its own (the
+        final attempt goes through on_complete as usual)."""
+        self._on_attempt_retried = on_attempt_retried
 
     def invoke(
         self,
@@ -139,41 +152,120 @@ class ContainerFunctionRuntime(FunctionRuntime):
                 context={"function_id": function_ref.id},
             )
             return Err(err)
+        spec = get_result.unwrap().runtime_spec
 
-        record = get_result.unwrap()
-        spec = record.runtime_spec
+        placed = self._place(function_ref, job_id, params, spec)
+        if placed.is_err:
+            err = placed.unwrap_err()
+            if isinstance(err, RunnerBudgetExhaustedError):
+                return self._wait_for_room(function_ref, job_id, params, spec, err)
+            return Err(err)
+        handle = placed.unwrap()
+        if handle is None:
+            self._log_forwarded(function_ref, job_id, t0)
+        else:
+            self._dispatch_to(handle, function_ref, job_id, params, t0)
+        return Ok(InvocationHandle(job_id=job_id, function_id=function_ref.id, version=function_ref.version))
 
+    def _place(
+        self, function_ref: StorageKey, job_id: str, params: Dict[str, Any], spec: RuntimeSpec,
+    ) -> Result[Optional[ContainerHandle], AxoError]:
+        """Picks the container this job runs on: a local handle, None if it
+        was forwarded to another endpoint, or RunnerBudgetExhaustedError if
+        it must wait for room in this endpoint's runner budget."""
         if self._concurrency_client is None:
             # Cluster placement never wired in -- summon() alone still does
             # reuse/queue/growth exactly as it always has, unchanged.
             summon_result = self._summoner.summon(function_ref.id, function_ref.version or 0, spec)
             if summon_result.is_err:
                 raw = summon_result.unwrap_err()
+                if isinstance(raw, RunnerBudgetExhaustedError):
+                    return Err(raw)
                 return Err(InvocationError(str(raw), context={"function_id": function_ref.id}))
-            handle = summon_result.unwrap()
-        else:
-            placement_result = self._resolve_placement(function_ref, job_id, params, spec)
-            if placement_result.is_err:
-                return Err(placement_result.unwrap_err())
-            handle = placement_result.unwrap()
-            if handle is None:
-                # Forwarded to a different endpoint -- nothing left to
-                # dispatch here. That endpoint's own on_complete/JOB_COMPLETED
-                # is what eventually resolves this job_id; this endpoint's own
-                # local result stays PENDING until the replicated terminal
-                # result arrives (see job result replication).
-                duration_ms = round((time.monotonic() - t0) * 1000, 2)
-                self._logger.info_event(
-                    Event.Concurrency.JOB_FORWARDED,
-                    component=Component.CONTAINER_RUNTIME,
-                    status="ok",
-                    job_id=job_id,
-                    function_id=function_ref.id,
-                    duration_ms=duration_ms,
-                )
-                return Ok(InvocationHandle(job_id=job_id, function_id=function_ref.id, version=function_ref.version))
+            return Ok(summon_result.unwrap())
+        # None = forwarded to a different endpoint -- nothing left to
+        # dispatch here. That endpoint's own on_complete/JOB_COMPLETED is
+        # what eventually resolves this job_id; this endpoint's own local
+        # result stays PENDING until the replicated terminal result arrives
+        # (see job result replication).
+        return self._resolve_placement(function_ref, job_id, params, spec)
 
-        # Create scratch directory
+    def _log_forwarded(self, function_ref: StorageKey, job_id: str, t0: float) -> None:
+        self._logger.info_event(
+            Event.Concurrency.JOB_FORWARDED,
+            component=Component.CONTAINER_RUNTIME,
+            status="ok",
+            job_id=job_id,
+            function_id=function_ref.id,
+            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+        )
+
+    def _wait_for_room(
+        self,
+        function_ref: StorageKey,
+        job_id: str,
+        params: Dict[str, Any],
+        spec: RuntimeSpec,
+        err: RunnerBudgetExhaustedError,
+    ) -> Result[InvocationHandle, FunctionRuntimeError]:
+        """No room in the runner budget: the job waits (like in a queue)
+        on a daemon thread that retries placement until a runner is freed,
+        its max_wait runs out, or it is cancelled. Never blocks the caller."""
+        accepted = InvocationHandle(job_id=job_id, function_id=function_ref.id, version=function_ref.version)
+        rejected = self._queue_deadlines.admit(job_id, runner_free=False)
+        if rejected is not None:
+            self._on_complete(accepted, Err(rejected), [])
+            return Ok(accepted)
+        with self._room_waiters_lock:
+            self._room_waiters[job_id] = function_ref
+        self._logger.info_event(
+            Event.Container.WAITING_FOR_ROOM,
+            component=Component.CONTAINER_RUNTIME,
+            job_id=job_id,
+            function_id=function_ref.id,
+            **err.to_dict(),
+        )
+        threading.Thread(
+            target=self._room_wait_loop, args=(function_ref, job_id, params, spec), daemon=True,
+        ).start()
+        return Ok(accepted)
+
+    def _room_wait_loop(
+        self, function_ref: StorageKey, job_id: str, params: Dict[str, Any], spec: RuntimeSpec,
+    ) -> None:
+        accepted = InvocationHandle(job_id=job_id, function_id=function_ref.id, version=function_ref.version)
+        while True:
+            time.sleep(self._room_poll_seconds)
+            with self._room_waiters_lock:
+                if job_id not in self._room_waiters:
+                    return  # dropped by cancel()/drop_queued(), already reported
+            late = self._queue_deadlines.pop_if_overdue(job_id, time.time())
+            if late is not None:
+                with self._room_waiters_lock:
+                    still_waiting = self._room_waiters.pop(job_id, None) is not None
+                if still_waiting:
+                    self._on_complete(accepted, Err(late), [])
+                return
+            placed = self._place(function_ref, job_id, params, spec)
+            if placed.is_err and isinstance(placed.unwrap_err(), RunnerBudgetExhaustedError):
+                continue
+            with self._room_waiters_lock:
+                still_waiting = self._room_waiters.pop(job_id, None) is not None
+            if not still_waiting:
+                return  # cancelled while placing; a reserved runner just stays warm
+            if placed.is_err:
+                self._on_complete(accepted, Err(placed.unwrap_err()), [])
+            elif placed.unwrap() is None:
+                self._log_forwarded(function_ref, job_id, time.monotonic())
+            else:
+                self._dispatch_to(placed.unwrap(), function_ref, job_id, params, time.monotonic())
+            return
+
+    def _dispatch_to(
+        self, handle: ContainerHandle, function_ref: StorageKey, job_id: str, params: Dict[str, Any], t0: float,
+    ) -> None:
+        """Sends the job to ``handle``: straight into its queue if it is
+        ready, else via a thread that waits for its cold start."""
         scratch_dir = self._alloc_scratch(job_id)
 
         # `ready_event` stays set forever once the container has *ever*
@@ -228,7 +320,6 @@ class ContainerFunctionRuntime(FunctionRuntime):
             service_name=handle.service_name,
             duration_ms=duration_ms,
         )
-        return Ok(InvocationHandle(job_id=job_id, function_id=function_ref.id, version=function_ref.version))
 
     def _resolve_placement(
         self,
@@ -274,7 +365,10 @@ class ContainerFunctionRuntime(FunctionRuntime):
                 # routed to "place with yourself" -> least_busy() finds
                 # nothing -> a permanent, self-inflicted dead end.
                 self._concurrency_client.release(function_id, version, decision.slot_index)
-                return Err(InvocationError(str(summon_result.unwrap_err()), context={"function_id": function_id}))
+                raw = summon_result.unwrap_err()
+                if isinstance(raw, RunnerBudgetExhaustedError):
+                    return Err(raw)  # no room here right now: the job waits, then asks again
+                return Err(InvocationError(str(raw), context={"function_id": function_id}))
             return Ok(summon_result.unwrap())
 
         # action == "place"
@@ -328,6 +422,16 @@ class ContainerFunctionRuntime(FunctionRuntime):
             import queue
             handle._job_queue = queue.Queue()
 
+        runner_free = handle.status != ContainerStatus.BUSY and handle._job_queue.empty()
+        rejected = self._queue_deadlines.admit(job_id, runner_free=runner_free)
+        if rejected is not None:
+            # max_wait=0 and the job would have to queue behind another one.
+            self._on_complete(
+                InvocationHandle(job_id=job_id, function_id=handle.function_id, version=handle.version),
+                Err(rejected), [],
+            )
+            return
+
         with handle._lock:
             handle.status = ContainerStatus.BUSY
             handle.last_used = time.time()
@@ -340,6 +444,12 @@ class ContainerFunctionRuntime(FunctionRuntime):
 
     def sweep_max_invocations(self, max_invocations: int) -> List[str]:
         return self._summoner.sweep_max_invocations(max_invocations)
+
+    def _resolve_io(self, job_id: str, op: str, ref: Any, data: Optional[bytes]):
+        """One dataio request from the running function, answered via axo_storage."""
+        if self._dataio is None:
+            return Err(DataIOUnavailableError("this endpoint has no axo_storage configured", context={"op": op}))
+        return self._dataio.resolve(job_id, op, ref, data)
 
     def cancel(self, job_id: str) -> bool:
         """Stops job_id: dismisses its container (same teardown _handle_crash
@@ -382,7 +492,24 @@ class ContainerFunctionRuntime(FunctionRuntime):
                     )
                     self._on_complete(queued_handle, Err(crash_err), [])
                 return True
+        return self.drop_queued(job_id, JobCancelledError(
+            "job was cancelled before it started", context={"job_id": job_id},
+        ))
 
+    def drop_queued(self, job_id: str, error: AxoError) -> bool:
+        """Finishes job_id with ``error`` if it is still waiting in some
+        container's queue, or for room in the runner budget (never touches
+        a running job). Used by cancel() and by the max_wait sweep."""
+        with self._room_waiters_lock:
+            waiting_ref = self._room_waiters.pop(job_id, None)
+        if waiting_ref is not None:
+            self._queue_deadlines.discard(job_id)
+            self._on_complete(
+                InvocationHandle(job_id=job_id, function_id=waiting_ref.id, version=waiting_ref.version),
+                Err(error), [],
+            )
+            return True
+        for handle in self._summoner.list_handles():
             job_queue = getattr(handle, "_job_queue", None)
             if job_queue is None:
                 continue
@@ -407,14 +534,13 @@ class ContainerFunctionRuntime(FunctionRuntime):
                     service_name=handle.service_name,
                     job_id=job_id,
                     status="queued",
+                    reason=error.name,
                 )
+                self._queue_deadlines.discard(job_id)
                 invocation_handle = InvocationHandle(
                     job_id=job_id, function_id=handle.function_id, version=handle.version,
                 )
-                self._on_complete(invocation_handle, Err(JobCancelledError(
-                    "job was cancelled before it started",
-                    context={"function_id": handle.function_id, "job_id": job_id},
-                )), [])
+                self._on_complete(invocation_handle, Err(error), [])
                 return True
         return False
 
@@ -498,6 +624,10 @@ class ContainerFunctionRuntime(FunctionRuntime):
                 continue
 
             inv_handle = InvocationHandle(job_id=job_id, function_id=handle.function_id, version=handle.version)
+            late = self._queue_deadlines.take(job_id, time.time())
+            if late is not None:
+                self._on_complete(inv_handle, Err(late), [])
+                continue
             if not self._pump_one_job(sock, handle, inv_handle, job_id, scratch_dir, params, disconnected):
                 break
 
@@ -601,7 +731,7 @@ class ContainerFunctionRuntime(FunctionRuntime):
                     self._on_complete(inv_handle, Ok(value), result_warnings)
                 else:
                     error_msg = payload_b.decode("utf-8", errors="replace")
-                    self._on_complete(inv_handle, Err(FunctionRuntimeError(error_msg)), result_warnings)
+                    self._on_complete(inv_handle, Err(FunctionExecError(error_msg)), result_warnings)
                 return True
 
             elif tag == b"io_request":
@@ -611,13 +741,13 @@ class ContainerFunctionRuntime(FunctionRuntime):
                 _, request_id_b, op_b, ref_json_b, data_b = frames
                 op = op_b.decode("utf-8")
                 ref = IORef.from_dict(json.loads(ref_json_b.decode("utf-8")))
-                result = resolve_io_request(op, ref, data_b or None, self._storage_backends, self._data_registry)
+                result = self._resolve_io(job_id, op, ref, data_b or None)
                 self._logger.debug_event(
                     Event.DataIO.REQUEST_RECEIVED if result.is_ok else Event.DataIO.REQUEST_FAILED,
                     component=Component.DATAIO,
                     job_id=job_id,
                     op=op,
-                    ref_kind=ref.kind,
+                    bucket=ref.bucket,
                 )
                 reply = [b"io_reply", request_id_b, b"ok", result.unwrap()] if result.is_ok \
                     else [b"io_reply", request_id_b, b"err", str(result.unwrap_err()).encode()]
@@ -770,6 +900,8 @@ class ContainerFunctionRuntime(FunctionRuntime):
                 self._attempts.pop(job_id, None)
 
         if retry_number is not None:
+            if self._on_attempt_retried is not None:
+                self._on_attempt_retried(job_id, err, inv_handle.started_at)
             self._logger.info_event(
                 Event.Job.RETRY_SCHEDULED,
                 component=Component.CONTAINER_RUNTIME,

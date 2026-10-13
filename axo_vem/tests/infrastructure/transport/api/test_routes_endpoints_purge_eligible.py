@@ -51,25 +51,3 @@ def test_running_endpoint_is_never_purge_eligible(client, collections):
     body = response.json()
     assert body["purge_eligible"] is False
     assert body["unreachable_since"] is None
-
-
-def test_purge_eligibility_honors_the_callers_own_profile_preference(client, collections, db):
-    """A caller with a shorter endpoint_purge_eligible_after_minutes
-    preference sees purge_eligible flip to True sooner than the system
-    default would allow -- resolved per FAKE_USER.key, mirroring
-    history.py's _since_for."""
-    db["user_profiles"].insert_one({
-        "_id": FAKE_USER.key, "user_id": FAKE_USER.key, "profile_photo": "",
-        "preferences": {
-            "color": None, "view_mode": "list", "language": "en",
-            "activity_window_minutes": 60, "endpoint_purge_eligible_after_minutes": 5,
-        },
-    })
-    ten_minutes_ago = datetime.now(timezone.utc) - timedelta(minutes=10)
-    collections.endpoints.insert_one({
-        "_id": "n0", "endpoint_id": "n0", "status": "unreachable", "created_at": _iso(ten_minutes_ago),
-    })
-
-    response = client.get("/endpoints/n0")
-    assert response.status_code == 200
-    assert response.json()["purge_eligible"] is True

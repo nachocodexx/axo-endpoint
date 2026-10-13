@@ -17,3 +17,7 @@ htmlcov/
 experiments/
 fault_tolerance.md
 upgrade.md
+.axo_endpoint/
+.axo_storage/
+axo_storage/.axo_storage/
+xolo*.md

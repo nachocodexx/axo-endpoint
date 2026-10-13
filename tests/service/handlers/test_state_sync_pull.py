@@ -14,7 +14,6 @@ def state_machine():
             leader_ids=frozenset({"leader"}),
             members=frozenset({"leader", "self"}),
             functions={"foo:1": b'{"name": "foo"}'},
-            data={"bar:1": b'{"name": "bar"}'},
             version=1,
         )
     )
@@ -29,4 +28,4 @@ def test_pull_returns_current_snapshot(state_machine):
     assert result.ok is True
     decoded = decode_cluster_state(result.payload)
     assert decoded == state_machine.snapshot()
-    assert decoded.data == {"bar:1": b'{"name": "bar"}'}
+    assert decoded.functions == {"foo:1": b'{"name": "foo"}'}

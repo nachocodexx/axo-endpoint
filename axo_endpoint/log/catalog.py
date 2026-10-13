@@ -8,17 +8,11 @@ class Component:
     DISPATCHER                       = "dispatcher"
     RUNTIME                          = "runtime"
     HANDLER_JOB_SUBMIT               = "handler.job_submit"
+    USAGE                            = "core.usage"
     HANDLER_JOB_RESULT               = "handler.job_result"
     HANDLER_FUNCTION_REGISTER        = "handler.function_register"
     HANDLER_FUNCTION_UPDATE          = "handler.function_update"
     HANDLER_FUNCTION_DELETE          = "handler.function_delete"
-    HANDLER_DATA_REGISTER            = "handler.data_register"
-    HANDLER_DATA_DELETE              = "handler.data_delete"
-    HANDLER_DATA_CHUNK_PUT           = "handler.data_chunk_put"
-    HANDLER_DATA_CHUNK_GET           = "handler.data_chunk_get"
-    HANDLER_DATA_STATUS              = "handler.data_status"
-    HANDLER_DATA_INFO                = "handler.data_info"
-    HANDLER_BUCKET_REGISTER          = "handler.bucket_register"
     HANDLER_PEER_ANNOUNCE            = "handler.peer_announce"
     HANDLER_CONTAINER_BOOTSTRAP      = "handler.container_bootstrap"
     CONTAINER_RUNTIME                = "container_runtime"
@@ -30,10 +24,8 @@ class Component:
     HANDLER_STATE_SYNC_PULL          = "handler.state_sync_pull"
     HANDLER_LEADER_PROXY             = "handler.leader_proxy"
     DATAIO                           = "dataio"
-    BLOB_REPLICATION                 = "blob_replication"
     HANDLER_ACTIVITY_LIST            = "handler.activity_list"
     EXTERNAL_FORWARDING              = "external_forwarding"
-    HANDLER_VIRTUAL_ENV_ASSIGN       = "handler.virtual_env_assign"
     CONCURRENCY_LEDGER               = "concurrency_ledger"
     HANDLER_CONCURRENCY_SLOT_REQUEST = "handler.concurrency_slot_request"
     HANDLER_CONCURRENCY_SLOT_RELEASE = "handler.concurrency_slot_release"
@@ -47,6 +39,7 @@ class Component:
 
 class Event:
     class App:
+        DRAIN_REQUESTED = "APP.DRAIN_REQUESTED"
         STARTED   = "APP.STARTED"
         STOPPED   = "APP.STOPPED"
         HEARTBEAT = "APP.HEARTBEAT"
@@ -56,6 +49,7 @@ class Event:
         SUBSCRIBER_STOPPED = "HEARTBEAT.SUBSCRIBER_STOPPED"
         FRAME_DROPPED      = "HEARTBEAT.FRAME_DROPPED"
         DECODE_ERROR       = "HEARTBEAT.DECODE_ERROR"
+        FOREIGN_VE_DROPPED = "HEARTBEAT.FOREIGN_VE_DROPPED"
 
     class Peer:
         DISCOVERED        = "PEER.DISCOVERED"
@@ -63,6 +57,7 @@ class Event:
         EVICTED           = "PEER.EVICTED"
         ANNOUNCE_SENT     = "PEER.ANNOUNCE_SENT"
         ANNOUNCE_RECEIVED = "PEER.ANNOUNCE_RECEIVED"
+        ANNOUNCE_REJECTED = "PEER.ANNOUNCE_REJECTED"
 
     class Router:
         REQUEST_DROPPED    = "ROUTER.REQUEST_DROPPED"
@@ -95,24 +90,13 @@ class Event:
         RETRY_EXHAUSTED = "JOB.RETRY_EXHAUSTED"
         CANCEL_REQUESTED = "JOB.CANCEL_REQUESTED"
 
+    class Usage:
+        RECORDED = "USAGE.RECORDED"
+
     class Function:
         REGISTERED = "FUNCTION.REGISTERED"
         UPDATED    = "FUNCTION.UPDATED"
         DELETED    = "FUNCTION.DELETED"
-
-    class Data:
-        REGISTERED       = "DATA.REGISTERED"
-        DELETED          = "DATA.DELETED"
-        CHUNK_STORED     = "DATA.CHUNK_STORED"
-        CHUNK_READ       = "DATA.CHUNK_READ"
-        STATUS_QUERIED   = "DATA.STATUS_QUERIED"
-        INFO_QUERIED     = "DATA.INFO_QUERIED"
-        STREAM_OPENED    = "DATA.STREAM_OPENED"
-        STREAM_FINALIZED = "DATA.STREAM_FINALIZED"
-        REPLICATION_COMPLETE = "DATA.REPLICATION_COMPLETE"
-
-    class Bucket:
-        REGISTERED = "BUCKET.REGISTERED"
 
     class DataIO:
         REQUEST_RECEIVED = "DATAIO.REQUEST_RECEIVED"
@@ -136,14 +120,10 @@ class Event:
     class Activity:
         LISTED = "ACTIVITY.LISTED"
 
-    class VirtualEnv:
-        ASSIGNED       = "VIRTUAL_ENV.ASSIGNED"
-        DETACHED       = "VIRTUAL_ENV.DETACHED"
-        ASSIGN_REJECTED = "VIRTUAL_ENV.ASSIGN_REJECTED"
-
     class External:
         PUBLISHED             = "EXTERNAL.PUBLISHED"
         PUBLISH_FAILED        = "EXTERNAL.PUBLISH_FAILED"
+        DELIVERY_RETRY        = "EXTERNAL.DELIVERY_RETRY"
         VERSION_UNKNOWN_SKIPPED = "EXTERNAL.VERSION_UNKNOWN_SKIPPED"
 
     class Container:
@@ -160,6 +140,7 @@ class Event:
         RESULT_PUSHED       = "CONTAINER.RESULT_PUSHED"
         BUILD_STARTED       = "CONTAINER.BUILD_STARTED"
         BUILD_COMPLETE      = "CONTAINER.BUILD_COMPLETE"
+        WAITING_FOR_ROOM    = "CONTAINER.WAITING_FOR_ROOM"
 
     class Concurrency:
         SLOT_GRANTED            = "CONCURRENCY.SLOT_GRANTED"

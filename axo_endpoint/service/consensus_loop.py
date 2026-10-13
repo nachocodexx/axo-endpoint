@@ -184,15 +184,13 @@ def run_consensus_tick(
 
     mutation = dirty_tracker.drain()
     state_machine.apply_local(mutation)
-    if not mutation.function_changes and not mutation.data_changes and not mutation.bucket_changes:
+    if not mutation.function_changes:
         return new_high_water, member_ids
 
     logger.info_event(
         Event.Consensus.REPLICATION_FLUSHED,
         component=Component.CONSENSUS,
         function_count=len(mutation.function_changes),
-        data_count=len(mutation.data_changes),
-        bucket_count=len(mutation.bucket_changes),
         term=view.term,
     )
     for member in members:

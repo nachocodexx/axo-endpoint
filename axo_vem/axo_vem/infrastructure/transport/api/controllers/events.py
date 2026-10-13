@@ -4,19 +4,19 @@ import json
 from typing import Callable
 
 from fastapi import APIRouter, Depends, HTTPException
-from xolo.client.models import UserDTO
+from axo_vem.infrastructure.auth.service_token import ActingUser
 
 from axo_vem.infrastructure.database.kurrent.reader import KurrentReader
 
 
-def build_router(reader: KurrentReader, current_user_dependency: Callable[..., UserDTO]) -> APIRouter:
+def build_router(reader: KurrentReader, current_user_dependency: Callable[..., ActingUser]) -> APIRouter:
     """The one route allowed to bypass Mongo and read Kurrent directly --
     exposing raw event history for a single entity's stream, for anything
     not yet projected into a read model."""
     router = APIRouter(tags=["job telemetry"])
 
     @router.get("/events/{category}/{entity_id}")
-    def get_raw_events(category: str, entity_id: str, _current_user: UserDTO = Depends(current_user_dependency)):
+    def get_raw_events(category: str, entity_id: str, _current_user: ActingUser = Depends(current_user_dependency)):
         stream_name = f"{category}-{entity_id}"
         try:
             records = reader.get_stream(stream_name)

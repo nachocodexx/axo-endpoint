@@ -3,6 +3,9 @@ from axo_endpoint.core.runtime.base import (
     FunctionRuntimeError,
     InvocationContext,
     InvocationHandle,
+    OUTPUT_BUCKETS_PARAM,
+    build_invocation,
+    split_output_buckets,
 )
 
 __all__ = [
@@ -10,4 +13,7 @@ __all__ = [
     "FunctionRuntimeError",
     "InvocationContext",
     "InvocationHandle",
+    "OUTPUT_BUCKETS_PARAM",
+    "build_invocation",
+    "split_output_buckets",
 ]

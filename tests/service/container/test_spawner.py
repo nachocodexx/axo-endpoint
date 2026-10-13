@@ -31,6 +31,13 @@ class _FakeConfig:
     AXO_ENDPOINT_CONTAINER_READINESS_TIMEOUT_SECONDS = 0.3
     AXO_ENDPOINT_CONTAINER_MEMORY_LIMIT_BYTES = 1073741824
     AXO_ENDPOINT_CONTAINER_CPU_LIMIT = 1.0
+    AXO_ENDPOINT_VIRTUAL_ENV_ID = None
+    AXO_ENDPOINT_CPU_CORES = 1.0
+    AXO_ENDPOINT_MEMORY_MB = 1024
+    AXO_ENDPOINT_RUNNER_BUDGET_ENFORCED = False
+    AXO_ENDPOINT_RESERVED_CPU_CORES = 0.25
+    AXO_ENDPOINT_RESERVED_MEMORY_MB = 256
+    AXO_ENDPOINT_RUNNER_CGROUP_PARENT = ""
 
 
 @pytest.fixture
@@ -425,3 +432,102 @@ def test_concurrent_ensure_image_calls_for_same_tag_build_only_once(summoner, mo
     assert len(results) == 5
     assert all(r.is_ok for r in results)
     assert fake_client.build_calls == 1
+
+
+# ── runner budget / labels / per-function idle ──────────────────────────────
+
+class _BudgetConfig(_FakeConfig):
+    """2 cores / 2 GB endpoint, 0.25 core / 256 MB kept for itself:
+    room for exactly one 1-core / 1 GB runner."""
+    AXO_ENDPOINT_VIRTUAL_ENV_ID = "ml-prod"
+    AXO_ENDPOINT_CPU_CORES = 2.0
+    AXO_ENDPOINT_MEMORY_MB = 2048
+    AXO_ENDPOINT_RUNNER_BUDGET_ENFORCED = True
+    AXO_ENDPOINT_RUNNER_CGROUP_PARENT = "/axo/ep-test"
+
+
+@pytest.fixture
+def budget_summoner(event_bus, monkeypatch):
+    summoner = ContainerSummoner(config=_BudgetConfig(), event_bus=event_bus)
+    fake_client = _FakeDockerClient()
+    monkeypatch.setattr(summoner._spawner, "_docker", lambda: fake_client)
+    monkeypatch.setattr(summoner._spawner, "stop", lambda handle, timeout=5: __import__("option").Ok(None))
+    summoner.fake_client = fake_client
+    # Only the reservation matters here: skip the background Docker spawn
+    # (and its readiness timeout, which would flip handles to CRASHED).
+    summoner.real_spawn = summoner._spawn_in_background
+    monkeypatch.setattr(summoner, "_spawn_in_background", lambda handle, spec: None)
+    return summoner
+
+
+SPEC = RuntimeSpec(type="container", python_version="3.10")
+
+
+def test_runner_carries_labels_and_cgroup_parent(budget_summoner):
+    handle = budget_summoner.summon("fn1", 1, SPEC).unwrap()
+    budget_summoner.real_spawn(handle, SPEC)
+    kwargs = budget_summoner.fake_client.run_kwargs
+    assert kwargs["labels"] == {
+        "axo.role": "runner", "axo.ve": "ml-prod", "axo.endpoint": "axo-endpoint-test",
+        "axo.function": "fn1", "axo.function_version": "1", "axo.pool_index": "0",
+    }
+    assert kwargs["cgroup_parent"] == "/axo/ep-test"
+
+
+def test_no_room_for_another_function_while_the_first_runner_is_busy(budget_summoner):
+    first = budget_summoner.summon("fn1", 1, SPEC).unwrap()
+    first.status = ContainerStatus.BUSY
+
+    result = budget_summoner.summon("fn2", 1, SPEC)
+
+    assert result.is_err
+    assert result.unwrap_err().name == "RUNNER_BUDGET_EXHAUSTED"
+    assert budget_summoner.budget_summary()["cpu_reserved"] == 1.0
+
+
+def test_same_function_queues_behind_its_runner_instead_of_growing(budget_summoner):
+    spec = RuntimeSpec(type="container", python_version="3.10", max_concurrency=4)
+    first = budget_summoner.summon("fn1", 1, spec).unwrap()
+    first.status = ContainerStatus.BUSY
+
+    assert budget_summoner.summon("fn1", 1, spec).unwrap() is first
+
+
+def test_idle_runner_of_another_function_is_evicted_to_make_room(budget_summoner):
+    first = budget_summoner.summon("fn1", 1, SPEC).unwrap()
+    first.status = ContainerStatus.IDLE
+
+    second = budget_summoner.summon("fn2", 1, SPEC)
+
+    assert second.is_ok
+    assert first.status == ContainerStatus.DISMISSED
+    assert budget_summoner.budget_summary()["runners"] == 1
+
+
+def test_always_warm_runner_is_never_evicted(budget_summoner):
+    warm = RuntimeSpec(type="container", python_version="3.10", idle_ttl_seconds=-1)
+    first = budget_summoner.summon("fn1", 1, warm).unwrap()
+    first.status = ContainerStatus.IDLE
+
+    assert budget_summoner.summon("fn2", 1, SPEC).unwrap_err().name == "RUNNER_BUDGET_EXHAUSTED"
+    assert first.status == ContainerStatus.IDLE
+
+
+def test_runner_bigger_than_the_whole_budget_fails_instead_of_waiting(budget_summoner):
+    huge = RuntimeSpec(type="container", python_version="3.10", cpu_limit=8.0)
+    result = budget_summoner.summon("fn1", 1, huge)
+    assert result.unwrap_err().name == "CONTAINER_ERROR"
+
+
+def test_sweep_idle_uses_each_functions_own_idle_time(summoner):
+    short, never, default = _handle("short"), _handle("never"), _handle("default")
+    short.idle_ttl_seconds, never.idle_ttl_seconds = 10.0, -1
+    for h in (short, never, default):
+        h.status, h.last_used = ContainerStatus.IDLE, 100.0
+        summoner._handles[(h.function_id, h.version)] = [h]
+    dismissed = []
+    summoner.dismiss = lambda handle, reason="dismissed": dismissed.append((handle.function_id, reason))
+
+    summoner.sweep_idle(ttl_seconds=300.0, now=200.0)
+
+    assert dismissed == [("short", "idle_ttl")]

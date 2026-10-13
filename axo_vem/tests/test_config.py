@@ -9,9 +9,8 @@ def test_defaults_with_no_env_vars(monkeypatch):
         "AXO_VEM_KURRENT_URI",
         "AXO_VEM_MONGO_URI",
         "AXO_VEM_MONGO_DB_NAME",
-        "AXO_VEM_XOLO_URI",
-        "AXO_VEM_XOLO_API_KEY",
-        "AXO_VEM_XOLO_ACCOUNT_ID",
+        "AXO_VEM_VE_ID",
+        "AXO_VEM_SERVICE_TOKEN",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -23,9 +22,8 @@ def test_defaults_with_no_env_vars(monkeypatch):
     assert config.AXO_VEM_KURRENT_URI == "esdb://localhost:2113?tls=false"
     assert config.AXO_VEM_MONGO_URI == "mongodb://localhost:27017"
     assert config.AXO_VEM_MONGO_DB_NAME == "axo_vem"
-    assert config.AXO_VEM_XOLO_URI == "http://localhost:10000/api/v4"
-    assert config.AXO_VEM_XOLO_API_KEY == ""
-    assert config.AXO_VEM_XOLO_ACCOUNT_ID == ""
+    assert config.AXO_VEM_VE_ID == ""
+    assert config.AXO_VEM_SERVICE_TOKEN == ""  # no token = every HTTP call refused
 
 
 def test_env_var_overrides(monkeypatch):

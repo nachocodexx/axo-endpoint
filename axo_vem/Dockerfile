@@ -9,6 +9,8 @@ FROM python:${PYTHON_VERSION}-slim
 
 WORKDIR /app
 COPY axo_shared/ /app/axo_shared/
+# path dev-dependency (bucket tests run against a real axo_storage)
+COPY axo_storage/ /app/axo_storage/
 
 WORKDIR /app/axo_vem
 

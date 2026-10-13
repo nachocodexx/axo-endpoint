@@ -91,6 +91,8 @@ class ConcurrencyLedger:
         # (function_id, version) -> {endpoint_id: (live, idle)}, fed by
         # heartbeat-gossiped container_pools metrics.
         self._pool_metrics: Dict[Tuple[str, int], Dict[str, Tuple[int, int]]] = {}
+        # Endpoints that are draining (gossiped): never given new work.
+        self._draining: Set[str] = set()
         # (function_id, version) -> next round_robin position
         self._rr_cursor: Dict[Tuple[str, int], int] = {}
 
@@ -120,23 +122,26 @@ class ConcurrencyLedger:
             # risk is smaller (an occasional avoidable queue, not a
             # permanent one) and unavoidable without a live query to a peer.
             idle_owners = [
-                eid for eid in owners if eid != requester_id and self._idle_count(key, eid) > 0
+                eid for eid in owners
+                if eid != requester_id and eid not in self._draining and self._idle_count(key, eid) > 0
             ]
             if idle_owners:
                 # Reuse always wins over growth -- never cold-start a new
                 # container while one already sits idle elsewhere.
                 return SlotDecision.place(self._choose(key, idle_owners))
 
-            if len(grants) < max(1, max_concurrency):
+            if len(grants) < max(1, max_concurrency) and requester_id not in self._draining:
                 slot_index = self._smallest_unused_index(grants)
                 grants[slot_index] = requester_id
                 return SlotDecision.granted(slot_index)
 
-            if not owners:
+            accepting = [eid for eid in owners if eid not in self._draining]
+            if not accepting:
                 # max_concurrency <= 0 shouldn't happen (callers clamp to
-                # >= 1), but fail safe rather than crash on an empty pool.
+                # >= 1), and every owner draining means wait for capacity:
+                # fail safe rather than crash on an empty pool.
                 return SlotDecision.retry()
-            return SlotDecision.place(self._choose(key, owners))
+            return SlotDecision.place(self._choose(key, accepting))
 
     def release_slot(self, function_id: str, version: int, slot_index: int, endpoint_id: str) -> None:
         """Frees a slot, but only if it still maps to the releasing
@@ -183,6 +188,14 @@ class ConcurrencyLedger:
         self._ready.set()
 
     # ── gossip ingestion ─────────────────────────────────────────────────────
+
+    def set_draining(self, endpoint_id: str, draining: bool) -> None:
+        """Gossiped per heartbeat: a draining endpoint gets no new placements."""
+        with self._lock:
+            if draining:
+                self._draining.add(endpoint_id)
+            else:
+                self._draining.discard(endpoint_id)
 
     def ingest_peer_metrics(self, endpoint_id: str, container_pools: Dict[str, Dict[str, int]]) -> None:
         """Records one endpoint's self-reported live/idle container counts

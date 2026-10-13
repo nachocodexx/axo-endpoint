@@ -17,7 +17,7 @@ class JobCancelHandler(CommandHandler):
     dismisses its in-flight container, or drops it if it's still only
     queued. Never leader-proxied -- a job runs on one specific endpoint,
     and only that endpoint's own runtime state can act on it (same category
-    as DATA_CHUNK_PUT/DATA_STATUS/CONCURRENCY_RECONCILE_PULL)."""
+    as CONCURRENCY_RECONCILE_PULL)."""
 
     def __init__(
         self, runtime: FunctionRuntime, now_fn: Callable[[], float] = time.time, logger: _Logger = None,

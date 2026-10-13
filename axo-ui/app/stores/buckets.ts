@@ -48,8 +48,8 @@ export const useBucketsStore = defineStore('buckets', () => {
 
   // `file` is sent as multipart/form-data, mirroring stores/functions.ts::register's
   // code upload -- the browser reads the file into memory and proxies it
-  // through axo_vem, which relays DATA_REGISTER + chunked
-  // DATA_CHUNK_PUT calls to the cluster on the caller's behalf. Deliberately
+  // through axo_vem, which stores it in axo_storage (OBJECT_REGISTER + chunked
+  // OBJECT_CHUNK_PUT) on the caller's behalf. Deliberately
   // does NOT refetch the bucket afterward -- that used to race the async
   // node-event -> Kurrent -> projector -> Mongo pipeline the read model
   // depends on (the bug this whole pending/ready + WS design fixes). The

@@ -10,20 +10,12 @@ from axo_vem.application.projector.dispatcher import apply_event
 from axo_vem.application.projector.handlers import ProjectorHandlers
 from axo_vem.infrastructure.database.kurrent.subscriber import KurrentSubscriber, _STREAM_NAME_PREFIXES
 from axo_vem.infrastructure.database.mongo.activity_repository import MongoActivityRepository
-from axo_vem.infrastructure.database.mongo.bucket_repository import (
-    MongoBucketRepository,
-    MongoDataItemRepository,
-)
 from axo_vem.infrastructure.database.mongo.checkpoint_store import MongoCheckpointStore
 from axo_vem.infrastructure.database.mongo.choreography_repository import MongoChoreographyRepository
 from axo_vem.infrastructure.database.mongo.consensus_repository import MongoConsensusRepository
 from axo_vem.infrastructure.database.mongo.endpoint_repository import MongoEndpointRepository
 from axo_vem.infrastructure.database.mongo.function_repository import MongoFunctionRepository
 from axo_vem.infrastructure.database.mongo.job_repository import MongoJobRepository
-from axo_vem.infrastructure.database.mongo.user_profile_repository import MongoUserProfileRepository
-from axo_vem.infrastructure.database.mongo.virtual_environment_repository import (
-    MongoVirtualEnvironmentRepository,
-)
 
 
 @dataclass
@@ -45,14 +37,10 @@ def _subscriber(client=None, **subscriber_kwargs):
     db = mongomock.MongoClient()["test"]
     handlers = ProjectorHandlers(
         activity_recorder=MongoActivityRepository(db["unified_activity"]),
-        user_profile_repository=MongoUserProfileRepository(db["user_profiles"]),
-        virtual_environment_repository=MongoVirtualEnvironmentRepository(db["virtual_environments"]),
         endpoint_repository=MongoEndpointRepository(db["endpoints"]),
         function_repository=MongoFunctionRepository(db["functions"]),
         consensus_recorder=MongoConsensusRepository(db["consensus"]),
         job_repository=MongoJobRepository(db["jobs"]),
-        bucket_repository=MongoBucketRepository(db["buckets"]),
-        data_item_repository=MongoDataItemRepository(db["bucket_data"]),
         choreography_repository=MongoChoreographyRepository(db["choreographies"]),
     )
     checkpoints = MongoCheckpointStore(db["projector_checkpoints"])

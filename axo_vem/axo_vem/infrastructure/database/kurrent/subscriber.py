@@ -28,8 +28,7 @@ _Logger = Union[Log, DumbLogger]
 # "activity-", never "activity-<function_id>"). filter_by_prefix=True sends
 # these as real prefixes instead, sidestepping that footgun entirely.
 _STREAM_NAME_PREFIXES = [
-    "endpoints-", "functions-", "consensus-", "activity-",
-    "user-profiles-", "virtual-environments-", "buckets-", "choreographies-",
+    "endpoints-", "functions-", "consensus-", "activity-", "choreographies-", "ve-settings-", "ve-fleet-", "ve-lifecycle-", "ve-policies-",
 ]
 
 OnEvent = Callable[[str, Dict[str, Any]], None]

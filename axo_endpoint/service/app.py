@@ -8,12 +8,10 @@ import zmq
 from option import Err, Ok, Result
 
 from axo_endpoint.core.consensus import (
-    BucketRegistrySyncBridge,
     BullyLeaderElector,
     ClusterMember,
     ConcurrencyLedger,
     ContainerCountEntry,
-    DataRegistrySyncBridge,
     DirtyTracker,
     InMemoryReplicatedStateMachine,
     LeaderView,
@@ -47,14 +45,8 @@ from axo_shared.activity.models import (
 from axo_shared.activity.repository import InMemoryRepository
 from axo_shared.events import models as event_models
 from axo_endpoint.core.consensus.state_machine import StateMutation
-from axo_endpoint.core.data import (
-    BUCKET_REGISTERED_EVENT,
-    DATA_DELETED_EVENT,
-    DATA_REGISTERED_EVENT,
-    DATA_UPLOAD_COMPLETED_EVENT,
-    BucketRegistry,
-    DataRegistry,
-)
+from axo_endpoint.core.dataio import ChunkCache, DataIOResolver
+from axo_shared.axo_storage import AxoStorageClient, VeCredentials
 from axo_endpoint.core.errors import AxoError
 from axo_endpoint.core.events import InMemoryEventBus
 from axo_endpoint.core.functions import FunctionRegistry
@@ -62,12 +54,11 @@ from axo_shared.functions.lifecycle import FunctionState
 from axo_endpoint.core.network import PeerInfo
 from axo_endpoint.core.results import FunctionResult
 from axo_shared.protocol import Command, CommandResult
-from axo_endpoint.core.storage import FilesystemStorageBackend, InMemoryStorageBackend
+from axo_endpoint.core.storage import InMemoryStorageBackend
 from axo_endpoint.dispatch import InMemoryCommandDispatcher
 from axo_endpoint.log import Log
 from axo_endpoint.log.catalog import Component, Event
 from axo_endpoint.config import Config
-from axo_endpoint.service.blob_replication import BlobReplicator
 from axo_endpoint.service.consensus_loop import (
     CLUSTER_DEGRADED_EVENT,
     CLUSTER_QUORUM_LOST_EVENT,
@@ -80,18 +71,12 @@ from axo_endpoint.service.container import ContainerResultReceiver, ContainerSum
 from axo_endpoint.service.container.handle import ContainerStatus
 from axo_endpoint.service.handlers import (
     ActivityListHandler,
-    BucketRegisterHandler,
     ConcurrencyReconcilePullHandler,
     ConcurrencySlotReleaseHandler,
     ConcurrencySlotRequestHandler,
     ConsistencyCheckRequestHandler,
+    EndpointDrainHandler,
     ContainerBootstrapHandler,
-    DataChunkGetHandler,
-    DataChunkPutHandler,
-    DataDeleteHandler,
-    DataInfoHandler,
-    DataRegisterHandler,
-    DataStatusHandler,
     FunctionDeleteHandler,
     FunctionRegisterHandler,
     FunctionUpdateHandler,
@@ -107,7 +92,6 @@ from axo_endpoint.service.handlers import (
     PingHandler,
     StateSyncPullHandler,
     StateSyncPushHandler,
-    VirtualEnvAssignHandler,
     build_completion_recorder,
     make_replicate_fn,
     make_reverify_fn,
@@ -119,7 +103,10 @@ from axo_endpoint.service.runtime.process_runtime import ProcessFunctionRuntime
 from axo_endpoint.service.runtime.scratch import sweep_orphaned_scratch_dirs
 from axo_shared import wire
 from axo_endpoint.service.transport.address import resolve_peer_address
-from axo_endpoint.service.transport.event_publisher import ZmqEventPublisher
+from axo_endpoint.service.transport.reliable_event_publisher import ReliableEventPublisher
+from axo_endpoint.core.usage import EndpointMetrics, UsageRecorder
+from axo_endpoint.core.runtime.queue_deadlines import QueueDeadlines
+from axo_shared.metrics import MetricAggregator
 from axo_endpoint.service.transport.heartbeat_zmq import (
     ZmqHeartbeatPublisher,
     ZmqHeartbeatSubscriber,
@@ -159,16 +146,7 @@ class App:
         self.functions_store = InMemoryStorageBackend()
         self.results_store   = InMemoryStorageBackend()
         self.event_bus       = InMemoryEventBus()
-        self.storage_backends = {
-            "fs": FilesystemStorageBackend(root=config.AXO_ENDPOINT_DATAIO_FS_ROOT),
-        }
         self.registry        = FunctionRegistry(backend=self.functions_store, event_bus=self.event_bus)
-        self.data_store      = InMemoryStorageBackend()
-        self.data_registry   = DataRegistry(
-            catalog=self.data_store, blob_backends=self.storage_backends, event_bus=self.event_bus,
-        )
-        self.bucket_store    = InMemoryStorageBackend()
-        self.bucket_registry = BucketRegistry(catalog=self.bucket_store, event_bus=self.event_bus)
 
         self.elector               = BullyLeaderElector(self_id=config.AXO_ENDPOINT_ID)
         self.dirty_tracker         = DirtyTracker(
@@ -188,23 +166,19 @@ class App:
         self.event_bus.subscribe(FunctionState.REGISTERED.value, self.registry_sync.on_function_event)
         self.event_bus.subscribe(FUNCTION_UPDATED_EVENT, self.registry_sync.on_function_updated)
         self.event_bus.subscribe(FUNCTION_DELETED_EVENT, self.registry_sync.on_function_deleted)
-        self.data_registry_sync    = DataRegistrySyncBridge(
-            registry=self.data_registry, catalog=self.data_store, dirty_tracker=self.dirty_tracker,
-        )
-        self.event_bus.subscribe(DATA_REGISTERED_EVENT, self.data_registry_sync.on_data_event)
-        self.event_bus.subscribe(DATA_DELETED_EVENT, self.data_registry_sync.on_data_deleted)
-        self.bucket_registry_sync  = BucketRegistrySyncBridge(
-            registry=self.bucket_registry, catalog=self.bucket_store, dirty_tracker=self.dirty_tracker,
-        )
-        self.event_bus.subscribe(BUCKET_REGISTERED_EVENT, self.bucket_registry_sync.on_bucket_event)
-        self.blob_replicator       = BlobReplicator(
-            data_registry=self.data_registry,
-            storage_backends=self.storage_backends,
-            chunk_bytes=config.AXO_ENDPOINT_CONSENSUS_BLOB_CHUNK_BYTES,
-            rate_limit_bytes_per_second=config.AXO_ENDPOINT_CONSENSUS_BLOB_RATE_LIMIT_BYTES_PER_SECOND,
-            enabled_kinds=config.AXO_ENDPOINT_BLOB_REPLICATION_ENABLED_KINDS,
-            recheck_seconds=config.AXO_ENDPOINT_BLOB_REPLICATION_RECHECK_SECONDS,
-            logger=self._logger,
+        # Data lives only in axo_storage. This endpoint reaches it for jobs'
+        # dataio (acting for the job's user, with this VE's token) and keeps
+        # an ephemeral cache of chunks it already downloaded.
+        self.storage_client: Optional[AxoStorageClient] = None
+        if config.AXO_ENDPOINT_STORAGE_URI:
+            self.storage_client = AxoStorageClient(
+                config.AXO_ENDPOINT_STORAGE_URI,
+                VeCredentials(config.AXO_ENDPOINT_VIRTUAL_ENV_ID or "", config.AXO_ENDPOINT_STORAGE_TOKEN),
+                timeout_seconds=config.AXO_ENDPOINT_STORAGE_TIMEOUT_SECONDS,
+            )
+        self.chunk_cache = ChunkCache(
+            max_bytes=config.AXO_ENDPOINT_CHUNK_CACHE_MAX_BYTES,
+            directory=config.AXO_ENDPOINT_CHUNK_CACHE_DIR or None,
         )
 
         self.activity_repository = InMemoryRepository(
@@ -223,12 +197,16 @@ class App:
 
         # External API publishing -- entirely gated by AXO_ENDPOINT_API_URI.
         # Unset: no publisher, no bridge, no subscriptions -- zero new behavior.
-        self.external_publisher: Optional[ZmqEventPublisher] = None
+        self.external_publisher: Optional[ReliableEventPublisher] = None
         self.external_bridge: Optional[ExternalEventForwardingBridge] = None
         if config.AXO_ENDPOINT_API_URI:
-            self.external_publisher = ZmqEventPublisher(
+            self.external_publisher = ReliableEventPublisher(
                 api_uri=config.AXO_ENDPOINT_API_URI,
                 endpoint_id=config.AXO_ENDPOINT_ID,
+                outbox_path=config.AXO_ENDPOINT_OUTBOX_PATH,
+                ack_timeout_s=config.AXO_ENDPOINT_OUTBOX_ACK_TIMEOUT_SECONDS,
+                retry_base_s=config.AXO_ENDPOINT_OUTBOX_RETRY_BASE_SECONDS,
+                retry_max_s=config.AXO_ENDPOINT_OUTBOX_RETRY_MAX_SECONDS,
                 logger=self._logger,
             )
             self.external_bridge = ExternalEventForwardingBridge(
@@ -262,20 +240,43 @@ class App:
             self.event_bus.subscribe(JOB_STARTED_EVENT, self.external_bridge.on_job_started)
             self.event_bus.subscribe("JOB_COMPLETED", self.external_bridge.on_job_finished)
             self.event_bus.subscribe("JOB_FAILED", self.external_bridge.on_job_finished)
-            self.event_bus.subscribe(BUCKET_REGISTERED_EVENT, self.external_bridge.on_bucket_registered)
-            self.event_bus.subscribe(DATA_REGISTERED_EVENT, self.external_bridge.on_data_registered)
-            self.event_bus.subscribe(DATA_UPLOAD_COMPLETED_EVENT, self.external_bridge.on_data_upload_completed)
-            self.event_bus.subscribe(DATA_DELETED_EVENT, self.external_bridge.on_data_deleted)
             self.event_bus.subscribe(LEADER_ELECTED_EVENT, self.external_bridge.on_leader_elected)
             self.event_bus.subscribe(CONSENSUS_VIEW_CHANGED_EVENT, self.external_bridge.on_consensus_view_changed)
             self.event_bus.subscribe(CLUSTER_QUORUM_LOST_EVENT, self.external_bridge.on_cluster_quorum_event)
             self.event_bus.subscribe(CLUSTER_QUORUM_RESTORED_EVENT, self.external_bridge.on_cluster_quorum_event)
             self.event_bus.subscribe(CLUSTER_DEGRADED_EVENT, self.external_bridge.on_cluster_quorum_event)
 
+        # Metering: one JobAttemptRecorded per attempt this endpoint runs,
+        # delivered reliably to the VEM (billing). Built even without an API
+        # so the same records can feed local metrics.
+        self.usage_recorder = UsageRecorder(
+            endpoint_id=config.AXO_ENDPOINT_ID,
+            virtual_environment_id=config.AXO_ENDPOINT_VIRTUAL_ENV_ID,
+            owner_type=config.AXO_ENDPOINT_OWNER_TYPE,
+            owner_id=config.AXO_ENDPOINT_OWNER_ID,
+            endpoint_cores=config.AXO_ENDPOINT_CPU_CORES,
+            endpoint_ram_mb=config.AXO_ENDPOINT_MEMORY_MB,
+            publish=self.external_publisher.publish if self.external_publisher is not None else None,
+            on_record=lambda record: self.endpoint_metrics.observe_job(record),
+            logger=self._logger,
+        )
+        self.event_bus.subscribe("JOB_SUBMITTED", self.usage_recorder.on_job_submitted)
+        self.event_bus.subscribe("JOB_COMPLETED", self.usage_recorder.on_job_finished)
+        self.event_bus.subscribe("JOB_FAILED", self.usage_recorder.on_job_finished)
+
         self.dispatcher = InMemoryCommandDispatcher(
             max_queue_size = config.AXO_ENDPOINT_QUEUE_MAX_DEPTH,
             worker_count   = config.AXO_ENDPOINT_QUEUE_WORKERS,
             logger         = self._logger,
+        )
+        self.endpoint_metrics = EndpointMetrics(
+            aggregator=MetricAggregator(width_s=config.AXO_ENDPOINT_METRICS_BIN_SECONDS),
+            endpoint_id=config.AXO_ENDPOINT_ID,
+            virtual_environment_id=config.AXO_ENDPOINT_VIRTUAL_ENV_ID,
+            bin_width_s=config.AXO_ENDPOINT_METRICS_BIN_SECONDS,
+            publish=self.external_publisher.publish if self.external_publisher is not None else None,
+            dispatcher_metrics_fn=self.dispatcher.metrics,
+            outbox_stats_fn=self.external_publisher.stats if self.external_publisher is not None else None,
         )
 
         # Result replication (executor -> leader -> every endpoint) is wired
@@ -283,7 +284,7 @@ class App:
         # on_complete (built here, well before that) is a plain closure, not
         # an object with an attach_*() method, so this mutable indirection
         # is what lets it start replicating once the real function is ready,
-        # the same way PEER_ANNOUNCE/VIRTUAL_ENV_ASSIGN mutate direct_handlers
+        # the same way PEER_ANNOUNCE mutates direct_handlers
         # post-hoc instead of needing everything built up front.
         self._replicate_result_fn: Optional[Callable[[FunctionResult], None]] = None
 
@@ -294,19 +295,32 @@ class App:
         on_complete = build_completion_recorder(
             results       = self.results_store,
             event_bus     = self.event_bus,
-            data_registry = self.data_registry,
             logger        = self._logger,
             replicate_fn  = _replicate_result,
         )
+        # max_wait per job: both runtimes check it where a job enters/leaves a
+        # runner queue; _queue_deadline_loop drops jobs that overstay.
+        self.queue_deadlines = QueueDeadlines()
+        # Set by ENDPOINT_DRAIN (VEM scale-down / stop): no new jobs accepted.
+        self._draining = threading.Event()
+        self.dataio = DataIOResolver(
+            client=self.storage_client,
+            cache=self.chunk_cache,
+            user_for_job=self.usage_recorder.acting_user,
+            access_recheck_seconds=config.AXO_ENDPOINT_STORAGE_ACCESS_RECHECK_SECONDS,
+        )
+        self.event_bus.subscribe("JOB_COMPLETED", lambda event: self.queue_deadlines.discard(event.payload["job_id"]))
+        self.event_bus.subscribe("JOB_FAILED", lambda event: self.queue_deadlines.discard(event.payload["job_id"]))
+
         self.process_runtime = ProcessFunctionRuntime(
             function_registry  = self.registry,
             on_complete        = on_complete,
             scratch_root       = config.AXO_ENDPOINT_SCRATCH_ROOT,
             memory_limit_bytes = config.AXO_ENDPOINT_WORKER_RLIMIT_AS_BYTES,
             cpu_limit_seconds  = config.AXO_ENDPOINT_WORKER_RLIMIT_CPU_SECONDS,
-            storage_backends   = self.storage_backends,
-            data_registry      = self.data_registry,
+            dataio             = self.dataio,
             event_bus          = self.event_bus,
+            queue_deadlines    = self.queue_deadlines,
             logger             = self._logger,
         )
         self.container_summoner = ContainerSummoner(config=config, event_bus=self.event_bus, logger=self._logger)
@@ -345,15 +359,16 @@ class App:
             summoner          = self.container_summoner,
             on_complete       = on_complete,
             config            = config,
-            storage_backends  = self.storage_backends,
-            data_registry     = self.data_registry,
+            dataio            = self.dataio,
             event_bus         = self.event_bus,
+            queue_deadlines   = self.queue_deadlines,
             logger            = self._logger,
         )
         self.container_runtime.attach_cluster_placement(
             concurrency_client=self.concurrency_client,
             forward_job_fn=self._forward_job_to_endpoint,
         )
+        self.container_runtime.attach_usage_hook(self.usage_recorder.on_attempt_retried)
         self.runtime = RuntimeDispatcher(
             registry          = self.registry,
             process_runtime   = self.process_runtime,
@@ -369,8 +384,8 @@ class App:
         # Job result replication (executor -> leader -> every endpoint).
         # JOB_RESULT_SYNC is leader-gated (an executor reporting a finished
         # result); JOB_RESULT_REPLICATE is the leader's own one-way push to
-        # each follower, never leader-gated (mirrors STATE_SYNC_PUSH/
-        # DATA_CHUNK_PUT's "receiver just stores it" shape).
+        # each follower, never leader-gated (mirrors STATE_SYNC_PUSH's
+        # "receiver just stores it" shape).
         self._job_result_sync_handler = LeaderProxyHandler(
             inner=JobResultSyncHandler(
                 results=self.results_store,
@@ -432,17 +447,22 @@ class App:
                 event_bus         = self.event_bus,
                 function_registry = self.registry,
                 logger            = self._logger,
+                queue_deadlines   = self.queue_deadlines,
+                is_draining       = self._draining.is_set,
             ),
         )
 
         self.dispatcher.register_handler(
             wire.JOB_SUBMIT,
             JobSubmitHandler(
-                runtime           = self.runtime,
-                results           = self.results_store,
-                event_bus         = self.event_bus,
-                function_registry = self.registry,
-                logger            = self._logger,
+                runtime            = self.runtime,
+                results            = self.results_store,
+                event_bus          = self.event_bus,
+                function_registry  = self.registry,
+                logger             = self._logger,
+                queue_deadlines    = self.queue_deadlines,
+                default_max_wait_s = config.AXO_ENDPOINT_DEFAULT_MAX_WAIT_SECONDS,
+                is_draining        = self._draining.is_set,
             ),
         )
         self.dispatcher.register_handler(
@@ -491,71 +511,19 @@ class App:
                 forward_timeout_seconds=config.AXO_ENDPOINT_CONSENSUS_FORWARD_TIMEOUT_SECONDS,
                 logger=self._logger,
             ),
-            wire.DATA_REGISTER: LeaderProxyHandler(
-                inner=DataRegisterHandler(
-                    registry=self.data_registry,
-                    own_rpc_uri=config.AXO_ENDPOINT_ROUTER_BIND,
-                    logger=self._logger,
-                    bucket_registry=self.bucket_registry,
-                ),
-                elector=self.elector,
-                self_id=config.AXO_ENDPOINT_ID,
-                resolve_leader_rpc_uri=self._resolve_leader_rpc_uri,
-                forward_fn=self._forward_command,
-                forward_timeout_seconds=config.AXO_ENDPOINT_CONSENSUS_FORWARD_TIMEOUT_SECONDS,
-                logger=self._logger,
-            ),
-            # Leader-proxied like DATA_REGISTER -- a catalog mutation, so a
-            # follower must proxy it, and the deletion replicates via the
-            # same DataRegistrySyncBridge tombstone path (see data_sync.py).
-            wire.DATA_DELETE: LeaderProxyHandler(
-                inner=DataDeleteHandler(registry=self.data_registry, logger=self._logger),
-                elector=self.elector,
-                self_id=config.AXO_ENDPOINT_ID,
-                resolve_leader_rpc_uri=self._resolve_leader_rpc_uri,
-                forward_fn=self._forward_command,
-                forward_timeout_seconds=config.AXO_ENDPOINT_CONSENSUS_FORWARD_TIMEOUT_SECONDS,
-                logger=self._logger,
-            ),
-            # Metadata-declaring registration, leader-gated like
-            # FUNCTION_REGISTER/DATA_REGISTER -- DATA_REGISTER's bucket-quota
-            # check (above) depends on this bucket already existing here.
-            wire.BUCKET_REGISTER: LeaderProxyHandler(
-                inner=BucketRegisterHandler(registry=self.bucket_registry, logger=self._logger),
-                elector=self.elector,
-                self_id=config.AXO_ENDPOINT_ID,
-                resolve_leader_rpc_uri=self._resolve_leader_rpc_uri,
-                forward_fn=self._forward_command,
-                forward_timeout_seconds=config.AXO_ENDPOINT_CONSENSUS_FORWARD_TIMEOUT_SECONDS,
-                logger=self._logger,
-            ),
             # Never leader-proxied -- a job runs on one specific endpoint,
-            # only that endpoint's own runtime state can act on it (same
-            # category as DATA_CHUNK_PUT/DATA_STATUS below).
+            # only that endpoint's own runtime state can act on it.
             wire.JOB_CANCEL: JobCancelHandler(runtime=self.runtime, logger=self._logger),
-            # Never leader-proxied -- the receiving node (leader, being pushed
-            # to by a real client, or a follower, being pushed to by the
-            # leader's replication loop) IS the intended receiver either way.
-            wire.DATA_CHUNK_PUT: DataChunkPutHandler(registry=self.data_registry, logger=self._logger),
-            # Never leader-proxied, same reasoning as DATA_CHUNK_PUT/
-            # DATA_STATUS -- reads this specific node's own local bytes.
-            wire.DATA_CHUNK_GET: DataChunkGetHandler(registry=self.data_registry, logger=self._logger),
-            wire.DATA_STATUS: DataStatusHandler(registry=self.data_registry, logger=self._logger),
-            wire.DATA_INFO: LeaderProxyHandler(
-                inner=DataInfoHandler(registry=self.data_registry, replicator=self.blob_replicator, logger=self._logger),
-                elector=self.elector,
-                self_id=config.AXO_ENDPOINT_ID,
-                resolve_leader_rpc_uri=self._resolve_leader_rpc_uri,
-                forward_fn=self._forward_command,
-                forward_timeout_seconds=config.AXO_ENDPOINT_CONSENSUS_FORWARD_TIMEOUT_SECONDS,
+            # Never leader-proxied: draining is about THIS endpoint.
+            wire.ENDPOINT_DRAIN: EndpointDrainHandler(
+                set_draining=self._set_draining,
+                active_job_count=lambda: len(self._snapshot_active_job_ids()),
                 logger=self._logger,
             ),
             wire.CONTAINER_BOOTSTRAP: ContainerBootstrapHandler(registry=self.registry, logger=self._logger),
             wire.STATE_SYNC_PUSH: StateSyncPushHandler(
                 state_machine=self.cluster_state_machine,
                 registry_sync=self.registry_sync,
-                data_registry_sync=self.data_registry_sync,
-                bucket_registry_sync=self.bucket_registry_sync,
                 logger=self._logger,
             ),
             wire.STATE_SYNC_PULL: StateSyncPullHandler(
@@ -565,11 +533,11 @@ class App:
             wire.CONCURRENCY_SLOT_REQUEST: self._concurrency_slot_request_handler,
             wire.CONCURRENCY_SLOT_RELEASE: self._concurrency_slot_release_handler,
             # Never leader-proxied -- reports this specific endpoint's own
-            # live containers, same reasoning as DATA_STATUS/CONCURRENCY_RECONCILE_PULL.
+            # live containers.
             wire.CONCURRENCY_RECONCILE_PULL: ConcurrencyReconcilePullHandler(
                 summoner=self.container_summoner, logger=self._logger,
             ),
-            # Leader-gated like BUCKET_REGISTER -- only the leader owns the
+            # Leader-gated -- only the leader owns the
             # result_consistency_sweeper this acts on.
             wire.CONSISTENCY_CHECK_REQUEST: LeaderProxyHandler(
                 inner=ConsistencyCheckRequestHandler(sweeper=self.result_consistency_sweeper, logger=self._logger),
@@ -587,12 +555,14 @@ class App:
             connect_addresses=config.AXO_ENDPOINT_SUB_CONNECT,
             logger=self._logger,
             on_new_peer=self._on_new_peer,
+            virtual_environment_id=config.AXO_ENDPOINT_VIRTUAL_ENV_ID,
         )
 
         direct_handlers[wire.PEER_ANNOUNCE] = PeerAnnounceHandler(
             subscriber=self.heartbeat_subscriber,
             local_mode=config.AXO_ENDPOINT_LOCAL_MODE,
             logger=self._logger,
+            virtual_environment_id=config.AXO_ENDPOINT_VIRTUAL_ENV_ID,
         )
 
         self.router_server = RouterServer(
@@ -609,23 +579,9 @@ class App:
         self._active_job_ids: Set[str] = set()
         self._active_job_ids_lock = threading.Lock()
 
-        # Runtime-mutable -- unlike the rest of Config, this can change after
-        # boot via VIRTUAL_ENV_ASSIGN (see handlers.virtual_env_assign). Reset
-        # to launch config on restart; no local persistence is introduced.
+        # Fixed for the endpoint's whole life: an endpoint is born inside one VE
+        # and never migrates (VIRTUAL_ENV_ASSIGN no longer exists).
         self._virtual_environment_id: Optional[str] = config.AXO_ENDPOINT_VIRTUAL_ENV_ID
-
-        # direct_handlers is stored by reference inside RouterServer (constructed
-        # above), so mutating it here still takes effect -- same trick as
-        # PEER_ANNOUNCE, just deferred until _active_job_ids/_virtual_environment_id
-        # actually exist for the closures below to read.
-        direct_handlers[wire.VIRTUAL_ENV_ASSIGN] = VirtualEnvAssignHandler(
-            active_job_ids_provider=self._snapshot_active_job_ids,
-            get_virtual_environment_id=self._get_virtual_environment_id,
-            set_virtual_environment_id=self._set_virtual_environment_id,
-            endpoint_id=config.AXO_ENDPOINT_ID,
-            external_publisher=self.external_publisher,
-            logger=self._logger,
-        )
 
         self.event_bus.subscribe("JOB_SUBMITTED", self._on_job_submitted)
         self.event_bus.subscribe("JOB_COMPLETED", self._on_job_finished)
@@ -646,15 +602,11 @@ class App:
         # matching its existing stateless-per-call design.
         self._cluster_high_water: int = 0
         self._cluster_member_ids: Optional[FrozenSet[str]] = None
-        # Updated on every inbound request (see _on_request_seen); drives the
-        # blob-replication idle trigger.
-        self._last_request_at: float = time.monotonic()
 
     def _on_request_seen(self) -> None:
         """Called by RouterServer once per handled request, regardless of
-        which operation it was -- the single hook point that lets the
-        blob-replication loop know how long the leader has been idle."""
-        self._last_request_at = time.monotonic()
+        which operation it was -- counts inbound requests for metrics."""
+        self.endpoint_metrics.on_request()
 
     def _on_job_submitted(self, event) -> None:
         """Adds a job id to the set of currently running jobs."""
@@ -666,16 +618,19 @@ class App:
         with self._active_job_ids_lock:
             self._active_job_ids.discard(event.payload["job_id"])
 
+    def _set_draining(self, draining: bool) -> None:
+        if draining:
+            self._draining.set()
+        else:
+            self._draining.clear()
+
     def _snapshot_active_job_ids(self) -> Set[str]:
-        """Thread-safe read for VirtualEnvAssignHandler's idle-gate check."""
+        """Thread-safe copy of the currently running job ids."""
         with self._active_job_ids_lock:
             return set(self._active_job_ids)
 
     def _get_virtual_environment_id(self) -> Optional[str]:
         return self._virtual_environment_id
-
-    def _set_virtual_environment_id(self, virtual_environment_id: Optional[str]) -> None:
-        self._virtual_environment_id = virtual_environment_id
 
     def run(self) -> None:
         """Starts the endpoint and blocks until stop() is called."""
@@ -707,8 +662,9 @@ class App:
             ),
             threading.Thread(target=self._worker_sweep_loop, daemon=True),
             threading.Thread(target=self._scratch_sweep_loop, daemon=True),
-            threading.Thread(target=self._blob_replication_loop, daemon=True),
             threading.Thread(target=self._result_consistency_loop, daemon=True),
+            threading.Thread(target=self._queue_deadline_loop, daemon=True),
+            threading.Thread(target=self.endpoint_metrics.run_flush_loop, args=(self._stop_event,), daemon=True),
         ]
         for thread in self._background_threads:
             thread.start()
@@ -732,6 +688,7 @@ class App:
         self.heartbeat_publisher.close()
 
         uptime_ms = round((time.monotonic() - self._start_time) * 1000, 2) if self._start_time else 0.0
+        self.endpoint_metrics.flush(now=float("inf"))  # last, still-open bins too
         if self.external_publisher is not None:
             stopped_event = event_models.EndpointStopped(
                 endpoint_id=self.config.AXO_ENDPOINT_ID,
@@ -742,6 +699,9 @@ class App:
             self.external_publisher.close()
         self.result_receiver.stop()
         self.dispatcher.close()
+        self.chunk_cache.close()  # the cache never outlives the endpoint
+        if self.storage_client is not None:
+            self.storage_client.close()
         for thread in self._background_threads:
             thread.join(timeout=2.0)
 
@@ -806,20 +766,26 @@ class App:
             return Err(AxoError(
                 f"unknown endpoint {target_endpoint_id!r}", context={"target_endpoint_id": target_endpoint_id},
             ))
-        command = Command(
-            operation=wire.JOB_FORWARD,
-            content_type="application/json",
-            envelope={
-                "function_id": function_ref.id, "function_version": function_ref.version,
-                "job_id": job_id, "params": params,
-            },
-            payload=b"",
-        )
+        # The target runs the job, so it records the usage: hand it this job's
+        # context (trace, received time, who started it) and forget it here.
+        usage = self.usage_recorder.take_for_forward(job_id)
+        envelope = {
+            "function_id": function_ref.id, "function_version": function_ref.version,
+            "job_id": job_id, "params": params,
+        }
+        if usage is not None:
+            envelope["usage"] = usage
+        command = Command(operation=wire.JOB_FORWARD, content_type="application/json", envelope=envelope, payload=b"")
         result = self._forward_command(rpc_uri, command, self.config.AXO_ENDPOINT_CONSENSUS_FORWARD_TIMEOUT_SECONDS)
-        if result.is_err:
-            return Err(result.unwrap_err())
-        command_result = result.unwrap()
-        if not command_result.ok:
+        command_result = result.unwrap() if result.is_ok else None
+        if command_result is not None and command_result.ok:
+            # The target tracks the deadline now (it travels in "usage").
+            self.queue_deadlines.discard(job_id)
+        if command_result is None or not command_result.ok:
+            if usage is not None:
+                self.usage_recorder.restore(usage)
+            if command_result is None:
+                return Err(result.unwrap_err())
             return Err(AxoError(command_result.error, context={"error_code": command_result.error_code}))
         return Ok(None)
 
@@ -918,10 +884,8 @@ class App:
                 "leader_ids": list(leader_view.leader_ids),
                 "members": list(members),
                 "function_keys": list(mutation.function_changes.keys()),
-                "data_keys": list(mutation.data_changes.keys()),
-                "bucket_keys": list(mutation.bucket_changes.keys()),
             },
-            payload=encode_state_changes(mutation.function_changes, mutation.data_changes, mutation.bucket_changes),
+            payload=encode_state_changes(mutation.function_changes),
         )))
         sock.close()
 
@@ -941,47 +905,6 @@ class App:
         incoming = decode_cluster_state(command_result.payload)
         if self.cluster_state_machine.apply_remote(incoming):
             self.registry_sync.apply_incoming(incoming.functions)
-            self.data_registry_sync.apply_incoming(incoming.data)
-            self.bucket_registry_sync.apply_incoming(incoming.buckets)
-
-    def _push_blob_chunk(
-        self, rpc_uri: str, name: str, version: int, chunk_index: int, chunk: bytes,
-    ) -> None:
-        """Fire-and-forget: pushes one chunk of a registered dataset to one
-        peer via DATA_CHUNK_PUT -- the exact same op a real client uses to
-        push data to the leader, so client push and leader/follower
-        replication share one code path end to end."""
-        sock = zmq.Context.instance().socket(zmq.DEALER)
-        sock.setsockopt(zmq.LINGER, 1000)
-        sock.connect(rpc_uri)
-        sock.send_multipart(wire.encode_command(Command(
-            operation=wire.DATA_CHUNK_PUT,
-            content_type="application/octet-stream",
-            envelope={"name": name, "version": version, "chunk_index": chunk_index},
-            payload=chunk,
-        )))
-        sock.close()
-
-    def _query_data_status(self, rpc_uri: str, name: str, version: int) -> Optional[dict]:
-        """Blocking request/reply: asks a peer for its own local DATA_STATUS
-        for one dataset -- used by the replication loop to diff what that
-        peer is missing before pushing. Returns None on any failure/timeout;
-        the replicator just skips that peer/dataset this tick and tries
-        again next tick."""
-        result = self._forward_command(
-            rpc_uri,
-            Command(
-                operation=wire.DATA_STATUS, content_type="application/json",
-                envelope={"name": name, "version": version}, payload=b"",
-            ),
-            self.config.AXO_ENDPOINT_CONSENSUS_FORWARD_TIMEOUT_SECONDS,
-        )
-        if result.is_err:
-            return None
-        command_result = result.unwrap()
-        if not command_result.ok:
-            return None
-        return command_result.metadata
 
     def _send_peer_announce(self, rpc_uri: str) -> None:
         """Fire-and-forget: tells a peer's router to subscribe to our PUB."""
@@ -994,6 +917,7 @@ class App:
             envelope={
                 "pub_bind": self.config.AXO_ENDPOINT_PUB_BIND,
                 "peer_id":  self.config.AXO_ENDPOINT_ID,
+                "virtual_environment_id": self._virtual_environment_id,
             },
             payload=b"",
         )))
@@ -1014,6 +938,7 @@ class App:
             "consensus_leader_ids": list(view.leader_ids),
             "consensus_dirty_pending": self.dirty_tracker.pending_count(),
             "container_pools": self.container_summoner.pool_summary(),
+            "draining": self._draining.is_set(),
         }
 
     def _heartbeat_publish_loop(self) -> None:
@@ -1034,6 +959,7 @@ class App:
                 **current_metrics,
                 "__pub_bind__": self.config.AXO_ENDPOINT_PUB_BIND,
                 "__sent_at__":  now,
+                "__ve_id__":    self._virtual_environment_id,
             }
             info = PeerInfo(
                 peer_id=self.config.AXO_ENDPOINT_ID,
@@ -1043,6 +969,7 @@ class App:
                 last_seen=now,
             )
             self.heartbeat_publisher.publish(info)
+            self.endpoint_metrics.sample()
             self._logger.debug_event(
                 Event.App.HEARTBEAT,
                 component=Component.APP,
@@ -1072,8 +999,10 @@ class App:
             self.concurrency_ledger.ingest_peer_metrics(
                 self.config.AXO_ENDPOINT_ID, current_metrics.get("container_pools", {}),
             )
+            self.concurrency_ledger.set_draining(self.config.AXO_ENDPOINT_ID, self._draining.is_set())
             for peer in self.heartbeat_subscriber.list_peers():
                 self.concurrency_ledger.ingest_peer_metrics(peer.peer_id, peer.metrics.get("container_pools", {}))
+                self.concurrency_ledger.set_draining(peer.peer_id, bool(peer.metrics.get("draining")))
             if self.elector.is_leader(self.config.AXO_ENDPOINT_ID) and self._cluster_member_ids is not None:
                 self.concurrency_ledger.reap_unknown_owners(set(self._cluster_member_ids))
 
@@ -1102,40 +1031,10 @@ class App:
             sweep_orphaned_scratch_dirs(self.config.AXO_ENDPOINT_SCRATCH_ROOT, active)
             self._stop_event.wait(self.config.AXO_ENDPOINT_SCRATCH_GC_INTERVAL_SECONDS)
 
-    def _blob_replication_loop(self) -> None:
-        """Runs in the background, diffing every complete registered dataset
-        against every peer and pushing whatever chunks that peer is missing
-        -- on its own cadence, separate from the heartbeat-driven consensus
-        tick, so a large dataset can't starve the small/frequent metadata
-        sync traffic. Only actually ticks once the leader has been idle (no
-        inbound requests) for AXO_ENDPOINT_BLOB_REPLICATION_IDLE_SECONDS --
-        0 disables idle-gating (replicate on every tick)."""
-        last = time.monotonic()
-        while not self._stop_event.is_set():
-            now = time.monotonic()
-            idle_seconds = self.config.AXO_ENDPOINT_BLOB_REPLICATION_IDLE_SECONDS
-            if idle_seconds <= 0 or now - self._last_request_at >= idle_seconds:
-                members = [
-                    ClusterMember(
-                        peer_id=p.peer_id,
-                        rpc_uri=resolve_peer_address(p.rpc_uri, p.peer_id, self.config.AXO_ENDPOINT_LOCAL_MODE),
-                    )
-                    for p in self.heartbeat_subscriber.list_peers()
-                ]
-                self.blob_replicator.run_tick(
-                    is_leader=self.elector.is_leader(self.config.AXO_ENDPOINT_ID),
-                    members=members,
-                    query_status_fn=self._query_data_status,
-                    push_chunk_fn=self._push_blob_chunk,
-                    elapsed_seconds=now - last,
-                )
-            last = now
-            self._stop_event.wait(self.config.AXO_ENDPOINT_CONSENSUS_BLOB_TICK_INTERVAL_SECONDS)
-
     def _result_consistency_loop(self) -> None:
         """Runs in the background: only while leader, ticks the paginated
         result-consistency sweep on its own configured cadence (separate
-        from every other loop here, same reasoning as blob replication --
+        from every other loop here --
         one slow concern shouldn't starve another). A short poll interval
         just checks whether AXO_ENDPOINT_RESULT_CONSISTENCY_CHECK_INTERVAL_SECONDS
         has actually elapsed; maybe_run_periodic is a no-op otherwise."""
@@ -1146,6 +1045,15 @@ class App:
                     interval_seconds=self.config.AXO_ENDPOINT_RESULT_CONSISTENCY_CHECK_INTERVAL_SECONDS,
                 )
             self._stop_event.wait(min(30.0, self.config.AXO_ENDPOINT_RESULT_CONSISTENCY_CHECK_INTERVAL_SECONDS))
+
+    def _queue_deadline_loop(self) -> None:
+        """Runs in the background: fails jobs still waiting in a runner queue
+        past their max_wait (timed_out_in_queue, never billed). A job that is
+        not in any queue yet (e.g. its container is still cold-starting) is
+        caught when it is dequeued instead."""
+        while not self._stop_event.wait(1.0):
+            for job_id, error in self.queue_deadlines.expired(time.time()):
+                self.runtime.drop_queued(job_id, error)
 
 
 def build_app(config: Config) -> App:

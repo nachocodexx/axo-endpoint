@@ -110,7 +110,12 @@ def test_emits_job_submitted_event(results_store, event_bus, function_registry):
     assert received == [
         Event(
             event_type="JOB_SUBMITTED",
-            payload={"job_id": "job1", "function_id": "add", "function_version": 1, "params": {}},
+            payload={"job_id": "job1", "function_id": "add", "function_version": 1, "params": {},
+                     "usage": {"job_id": "job1", "function_id": "add", "function_version": 1,
+                               "received_at": 100.0, "trace_id": "job1", "attempt": 1,
+                               "started_by_type": "user", "started_by_id": "unknown",
+                               "upstream_waits_ms": {}, "max_wait_s": -1.0,
+                               "acting_user_id": ""}},
             timestamp=100.0,
         )
     ]
@@ -249,7 +254,8 @@ def test_completion_recorder_writes_success_result_and_emits_job_completed(resul
     assert received == [
         Event(
             event_type="JOB_COMPLETED",
-            payload={"job_id": "job1", "function_id": "add", "function_version": None, "duration_ms": None},
+            payload={"job_id": "job1", "function_id": "add", "function_version": None, "duration_ms": None,
+                     "outcome": "completed", "started_at": None, "finished_at": 100.0},
             timestamp=100.0,
         )
     ]
@@ -266,7 +272,8 @@ def test_completion_recorder_computes_duration_from_started_at(results_store):
     assert received == [
         Event(
             event_type="JOB_COMPLETED",
-            payload={"job_id": "job1", "function_id": "add", "function_version": 2, "duration_ms": 500.0},
+            payload={"job_id": "job1", "function_id": "add", "function_version": 2, "duration_ms": 500.0,
+                     "outcome": "completed", "started_at": 100.0, "finished_at": 100.5},
             timestamp=100.5,
         )
     ]
@@ -286,65 +293,105 @@ def test_completion_recorder_writes_failure_result_and_emits_job_failed(results_
     assert len(received) == 1
 
 
-def _data_registry():
-    from axo_endpoint.core.data import DataRegistry
-    from axo_endpoint.core.storage import FilesystemStorageBackend
-
-    import tempfile
-
-    root = tempfile.mkdtemp()
-    return DataRegistry(
-        catalog=InMemoryStorageBackend(),
-        blob_backends={"fs": FilesystemStorageBackend(root=root)},
-        event_bus=InMemoryEventBus(),
-    )
-
-
-def test_completion_recorder_stores_raw_bytes_via_data_registry_and_returns_ref(results_store):
+@pytest.mark.parametrize("value", [b"raw-bytes", {1, 2, 3}, object()])
+def test_non_json_results_fail_the_job_as_the_users_error(results_store, value):
     event_bus = InMemoryEventBus()
-    data_registry = _data_registry()
-    on_complete = build_completion_recorder(
-        results=results_store, event_bus=event_bus, data_registry=data_registry, now_fn=lambda: 100.0,
-    )
-
-    on_complete(InvocationHandle(job_id="job1", function_id="add"), Ok(b"raw-bytes-result"))
-
-    result = results_store.get(StorageKey(id="job1")).unwrap()
-    assert result.ok is True
-    assert result.output == {"type": "bytes"}
-    assert result.refs == {"value": StorageKey(id="job-result-job1", version=1)}
-    stored = data_registry.read_whole("job-result-job1", 1).unwrap()
-    assert stored == b"raw-bytes-result"
-
-
-def test_completion_recorder_cloudpickles_non_bytes_non_json_safe_values_before_storing(results_store):
-    import cloudpickle
-
-    event_bus = InMemoryEventBus()
-    data_registry = _data_registry()
-    on_complete = build_completion_recorder(
-        results=results_store, event_bus=event_bus, data_registry=data_registry, now_fn=lambda: 100.0,
-    )
-
-    on_complete(InvocationHandle(job_id="job1", function_id="add"), Ok({1, 2, 3}))  # a set isn't JSON-safe
-
-    result = results_store.get(StorageKey(id="job1")).unwrap()
-    assert result.output == {"type": "bytes"}
-    stored = data_registry.read_whole("job-result-job1", 1).unwrap()
-    assert cloudpickle.loads(stored) == {1, 2, 3}
-
-
-def test_completion_recorder_without_data_registry_stores_type_bytes_with_empty_refs(results_store):
-    """Regression guard: with no data_registry wired in (the default), a
-    non-JSON-safe return value is silently dropped -- output says "bytes"
-    but refs stays empty, so the caller gets nothing back. Worth pinning
-    explicitly since it's an easy behavior to accidentally change."""
-    event_bus = InMemoryEventBus()
+    failed = []
+    event_bus.subscribe("JOB_FAILED", failed.append)
     on_complete = build_completion_recorder(results=results_store, event_bus=event_bus, now_fn=lambda: 100.0)
 
-    on_complete(InvocationHandle(job_id="job1", function_id="add"), Ok(b"raw-bytes-result"))
+    on_complete(InvocationHandle(job_id="job1", function_id="add"), Ok(value))
 
     result = results_store.get(StorageKey(id="job1")).unwrap()
-    assert result.ok is True
-    assert result.output == {"type": "bytes"}
-    assert result.refs == {}
+    assert result.ok is False
+    assert "results must be JSON" in result.error and "dataio.write" in result.error
+    assert failed[0].payload["outcome"] == "failed_user"
+
+
+def test_invalid_max_wait_is_rejected_before_anything_is_recorded(results_store, event_bus, function_registry):
+    runtime = _FakeRuntime()
+    handler = JobSubmitHandler(
+        runtime=runtime, results=results_store, event_bus=event_bus,
+        function_registry=function_registry, job_id_fn=lambda: "job1",
+    )
+    command = Command(
+        operation="JOB_SUBMIT", content_type="application/json",
+        envelope={"function_id": "add", "function_version": 1, "params": {}, "max_wait": -5}, payload=b"",
+    )
+    result = handler.handle(command)
+    assert result.ok is False
+    assert result.error_name == "INVALID_FIELD"
+    assert runtime.invocations == []
+
+
+def test_max_wait_registers_a_deadline_from_received_time(results_store, event_bus, function_registry):
+    from axo_endpoint.core.runtime.queue_deadlines import QueueDeadlines
+
+    deadlines = QueueDeadlines()
+    handler = JobSubmitHandler(
+        runtime=_FakeRuntime(), results=results_store, event_bus=event_bus,
+        function_registry=function_registry, job_id_fn=lambda: "job1", now_fn=lambda: 100.0,
+        queue_deadlines=deadlines, default_max_wait_s=-1,
+    )
+    command = Command(
+        operation="JOB_SUBMIT", content_type="application/json",
+        envelope={"function_id": "add", "function_version": 1, "params": {}, "max_wait": 3}, payload=b"",
+    )
+    assert handler.handle(command).ok is True
+    assert deadlines.take("job1", now=103.0) is None
+
+    handler._job_id_fn = lambda: "job2"
+    handler.handle(command)
+    assert deadlines.take("job2", now=103.5).name == "QUEUE_WAIT_TIMEOUT"
+
+
+def test_output_buckets_ride_in_the_params_and_survive_a_forward_revalidation(results_store, event_bus):
+    """A choreography's FN -> bucket edges: the function sees them as
+    ctx.output_buckets. A JOB_FORWARD brings params already carrying the
+    reserved key; validation must not reject it as an undeclared param."""
+    from axo_shared.functions.params_schema import ParamSpec
+    from axo_endpoint.core.runtime import OUTPUT_BUCKETS_PARAM, build_invocation
+
+    registry = FunctionRegistry(backend=InMemoryStorageBackend(), event_bus=event_bus)
+    registry.register(function_id="add", name="add", code=b"", now=0.0,
+                      params_schema=[ParamSpec(name="a", type="number", required=True)])
+    runtime = _FakeRuntime()
+    handler = JobSubmitHandler(runtime=runtime, results=results_store, event_bus=event_bus,
+                               function_registry=registry, job_id_fn=lambda: "job1")
+
+    assert handler.handle(Command(
+        operation="JOB_SUBMIT", content_type="application/json",
+        envelope={"function_id": "add", "function_name": "add", "function_version": 1, "params": {"a": 2},
+                  "output_buckets": ["reports"]},
+    )).ok
+    params = runtime.invocations[0][2]
+    assert params == {"a": 2, OUTPUT_BUCKETS_PARAM: ["reports"]}
+
+    # what the worker does with them
+    ctx, call_params = build_invocation("job1", "/tmp/x", params)
+    assert ctx.output_buckets == ["reports"] and call_params == {"a": 2}
+
+    # the same params arriving again (as a forward would send them)
+    assert handler.handle(Command(
+        operation="JOB_SUBMIT", content_type="application/json",
+        envelope={"function_id": "add", "function_name": "add", "function_version": 1, "params": params},
+    )).ok
+    assert runtime.invocations[1][2] == params
+
+
+def test_a_caller_job_id_is_used_and_a_repeat_runs_once(results_store, event_bus, function_registry):
+    """The Control Plane brings its own id for a job it accepted while the VE
+    slept; delivering it twice must not run it twice."""
+    runtime = _FakeRuntime()
+    handler = JobSubmitHandler(runtime=runtime, results=results_store, event_bus=event_bus,
+                               function_registry=function_registry, job_id_fn=lambda: "minted1")
+    envelope = {"function_id": "add", "function_name": "add", "function_version": 1, "params": {},
+                "job_id": "cp-job-0001"}
+    first = handler.handle(Command(operation="JOB_SUBMIT", content_type="application/json", envelope=envelope))
+    again = handler.handle(Command(operation="JOB_SUBMIT", content_type="application/json", envelope=envelope))
+    assert first.metadata == {"job_id": "cp-job-0001", "status": "QUEUED"}
+    assert again.ok and again.metadata == {"job_id": "cp-job-0001", "status": "DUPLICATE"}
+    assert len(runtime.invocations) == 1
+    bad = handler.handle(Command(operation="JOB_SUBMIT", content_type="application/json",
+                                 envelope={**envelope, "job_id": "../x"}))
+    assert bad.ok is False and runtime.invocations[-1][1] == "cp-job-0001"

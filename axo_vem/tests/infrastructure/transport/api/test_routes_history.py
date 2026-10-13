@@ -1,15 +1,12 @@
 from datetime import datetime, timedelta, timezone
 
-from xolo.client.models import UserDTO
-
 from axo_shared.events import models
 
-from .conftest import FAKE_USER, _fake_current_user
+from fastapi.testclient import TestClient
 
-OTHER_USER = UserDTO(
-    key="user-2", username="bob", first_name="Bob", last_name="B",
-    email="bob@example.com", profile_photo="",
-)
+from axo_vem.infrastructure.transport.api.app import create_app
+
+from .conftest import CP_HEADERS, _fake_current_user
 
 
 def _seed_function_registered(kurrent_appender, function_id="add", endpoint_id="n0"):
@@ -82,86 +79,39 @@ def test_active_object_history_route_returns_empty_no_source_yet(client, kurrent
     assert response.json() == []
 
 
-def test_history_default_window_excludes_events_older_than_an_hour(client, kurrent_appender):
+def _seed_old(kurrent_appender, hours_ago=2):
     old_event = models.FunctionRegistered(
         endpoint_id="n0", function_id="old-fn", version=1,
-        created_at=datetime.now(timezone.utc) - timedelta(hours=2),
+        created_at=datetime.now(timezone.utc) - timedelta(hours=hours_ago),
     )
     kurrent_appender.append_to_stream(
         "functions-old-fn", models.FUNCTION_REGISTERED, old_event.model_dump(mode="json"),
     )
+
+
+def test_since_minutes_narrows_the_window(client, kurrent_appender):
+    _seed_old(kurrent_appender)
     _seed_function_registered(kurrent_appender, function_id="recent-fn")
 
-    response = client.get("/history")
-    function_ids = {e["meta"]["function_id"] for e in response.json()}
-    assert function_ids == {"recent-fn"}
+    everything = {e["meta"]["function_id"] for e in client.get("/history").json()}
+    last_hour = {e["meta"]["function_id"] for e in client.get("/history", params={"since_minutes": 60}).json()}
+
+    assert everything == {"old-fn", "recent-fn"}
+    assert last_hour == {"recent-fn"}
 
 
-def test_history_widening_activity_window_minutes_preference_includes_older_events(client, kurrent_appender):
-    old_event = models.FunctionRegistered(
-        endpoint_id="n0", function_id="old-fn", version=1,
-        created_at=datetime.now(timezone.utc) - timedelta(hours=2),
+def test_records_older_than_retention_are_hidden_and_come_back_when_raised(collections, activity_repository, kurrent_appender):
+    """Retention never deletes: lowering it hides older records, raising it
+    shows them again."""
+    retention_hours = [1]
+    app = create_app(
+        collections=collections, activity_repository=activity_repository,
+        current_user_dependency=_fake_current_user,
+        retention_cutoff=lambda: datetime.now(timezone.utc) - timedelta(hours=retention_hours[0]),
     )
-    kurrent_appender.append_to_stream(
-        "functions-old-fn", models.FUNCTION_REGISTERED, old_event.model_dump(mode="json"),
-    )
+    client = TestClient(app, headers=CP_HEADERS)
+    _seed_old(kurrent_appender, hours_ago=2)
 
-    # Default 60-minute window excludes it.
     assert client.get("/history").json() == []
-
-    # POST /profile itself lands its own UserProfileCreated row in
-    # unified_activity, so filter down to just the FunctionRegistered rows
-    # this test actually cares about.
-    client.post("/profile", json={
-        "profile_photo": "", "color": None, "view_mode": "list", "language": "en",
-        "activity_window_minutes": 300,
-    })
-
-    response = client.get("/history")
-    function_ids = {
-        e["meta"]["function_id"] for e in response.json() if e["event_type"] == models.FUNCTION_REGISTERED
-    }
-    assert function_ids == {"old-fn"}
-
-
-def test_user_profile_history_requires_self(client):
-    response = client.get(f"/user-profiles/{FAKE_USER.key}/history")
-    assert response.status_code == 200
-
-
-def test_user_profile_history_rejects_other_users(client):
-    client.app.dependency_overrides[_fake_current_user] = lambda: OTHER_USER
-    try:
-        response = client.get(f"/user-profiles/{FAKE_USER.key}/history")
-        assert response.status_code == 403
-    finally:
-        del client.app.dependency_overrides[_fake_current_user]
-
-
-def test_virtual_environment_history_requires_ownership(client):
-    create_response = client.post(
-        "/virtual-environments", json={"name": "dev-env", "cpu": 1.0, "ram": 512, "disk": 1024},
-    )
-    ve_id = create_response.json()["virtual_environment_id"]
-
-    response = client.get(f"/virtual-environments/{ve_id}/history")
-    assert response.status_code == 200
-
-
-def test_virtual_environment_history_rejects_non_owner(client):
-    create_response = client.post(
-        "/virtual-environments", json={"name": "dev-env", "cpu": 1.0, "ram": 512, "disk": 1024},
-    )
-    ve_id = create_response.json()["virtual_environment_id"]
-
-    client.app.dependency_overrides[_fake_current_user] = lambda: OTHER_USER
-    try:
-        response = client.get(f"/virtual-environments/{ve_id}/history")
-        assert response.status_code == 403
-    finally:
-        del client.app.dependency_overrides[_fake_current_user]
-
-
-def test_virtual_environment_history_unknown_id_returns_404(client):
-    response = client.get("/virtual-environments/missing/history")
-    assert response.status_code == 404
+    retention_hours[0] = 3
+    assert {e["meta"]["function_id"] for e in client.get("/history").json()} == {"old-fn"}

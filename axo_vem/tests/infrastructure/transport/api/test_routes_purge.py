@@ -11,50 +11,6 @@ def _create_ve(client, name="dev-env", cpu=2.0, ram=1024, disk=2048):
     return client.post("/virtual-environments", json={"name": name, "cpu": cpu, "ram": ram, "disk": disk})
 
 
-def test_delete_virtual_environment_with_endpoint_assigned_returns_409(client, collections):
-    ve_id = _create_ve(client).json()["virtual_environment_id"]
-    collections.endpoints.insert_one({"_id": "n0", "endpoint_id": "n0", "virtual_environment_id": ve_id})
-
-    response = client.delete(f"/virtual-environments/{ve_id}")
-    assert response.status_code == 409
-
-    # Unassigning the endpoint clears the guard.
-    collections.endpoints.update_one({"_id": "n0"}, {"$set": {"virtual_environment_id": None}})
-    response = client.delete(f"/virtual-environments/{ve_id}")
-    assert response.status_code == 204
-
-
-def test_purge_virtual_environment_requires_soft_delete_first(client):
-    ve_id = _create_ve(client).json()["virtual_environment_id"]
-
-    response = client.delete(f"/virtual-environments/{ve_id}/purge")
-    assert response.status_code == 409
-
-    client.delete(f"/virtual-environments/{ve_id}")
-    response = client.delete(f"/virtual-environments/{ve_id}/purge")
-    assert response.status_code == 200
-
-    assert client.get(f"/virtual-environments/{ve_id}").status_code == 404
-
-
-def test_purge_virtual_environment_removes_activity(client, activity_repository):
-    ve_id = _create_ve(client).json()["virtual_environment_id"]
-    activity_repository.record("SomeEvent", {
-        "event_id": "e1", "created_at": "2026-01-01T00:00:00+00:00",
-        "virtual_environment_id": ve_id,
-    })
-
-    client.delete(f"/virtual-environments/{ve_id}")
-    client.delete(f"/virtual-environments/{ve_id}/purge")
-
-    assert activity_repository.get_timeline(virtual_environment_id=ve_id) == []
-
-
-def test_purge_virtual_environment_unknown_returns_404(client):
-    response = client.delete("/virtual-environments/missing/purge")
-    assert response.status_code == 404
-
-
 def test_purge_function_version_requires_soft_delete_first(client, collections):
     collections.functions.insert_one({"_id": "add:1", "function_id": "add", "version": 1})
 

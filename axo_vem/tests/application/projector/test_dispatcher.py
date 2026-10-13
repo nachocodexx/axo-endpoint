@@ -10,33 +10,21 @@ from axo_vem.application.projector.dispatcher import apply_event
 from axo_vem.application.projector.handlers import ProjectorHandlers
 from axo_vem.infrastructure.transport.ws.broadcaster import Broadcaster
 from axo_vem.infrastructure.database.mongo.activity_repository import MongoActivityRepository
-from axo_vem.infrastructure.database.mongo.bucket_repository import (
-    MongoBucketRepository,
-    MongoDataItemRepository,
-)
 from axo_vem.infrastructure.database.mongo.choreography_repository import MongoChoreographyRepository
 from axo_vem.infrastructure.database.mongo.consensus_repository import MongoConsensusRepository
 from axo_vem.infrastructure.database.mongo.endpoint_repository import MongoEndpointRepository
 from axo_vem.infrastructure.database.mongo.function_repository import MongoFunctionRepository
 from axo_vem.infrastructure.database.mongo.job_repository import MongoJobRepository
-from axo_vem.infrastructure.database.mongo.user_profile_repository import MongoUserProfileRepository
-from axo_vem.infrastructure.database.mongo.virtual_environment_repository import (
-    MongoVirtualEnvironmentRepository,
-)
 
 
 def _handlers():
     db = mongomock.MongoClient()["test"]
     handlers = ProjectorHandlers(
         activity_recorder=MongoActivityRepository(db["unified_activity"]),
-        user_profile_repository=MongoUserProfileRepository(db["user_profiles"]),
-        virtual_environment_repository=MongoVirtualEnvironmentRepository(db["virtual_environments"]),
         endpoint_repository=MongoEndpointRepository(db["endpoints"]),
         function_repository=MongoFunctionRepository(db["functions"]),
         consensus_recorder=MongoConsensusRepository(db["consensus"]),
         job_repository=MongoJobRepository(db["jobs"]),
-        bucket_repository=MongoBucketRepository(db["buckets"]),
-        data_item_repository=MongoDataItemRepository(db["bucket_data"]),
         choreography_repository=MongoChoreographyRepository(db["choreographies"]),
     )
     return handlers, db
@@ -173,35 +161,6 @@ def test_endpoint_recovered_flips_status_back_to_running():
 
     doc = db["endpoints"].find_one({"_id": "n0"})
     assert doc["status"] == "running"
-
-
-def test_endpoint_virtual_env_assigned_upserts_same_document():
-    handlers, db = _handlers()
-    started = models.EndpointStarted(
-        endpoint_id="n0", router_bind="tcp://0.0.0.0:5555", pub_bind="tcp://0.0.0.0:5556",
-    )
-    apply_event(handlers, models.ENDPOINT_STARTED, started.model_dump(mode="json"))
-
-    assigned = models.EndpointVirtualEnvironmentAssigned(endpoint_id="n0", virtual_environment_id="ve1")
-    apply_event(handlers, models.ENDPOINT_VIRTUAL_ENV_ASSIGNED, assigned.model_dump(mode="json"))
-
-    assert db["endpoints"].count_documents({}) == 1
-    doc = db["endpoints"].find_one({"_id": "n0"})
-    assert doc["virtual_environment_id"] == "ve1"
-
-
-def test_endpoint_virtual_env_detached_upserts_same_document():
-    handlers, db = _handlers()
-    started = models.EndpointStarted(
-        endpoint_id="n0", router_bind="tcp://0.0.0.0:5555", pub_bind="tcp://0.0.0.0:5556",
-    )
-    apply_event(handlers, models.ENDPOINT_STARTED, started.model_dump(mode="json"))
-
-    detached = models.EndpointVirtualEnvironmentDetached(endpoint_id="n0", previous_virtual_environment_id="ve1")
-    apply_event(handlers, models.ENDPOINT_VIRTUAL_ENV_DETACHED, detached.model_dump(mode="json"))
-
-    doc = db["endpoints"].find_one({"_id": "n0"})
-    assert doc["previous_virtual_environment_id"] == "ve1"
 
 
 def test_function_registered_upserts_by_function_id_and_version():
@@ -479,220 +438,6 @@ class _FakeEventPublisher:
         self.appended.append((stream_name, event_type, data))
 
 
-def test_leader_elected_sets_leader_endpoint_id_on_the_endpoints_own_ve():
-    handlers, db = _handlers()
-    db["virtual_environments"].insert_one({
-        "_id": "ve1", "virtual_environment_id": "ve1", "name": "dev", "owner_user_id": "u1",
-        "resource_quota": {"cpu": 1.0, "ram": 1, "disk": 1},
-    })
-    assigned = models.EndpointVirtualEnvironmentAssigned(endpoint_id="n0", virtual_environment_id="ve1")
-    apply_event(handlers, models.ENDPOINT_VIRTUAL_ENV_ASSIGNED, assigned.model_dump(mode="json"))
-
-    # The reporting endpoint (n1, some other peer) is irrelevant -- only the
-    # elected leader's (n0's) own VE assignment matters.
-    event = models.LeaderElected(endpoint_id="n1", leader_ids=["n0"], term=1)
-    publisher = _FakeEventPublisher()
-    apply_event(handlers, models.LEADER_ELECTED, event.model_dump(mode="json"), event_publisher=publisher)
-
-    doc = db["virtual_environments"].find_one({"_id": "ve1"})
-    assert doc["leader_endpoint_id"] == "n0"
-
-    # Audit event appended to the VE's own stream, not waited on for the read
-    # model update above (already applied directly).
-    assert len(publisher.appended) == 1
-    stream_name, event_type, data = publisher.appended[0]
-    assert stream_name == "virtual-environments-ve1"
-    assert event_type == models.VIRTUAL_ENV_LEADER_CHANGED
-    assert data["virtual_environment_id"] == "ve1"
-    assert data["leader_endpoint_id"] == "n0"
-
-
-def test_leader_change_clears_the_previous_leaders_ve():
-    handlers, db = _handlers()
-    db["virtual_environments"].insert_many([
-        {"_id": "ve1", "virtual_environment_id": "ve1", "name": "a", "owner_user_id": "u1", "resource_quota": {"cpu": 1.0, "ram": 1, "disk": 1}},
-        {"_id": "ve2", "virtual_environment_id": "ve2", "name": "b", "owner_user_id": "u1", "resource_quota": {"cpu": 1.0, "ram": 1, "disk": 1}},
-    ])
-    apply_event(handlers, models.ENDPOINT_VIRTUAL_ENV_ASSIGNED, models.EndpointVirtualEnvironmentAssigned(endpoint_id="n0", virtual_environment_id="ve1").model_dump(mode="json"))
-    apply_event(handlers, models.ENDPOINT_VIRTUAL_ENV_ASSIGNED, models.EndpointVirtualEnvironmentAssigned(endpoint_id="n1", virtual_environment_id="ve2").model_dump(mode="json"))
-
-    apply_event(handlers, models.LEADER_ELECTED, models.LeaderElected(endpoint_id="n0", leader_ids=["n0"], term=1).model_dump(mode="json"))
-    assert db["virtual_environments"].find_one({"_id": "ve1"})["leader_endpoint_id"] == "n0"
-
-    apply_event(handlers, models.LEADER_ELECTED, models.LeaderElected(endpoint_id="n1", leader_ids=["n1"], term=2).model_dump(mode="json"))
-    assert "leader_endpoint_id" not in db["virtual_environments"].find_one({"_id": "ve1"})
-    assert db["virtual_environments"].find_one({"_id": "ve2"})["leader_endpoint_id"] == "n1"
-
-
-def test_consensus_view_changed_also_updates_ve_leader():
-    handlers, db = _handlers()
-    db["virtual_environments"].insert_one({"_id": "ve1", "virtual_environment_id": "ve1", "name": "dev", "owner_user_id": "u1", "resource_quota": {"cpu": 1.0, "ram": 1, "disk": 1}})
-    apply_event(handlers, models.ENDPOINT_VIRTUAL_ENV_ASSIGNED, models.EndpointVirtualEnvironmentAssigned(endpoint_id="n0", virtual_environment_id="ve1").model_dump(mode="json"))
-
-    event = models.ConsensusViewChanged(endpoint_id="n0", term=1, was_leader=False, is_leader=True, leader_ids=["n0"])
-    apply_event(handlers, models.CONSENSUS_VIEW_CHANGED, event.model_dump(mode="json"))
-
-    assert db["virtual_environments"].find_one({"_id": "ve1"})["leader_endpoint_id"] == "n0"
-
-
-def test_leader_elected_is_a_no_op_when_leader_has_no_ve():
-    handlers, db = _handlers()
-    db["virtual_environments"].insert_one({"_id": "ve1", "virtual_environment_id": "ve1", "name": "dev", "owner_user_id": "u1", "resource_quota": {"cpu": 1.0, "ram": 1, "disk": 1}})
-
-    # n0 has never been assigned to any VE.
-    event = models.LeaderElected(endpoint_id="n0", leader_ids=["n0"], term=1)
-    apply_event(handlers, models.LEADER_ELECTED, event.model_dump(mode="json"))
-
-    assert "leader_endpoint_id" not in db["virtual_environments"].find_one({"_id": "ve1"})
-
-
-def test_quorum_events_do_not_touch_ve_leader_tracking():
-    handlers, db = _handlers()
-    db["virtual_environments"].insert_one({
-        "_id": "ve1", "virtual_environment_id": "ve1", "name": "dev", "owner_user_id": "u1",
-        "resource_quota": {"cpu": 1.0, "ram": 1, "disk": 1}, "leader_endpoint_id": "n0",
-    })
-
-    event = models.ClusterQuorumLost(endpoint_id="n0", term=5, member_count=1, quorum_size=2)
-    apply_event(handlers, models.CLUSTER_QUORUM_LOST, event.model_dump(mode="json"))
-
-    assert db["virtual_environments"].find_one({"_id": "ve1"})["leader_endpoint_id"] == "n0"
-
-
-def test_virtual_environment_leader_changed_is_recognized_and_recorded():
-    handlers, db = _handlers()
-    event = models.VirtualEnvironmentLeaderChanged(virtual_environment_id="ve1", leader_endpoint_id="n0")
-    apply_event(handlers, models.VIRTUAL_ENV_LEADER_CHANGED, event.model_dump(mode="json"))
-
-    activity_doc = db["unified_activity"].find_one({"_id": event.event_id})
-    assert activity_doc is not None
-    assert activity_doc["event_type"] == models.VIRTUAL_ENV_LEADER_CHANGED
-
-
-def test_user_profile_created_also_records_unified_activity():
-    handlers, db = _handlers()
-    event = models.UserProfileCreated(
-        user_id="user-1", profile_photo="", preferences=models.Preferences(),
-    )
-    apply_event(handlers, models.USER_PROFILE_CREATED, event.model_dump(mode="json"))
-
-    doc = db["user_profiles"].find_one({"_id": "user-1"})
-    assert doc is not None
-
-    activity_doc = db["unified_activity"].find_one({"_id": event.event_id})
-    assert activity_doc is not None
-    assert activity_doc["event_type"] == models.USER_PROFILE_CREATED
-    assert activity_doc["user_id"] == "user-1"
-
-
-def test_virtual_environment_created_also_records_unified_activity():
-    handlers, db = _handlers()
-    event = models.VirtualEnvironmentCreated(
-        virtual_environment_id="ve1", name="my-ve", owner_user_id="user-1",
-        resource_quota=models.ResourceQuota(cpu=1.0, ram=512, disk=1024),
-    )
-    apply_event(handlers, models.VIRTUAL_ENV_CREATED, event.model_dump(mode="json"))
-
-    doc = db["virtual_environments"].find_one({"_id": "ve1"})
-    assert doc is not None
-
-    activity_doc = db["unified_activity"].find_one({"_id": event.event_id})
-    assert activity_doc is not None
-    assert activity_doc["event_type"] == models.VIRTUAL_ENV_CREATED
-    assert activity_doc["virtual_environment_id"] == "ve1"
-    assert activity_doc["meta"]["name"] == "my-ve"
-    assert activity_doc["meta"]["resource_quota"] == {"cpu": 1.0, "ram": 512, "disk": 1024}
-
-
-def test_virtual_environment_updated_preserves_owner_user_id():
-    """VirtualEnvironmentUpdated deliberately omits owner_user_id (ownership
-    is immutable after creation) -- the handler must fetch the existing
-    aggregate first rather than losing it, mirroring the old plain-$set
-    upsert's reliance on Mongo's partial-update semantics."""
-    handlers, db = _handlers()
-    created = models.VirtualEnvironmentCreated(
-        virtual_environment_id="ve1", name="dev", owner_user_id="user-1",
-        resource_quota=models.ResourceQuota(cpu=1.0, ram=512, disk=1024),
-    )
-    apply_event(handlers, models.VIRTUAL_ENV_CREATED, created.model_dump(mode="json"))
-
-    updated = models.VirtualEnvironmentUpdated(
-        virtual_environment_id="ve1", name="renamed",
-        resource_quota=models.ResourceQuota(cpu=2.0, ram=1024, disk=2048),
-    )
-    apply_event(handlers, models.VIRTUAL_ENV_UPDATED, updated.model_dump(mode="json"))
-
-    doc = db["virtual_environments"].find_one({"_id": "ve1"})
-    assert doc["name"] == "renamed"
-    assert doc["owner_user_id"] == "user-1"
-
-
-def test_bucket_created_records_unified_activity_and_buckets_collection():
-    handlers, db = _handlers()
-    created = models.DataBucketCreated(endpoint_id="n0", name="mybucket", quota_bytes=1024)
-    apply_event(handlers, models.DATA_BUCKET_CREATED, created.model_dump(mode="json"))
-
-    activity_doc = db["unified_activity"].find_one({"_id": created.event_id})
-    assert activity_doc["meta"]["name"] == "mybucket"
-    assert activity_doc["event_type"] == models.DATA_BUCKET_CREATED
-
-    bucket_doc = db["buckets"].find_one({"_id": "mybucket"})
-    assert bucket_doc["quota_bytes"] == 1024
-
-
-def test_data_registered_records_unified_activity_and_bucket_data_collection():
-    handlers, db = _handlers()
-    registered = models.DataRegistered(
-        endpoint_id="n0", name="mybucket/df1", version=1,
-        format="raw", kind="fs", total_size=8, total_chunks=2,
-    )
-    apply_event(handlers, models.DATA_REGISTERED, registered.model_dump(mode="json"))
-
-    activity_doc = db["unified_activity"].find_one({"_id": registered.event_id})
-    assert activity_doc["meta"]["name"] == "mybucket/df1"
-    assert activity_doc["event_type"] == models.DATA_REGISTERED
-
-    item_doc = db["bucket_data"].find_one({"_id": "mybucket/df1:1"})
-    assert item_doc["total_size"] == 8
-    assert item_doc["total_chunks"] == 2
-    assert item_doc["status"] == "pending"
-
-
-def test_data_upload_completed_flips_status_to_ready():
-    handlers, db = _handlers()
-    registered = models.DataRegistered(
-        endpoint_id="n0", name="mybucket/df1", version=1,
-        format="raw", kind="fs", total_size=8, total_chunks=2,
-    )
-    apply_event(handlers, models.DATA_REGISTERED, registered.model_dump(mode="json"))
-
-    completed = models.DataUploadCompleted(endpoint_id="n0", name="mybucket/df1", version=1)
-    apply_event(handlers, models.DATA_UPLOAD_COMPLETED, completed.model_dump(mode="json"))
-
-    item_doc = db["bucket_data"].find_one({"_id": "mybucket/df1:1"})
-    assert item_doc["status"] == "ready"
-    # Untouched by the status-only update.
-    assert item_doc["total_size"] == 8
-    assert item_doc["total_chunks"] == 2
-
-
-def test_data_deleted_removes_the_bucket_data_document():
-    handlers, db = _handlers()
-    registered = models.DataRegistered(
-        endpoint_id="n0", name="mybucket/df1", version=1,
-        format="raw", kind="fs", total_size=8, total_chunks=2,
-    )
-    apply_event(handlers, models.DATA_REGISTERED, registered.model_dump(mode="json"))
-    assert db["bucket_data"].find_one({"_id": "mybucket/df1:1"}) is not None
-
-    deleted = models.DataDeleted(endpoint_id="n0", name="mybucket/df1", version=1)
-    apply_event(handlers, models.DATA_DELETED, deleted.model_dump(mode="json"))
-
-    assert db["bucket_data"].find_one({"_id": "mybucket/df1:1"}) is None
-    activity_doc = db["unified_activity"].find_one({"_id": deleted.event_id})
-    assert activity_doc["event_type"] == models.DATA_DELETED
-
-
 class _FakeWebSocket:
     def __init__(self):
         self.sent = []
@@ -701,45 +446,22 @@ class _FakeWebSocket:
         self.sent.append(message)
 
 
-def test_data_registered_and_upload_completed_broadcast_over_ws():
-    handlers, _ = _handlers()
-    ws = _FakeWebSocket()
-
-    async def scenario():
-        broadcaster = Broadcaster()
-        broadcaster.bind_loop(asyncio.get_running_loop())
-        broadcaster.register("buckets", ws)
-
-        registered = models.DataRegistered(
-            endpoint_id="n0", name="mybucket/df1", version=1,
-            format="raw", kind="fs", total_size=8, total_chunks=2,
-        )
-        apply_event(handlers, models.DATA_REGISTERED, registered.model_dump(mode="json"), broadcaster)
-
-        completed = models.DataUploadCompleted(endpoint_id="n0", name="mybucket/df1", version=1)
-        apply_event(handlers, models.DATA_UPLOAD_COMPLETED, completed.model_dump(mode="json"), broadcaster)
-
-        deleted = models.DataDeleted(endpoint_id="n0", name="mybucket/df1", version=1)
-        apply_event(handlers, models.DATA_DELETED, deleted.model_dump(mode="json"), broadcaster)
-
-        await asyncio.sleep(0.01)
-
-    asyncio.run(scenario())
-
-    assert ws.sent == [
-        {
-            "bucket": "mybucket", "name": "mybucket/df1", "version": 1,
-            "format": "raw", "kind": "fs", "total_size": 8, "total_chunks": 2,
-            "status": "pending",
-        },
-        {"bucket": "mybucket", "name": "mybucket/df1", "version": 1, "status": "ready"},
-        {"bucket": "mybucket", "name": "mybucket/df1", "version": 1, "status": "deleted"},
-    ]
-
-
 def test_unknown_event_type_raises():
     handlers, db = _handlers()
     with pytest.raises(ValueError):
         apply_event(handlers, "NotARealEventType", {})
 
     assert db["unified_activity"].count_documents({}) == 0
+
+
+@pytest.mark.parametrize("event_type", [
+    models.USER_PROFILE_CREATED, models.VIRTUAL_ENV_CREATED, models.VIRTUAL_ENV_LEADER_CHANGED,
+    models.ENDPOINT_VIRTUAL_ENV_ASSIGNED, models.DATA_BUCKET_CREATED, models.DATA_REGISTERED,
+])
+def test_legacy_event_types_are_skipped_quietly(event_type):
+    """Profiles/VEs belong to the Control Plane and buckets to axo_storage
+    now -- an older event log still replays without errors or side effects."""
+    handlers, db = _handlers()
+    apply_event(handlers, event_type, {"event_id": "e1", "created_at": "2026-01-01T00:00:00+00:00"})
+    assert db["unified_activity"].count_documents({}) == 0
+

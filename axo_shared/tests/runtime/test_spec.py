@@ -8,7 +8,7 @@ def test_defaults():
     assert spec.requirements == []
     assert spec.image is None
     assert spec.env_vars == {}
-    assert spec.idle_ttl_seconds == 300.0
+    assert spec.idle_ttl_seconds is None
     assert spec.max_invocations == 0
     assert spec.memory_limit_bytes is None
     assert spec.cpu_limit is None
@@ -45,4 +45,4 @@ def test_from_dict_partial_overrides_only_given_keys():
     assert spec.type == "container"
     assert spec.python_version == "3.10"
     assert spec.requirements == []
-    assert spec.idle_ttl_seconds == 300.0
+    assert spec.idle_ttl_seconds is None

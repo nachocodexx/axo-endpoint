@@ -4,7 +4,7 @@ import time
 from typing import Callable, Optional, Union
 
 from axo_shared.activity.models import FUNCTION_REGISTER_FAILED_EVENT
-from axo_endpoint.core.errors import MissingFieldError, StorageFailureError
+from axo_endpoint.core.errors import FunctionVersionExistsError, MissingFieldError, StorageFailureError
 from axo_endpoint.core.events.bus import Event as BusEvent, EventBus
 from axo_endpoint.core.functions import FunctionRegistry
 from axo_shared.functions.params_schema import parse_params_schema
@@ -33,8 +33,8 @@ class FunctionRegisterHandler(CommandHandler):
 
     def handle(self, command: Command) -> CommandResult:
         """Reads the function's id, name, and code from the request, and
-        saves them -- version is never read from the request, the registry
-        assigns it."""
+        saves them -- the registry assigns the version, except when the VEM
+        restores a function (restore=true + version)."""
         t0 = time.monotonic()
         function_id = command.envelope.get("function_id")
         name = command.envelope.get("name")
@@ -59,6 +59,13 @@ class FunctionRegisterHandler(CommandHandler):
             runtime_spec = RuntimeSpec.from_dict(raw_spec)
         code_format = command.envelope.get("code_format", "cloudpickle")
         params_schema = parse_params_schema(command.envelope.get("params_schema")) or None
+        # Restoring (VEM, after a VE start): re-register at the exact version
+        # the function had. Only honored with restore=true.
+        restore_version = command.envelope.get("version") if command.envelope.get("restore") else None
+        if restore_version is not None and (not isinstance(restore_version, int) or restore_version < 1):
+            return CommandResult.from_error(MissingFieldError(
+                "restore needs a positive integer version", context={"fields": ["version"]},
+            ))
 
         result = self._registry.register(
             function_id=function_id,
@@ -68,9 +75,12 @@ class FunctionRegisterHandler(CommandHandler):
             runtime_spec=runtime_spec,
             code_format=code_format,
             params_schema=params_schema,
+            restore_version=restore_version,
         )
         if result.is_err:
             raw = result.unwrap_err()
+            if isinstance(raw, FunctionVersionExistsError):
+                return CommandResult.from_error(raw)
             err = StorageFailureError(str(raw), context={"function_id": function_id, "function_name": name})
             self._logger.info_event(
                 Event.Function.REGISTERED,

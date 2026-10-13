@@ -73,6 +73,23 @@ services:
     # is a dedicated instance for axo_vem's own read model, kept
     # separate from the unrelated xolo-db service above.
 
+  axo-storage:
+    build:
+      context: .
+      dockerfile: axo_storage/Dockerfile
+    image: ${AXO_STORAGE_IMAGE:-axo-storage:local}
+    container_name: ${AXO_STORAGE_CONTAINER_NAME:-axo-storage}
+    hostname: axo-storage
+    restart: unless-stopped
+    env_file:
+      - ${AXO_STORAGE_ENV_FILE:-./deploy/env/axo.storage.prod.env}
+    volumes:
+      # Every bucket's bytes + the SQLite catalog. Endpoints only cache.
+      - ${AXO_STORAGE_VOLUME_NAME:-axo-storage-data}:/data
+    networks:
+      - axo-net
+    # No host port published -- only endpoints and axo-vem talk to this.
+
   axo-vem:
     build:
       context: .
@@ -88,6 +105,7 @@ services:
     depends_on:
       - kurrentdb
       - axo-vem-mongo
+      - axo-storage
     networks:
       - axo-net
     volumes:
@@ -100,6 +118,9 @@ services:
       # so full bidirectional mesh membership after a dynamic launch is a
       # manual (or future) follow-up step, not handled here.
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      # The Control Plane outbox (job attempts are billing records): kept
+      # across VEM restarts until the CP acks each one.
+      - axo-vem-outbox:/var/lib/axo_vem/outbox
 
   xolo-db:
     image: mongo:${XOLO_MONGO_IMAGE_TAG:-8-noble}
@@ -176,10 +197,14 @@ networks:
     external: true
 
 volumes:
+  axo-storage-data:
+    name: ${AXO_STORAGE_VOLUME_NAME:-axo-storage-data}
   axo-kurrentdb-data:
     name: ${AXO_KURRENTDB_VOLUME_NAME:-axo-kurrentdb-data}
   axo-vem-mongo-data:
     name: ${AXO_VEM_MONGO_VOLUME_NAME:-axo-vem-mongo-data}
+  axo-vem-outbox:
+    name: ${AXO_VEM_OUTBOX_VOLUME_NAME:-axo-vem-outbox}
   xolo-mongodb-data:
     name: ${XOLO_MONGO_VOLUME_NAME:-xolo-mongodb-data}
   xolo-redis-data:

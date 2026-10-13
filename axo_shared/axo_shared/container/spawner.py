@@ -52,8 +52,16 @@ class ContainerSpawner:
         mounts: Optional[List[MountSpec]] = None,
         mem_limit_bytes: Optional[int] = None,
         nano_cpus: Optional[int] = None,
+        labels: Optional[Dict[str, str]] = None,
+        cgroup_parent: Optional[str] = None,
     ) -> Result[SpawnedContainerHandle, ContainerSpawnError]:
+        """``labels`` let a cleanup process find what created a container
+        (e.g. axo.ve / axo.role / axo.endpoint). ``cgroup_parent`` nests the
+        container under an existing cgroup so its limits cap the container
+        together with its siblings -- docker mode only: Swarm services
+        don't support it, so it is ignored there."""
         mounts = mounts or []
+        labels = dict(labels or {})
         try:
             if mode == "swarm":
                 resources = None
@@ -66,6 +74,8 @@ class ContainerSpawner:
                     networks=[network] if network else None,
                     mounts=_mounts_for_swarm(mounts) or None,
                     resources=resources,
+                    labels=labels or None,
+                    container_labels=labels or None,
                 )
                 return Ok(SpawnedContainerHandle(name=name, mode=mode, service_id=svc.id))
             else:
@@ -77,6 +87,8 @@ class ContainerSpawner:
                     volumes=_mounts_for_docker(mounts) or None,
                     mem_limit=mem_limit_bytes,
                     nano_cpus=nano_cpus,
+                    labels=labels or None,
+                    cgroup_parent=cgroup_parent or None,
                     detach=True,
                     remove=False,
                 )
@@ -110,6 +122,48 @@ class ContainerSpawner:
         except docker.errors.DockerException as exc:
             return Err(ContainerSpawnError(str(exc)))
         return Ok(None)
+
+    def halt(self, handle: SpawnedContainerHandle, timeout: int = 10) -> Result[None, ContainerSpawnError]:
+        """Stops a container but KEEPS it, so start() can bring it back fast
+        (an idle endpoint going to sleep). A Swarm service is scaled to 0."""
+        try:
+            if handle.mode == "swarm" and handle.service_id:
+                self._docker().services.get(handle.service_id).scale(0)
+            elif handle.container_id:
+                self._docker().containers.get(handle.container_id).stop(timeout=timeout)
+        except docker.errors.NotFound:
+            return Err(ContainerSpawnError(f"{handle.name} no longer exists"))
+        except docker.errors.DockerException as exc:
+            return Err(ContainerSpawnError(str(exc)))
+        return Ok(None)
+
+    def start(self, handle: SpawnedContainerHandle) -> Result[None, ContainerSpawnError]:
+        """Starts a container halted with halt() (a sleeping endpoint waking up)."""
+        try:
+            if handle.mode == "swarm" and handle.service_id:
+                self._docker().services.get(handle.service_id).scale(1)
+            elif handle.container_id:
+                self._docker().containers.get(handle.container_id).start()
+        except docker.errors.NotFound:
+            return Err(ContainerSpawnError(f"{handle.name} no longer exists"))
+        except docker.errors.DockerException as exc:
+            return Err(ContainerSpawnError(str(exc)))
+        return Ok(None)
+
+    def state(self, mode: ContainerMode, name: str) -> Optional[str]:
+        """"running", "exited", "created", ... (Docker's container status;
+        for a Swarm service "running" while it has replicas, else "exited"),
+        or None when no such container/service exists."""
+        try:
+            if mode == "swarm":
+                svc = self._docker().services.get(name)
+                replicas = ((svc.attrs.get("Spec") or {}).get("Mode") or {}).get("Replicated", {}).get("Replicas", 1)
+                return "running" if replicas else "exited"
+            return self._docker().containers.get(name).status
+        except docker.errors.NotFound:
+            return None
+        except docker.errors.DockerException:
+            return None
 
     def stats(self, handle: SpawnedContainerHandle) -> Result[ContainerStats, ContainerSpawnError]:
         """One-shot snapshot (stream=False) of a running container's

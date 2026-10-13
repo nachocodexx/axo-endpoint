@@ -16,7 +16,7 @@ from pydantic import BaseModel
 
 from axo_endpoint.core.dataio import DataIOError, DataIOTimeoutError, IORef
 from axo_endpoint.core.results import is_json_safe_value
-from axo_endpoint.core.runtime import InvocationContext
+from axo_endpoint.core.runtime import InvocationContext, build_invocation
 from axo_endpoint.dataio import bind_channel, reset_channel
 from axo_endpoint.runner.job_store import JobStore
 
@@ -148,10 +148,10 @@ class RunnerServer:
             logger.debug("zmq job received job_id=%s", job_id)
             self._store.set_pending(job_id)
 
-            ctx = InvocationContext(job_id=job_id, scratch_dir=scratch_dir)
             token = bind_channel(ZmqIOChannel(sock, identity, self._dataio_timeout_ms))
+            ctx = InvocationContext(job_id=job_id, scratch_dir=scratch_dir)
             try:
-                params = json.loads(params_b.decode("utf-8"))
+                ctx, params = build_invocation(job_id, scratch_dir, json.loads(params_b.decode("utf-8")))
                 result = self._fn(params, ctx)
                 payload = _encode_result(result)
                 output = {"value": result, "type": "json"} if is_json_safe_value(result) else {"type": "bytes"}
@@ -222,9 +222,9 @@ class RunnerServer:
                 # No IOChannel bound here (unlike the ZMQ dispatch path): direct
                 # HTTP invocation has no endpoint round trip to proxy dataio
                 # requests through, so dataio.read/write raises DataIOUnavailableError.
-                ctx = InvocationContext(job_id=job_id, scratch_dir=scratch_dir)
+                ctx, params = build_invocation(job_id, scratch_dir, body.params)
                 try:
-                    result = fn(body.params, ctx)
+                    result = fn(params, ctx)
                     output = {"value": result, "type": "json"} if is_json_safe_value(result) else {"type": "bytes"}
                     store.set_result(job_id, ok=True, output=output, warnings=ctx.warnings)
                     push_result(job_id, "ok", _encode_result(result))

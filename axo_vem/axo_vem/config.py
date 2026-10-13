@@ -17,6 +17,22 @@ def _list(name: str, default: str) -> List[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _optional_int(name: str) -> Optional[int]:
+    raw = os.environ.get(name, "").strip()
+    try:
+        return int(raw) if raw else None
+    except ValueError:
+        return None
+
+
+def _optional_float(name: str) -> Optional[float]:
+    raw = os.environ.get(name, "").strip()
+    try:
+        return float(raw) if raw else None
+    except ValueError:
+        return None
+
+
 def _bool(name: str, default: str) -> bool:
     return os.environ.get(name, default).lower() in {"1", "true", "yes", "on"}
 
@@ -40,7 +56,73 @@ class Config:
             "AXO_VEM_ROUTER_BIND", "tcp://0.0.0.0:6000"
         )
 
-        # Outbound commands (API -> node, e.g. VIRTUAL_ENV_ASSIGN)
+        # Who this VEM is -- set by the Control Plane when it launches the VE.
+        # A VEM manages exactly ONE VE.
+        self.AXO_VEM_VE_ID: str = os.environ.get("AXO_VEM_VE_ID", "")
+        # The Control Plane's token: every HTTP call must carry it (plus the
+        # acting user). Unset = every call refused.
+        self.AXO_VEM_SERVICE_TOKEN: str = os.environ.get("AXO_VEM_SERVICE_TOKEN", "")
+        # Hard limits from the VE's plan and the platform admin (set by the
+        # Control Plane at launch); settings can never go past them.
+        self.AXO_VEM_PLAN_MAX_ENDPOINTS: int = _int("AXO_VEM_PLAN_MAX_ENDPOINTS", 1)
+        self.AXO_VEM_PLAN_POLICIES_ALLOWED: bool = _bool("AXO_VEM_PLAN_POLICIES_ALLOWED", "false")
+        self.AXO_VEM_PLAN_MAX_RETENTION_DAYS: Optional[int] = _optional_int("AXO_VEM_PLAN_MAX_RETENTION_DAYS")
+        # The VE quota: every endpoint's size together must fit. Empty = none.
+        self.AXO_VEM_QUOTA_CPU_CORES: Optional[float] = _optional_float("AXO_VEM_QUOTA_CPU_CORES")
+        self.AXO_VEM_QUOTA_MEMORY_MB: Optional[int] = _optional_int("AXO_VEM_QUOTA_MEMORY_MB")
+        # JSON of the settings chosen when the VE was bought (target, min,
+        # endpoint size); used only while the VE has no settings history.
+        self.AXO_VEM_INITIAL_SETTINGS: str = os.environ.get("AXO_VEM_INITIAL_SETTINGS", "")
+        self.AXO_VEM_PLATFORM_MAX_QUEUE_LIMIT: Optional[int] = _optional_int("AXO_VEM_PLATFORM_MAX_QUEUE_LIMIT")
+        self.AXO_VEM_PLATFORM_MAX_WAIT_SECONDS: Optional[float] = _optional_float("AXO_VEM_PLATFORM_MAX_WAIT_SECONDS")
+        self.AXO_VEM_PLATFORM_ALLOW_WAIT_FOREVER: bool = _bool("AXO_VEM_PLATFORM_ALLOW_WAIT_FOREVER", "true")
+
+        # Endpoint lifecycle (Reconciler): how often it runs, how long a new
+        # or woken endpoint may take to report in, how long draining waits
+        # for running jobs, how many failures in a row before auto-replace
+        # gives up, and how long a request waits for a sleeping endpoint.
+        self.AXO_VEM_RECONCILE_INTERVAL_SECONDS: float = float(os.environ.get("AXO_VEM_RECONCILE_INTERVAL_SECONDS", "2.0"))
+        self.AXO_VEM_ENDPOINT_STARTUP_TIMEOUT_SECONDS: float = float(
+            os.environ.get("AXO_VEM_ENDPOINT_STARTUP_TIMEOUT_SECONDS", "180.0")
+        )
+        self.AXO_VEM_ENDPOINT_DRAIN_TIMEOUT_SECONDS: float = float(
+            os.environ.get("AXO_VEM_ENDPOINT_DRAIN_TIMEOUT_SECONDS", "600.0")
+        )
+        self.AXO_VEM_ENDPOINT_MAX_FAILURES: int = _int("AXO_VEM_ENDPOINT_MAX_FAILURES", 3)
+        # Scaling policies: evaluation cadence, and how long a manual target
+        # change pauses them (so a person's choice isn't undone at once).
+        self.AXO_VEM_POLICY_INTERVAL_SECONDS: float = float(os.environ.get("AXO_VEM_POLICY_INTERVAL_SECONDS", "10.0"))
+        self.AXO_VEM_POLICY_PAUSE_AFTER_MANUAL_SECONDS: float = float(
+            os.environ.get("AXO_VEM_POLICY_PAUSE_AFTER_MANUAL_SECONDS", "1800")
+        )
+        # The Control Plane link: heartbeats, job attempts (billing) and
+        # 1-minute summaries, through a journal resent until the CP acks.
+        # Empty = no CP (job attempts then go to this VEM's own event log).
+        self.AXO_VEM_CP_URI: str = os.environ.get("AXO_VEM_CP_URI", "")
+        self.AXO_VEM_CP_OUTBOX_PATH: str = os.environ.get("AXO_VEM_CP_OUTBOX_PATH", "/var/lib/axo_vem/outbox")
+        self.AXO_VEM_CP_HEARTBEAT_SECONDS: float = float(os.environ.get("AXO_VEM_CP_HEARTBEAT_SECONDS", "5.0"))
+        self.AXO_VEM_CP_FLUSH_TIMEOUT_SECONDS: float = float(
+            os.environ.get("AXO_VEM_CP_FLUSH_TIMEOUT_SECONDS", "60.0")
+        )
+        # How long 10 s metric bins stay in memory (the live tier).
+        self.AXO_VEM_METRICS_KEEP_SECONDS: float = float(os.environ.get("AXO_VEM_METRICS_KEEP_SECONDS", "3600"))
+        self.AXO_VEM_ENDPOINT_WAKE_TIMEOUT_SECONDS: float = float(
+            os.environ.get("AXO_VEM_ENDPOINT_WAKE_TIMEOUT_SECONDS", "120.0")
+        )
+
+        # axo_storage, where every bucket and object lives. Choreographies
+        # (and the function code bucket) call it as a platform service with
+        # this token, acting for a user.
+        self.AXO_VEM_STORAGE_URI: str = os.environ.get("AXO_VEM_STORAGE_URI", "")
+        self.AXO_VEM_STORAGE_SERVICE_TOKEN: str = os.environ.get("AXO_VEM_STORAGE_SERVICE_TOKEN", "")
+        self.AXO_VEM_STORAGE_TIMEOUT_SECONDS: float = float(os.environ.get("AXO_VEM_STORAGE_TIMEOUT_SECONDS", "30.0"))
+        # Handed to every endpoint the VEM launches: where it reaches
+        # axo_storage, and this VE's finished axo_storage token (given by the
+        # Control Plane -- the VEM never holds the secret tokens come from).
+        self.AXO_VEM_NODE_STORAGE_URI: str = os.environ.get("AXO_VEM_NODE_STORAGE_URI", "")
+        self.AXO_VEM_VE_STORAGE_TOKEN: str = os.environ.get("AXO_VEM_VE_STORAGE_TOKEN", "")
+
+        # Outbound commands (VEM -> endpoint)
         self.AXO_VEM_ENDPOINT_COMMAND_TIMEOUT_SECONDS: float = float(
             os.environ.get("AXO_VEM_ENDPOINT_COMMAND_TIMEOUT_SECONDS", "10.0")
         )
@@ -90,13 +172,6 @@ class Config:
             os.environ.get("AXO_VEM_PROJECTOR_STALE_AFTER_SECONDS", "60.0")
         )
 
-        # Xolo (identity / access control -- see auth/dependency.py)
-        self.AXO_VEM_XOLO_URI: str = os.environ.get(
-            "AXO_VEM_XOLO_URI", "http://localhost:10000/api/v4"
-        )
-        self.AXO_VEM_XOLO_API_KEY: str = os.environ.get("AXO_VEM_XOLO_API_KEY", "")
-        self.AXO_VEM_XOLO_ACCOUNT_ID: str = os.environ.get("AXO_VEM_XOLO_ACCOUNT_ID", "")
-
         # Node deployment (launching new axo_endpoint node containers via
         # the shared axo_shared.container.ContainerSpawner -- see
         # application/nodes/launch_endpoint_node.py)
@@ -124,17 +199,6 @@ class Config:
             os.environ.get("AXO_VEM_STATS_POLL_INTERVAL_SECONDS", "3.0")
         )
 
-        # unified_activity retention -- a fixed system-wide ceiling,
-        # independent of any user's own activity_window_minutes display
-        # preference (see infrastructure/transport/api/controllers/history.py).
-        # ActivityRetentionWorker hard-deletes rows older than this on its
-        # own tick cadence -- see application/activity/retention_worker.py.
-        self.AXO_VEM_ACTIVITY_RETENTION_HOURS: float = float(
-            os.environ.get("AXO_VEM_ACTIVITY_RETENTION_HOURS", "1.0")
-        )
-        self.AXO_VEM_ACTIVITY_RETENTION_TICK_SECONDS: float = float(
-            os.environ.get("AXO_VEM_ACTIVITY_RETENTION_TICK_SECONDS", "300.0")
-        )
 
         # Endpoint liveness detection -- EndpointLivenessWorker (see
         # infrastructure/transport/zmq_command/endpoint_liveness_worker.py).

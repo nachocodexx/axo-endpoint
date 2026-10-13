@@ -61,8 +61,17 @@ class LaunchEndpointNodeUseCase:
         mode: ContainerMode = "docker",
         default_env: Optional[Dict[str, str]] = None,
         endpoint_repository: Optional[EndpointRepository] = None,
+        virtual_environment_id: str = "",
+        storage_uri: str = "",
+        storage_token: str = "",
     ) -> None:
+        """Every endpoint this launches belongs to this VEM's one VE
+        (``virtual_environment_id``) and gets that VE's finished axo_storage
+        token -- the VEM never holds the secret tokens are made from."""
         self._spawner = spawner
+        self._virtual_environment_id = virtual_environment_id
+        self._storage_uri = storage_uri
+        self._storage_token = storage_token
         self._image = image
         self._network = network
         self._mode = mode
@@ -76,12 +85,17 @@ class LaunchEndpointNodeUseCase:
         router_port: int = 5555,
         pub_port: int = 5556,
         results_port: int = 5557,
-        virtual_environment_id: Optional[str] = None,
         env_overrides: Optional[Dict[str, str]] = None,
+        cpu_cores: Optional[float] = None,
+        memory_mb: Optional[int] = None,
     ) -> Result[LaunchEndpointNodeResult, ContainerSpawnError]:
+        """``cpu_cores``/``memory_mb``: the endpoint's size. It becomes the
+        container's limits and the endpoint's own runner budget (its runner
+        containers must fit inside it -- enforced by the endpoint)."""
         endpoint_id = f"axo-endpoint-{uuid.uuid4().hex[:8]}"
         router_bind = f"tcp://0.0.0.0:{router_port}"
-        peer_addresses = self._peer_addresses_for(virtual_environment_id)
+        virtual_environment_id = self._virtual_environment_id
+        peer_addresses = self._peer_addresses()
 
         overrides = {k: v for k, v in (env_overrides or {}).items() if k not in MESH_IDENTITY_KEYS}
         env = {
@@ -94,6 +108,14 @@ class LaunchEndpointNodeUseCase:
             "AXO_ENDPOINT_PUB_BIND": f"tcp://0.0.0.0:{pub_port}",
             "AXO_ENDPOINT_VIRTUAL_ENV_ID": virtual_environment_id or "",
         }
+        if self._storage_uri:
+            env["AXO_ENDPOINT_STORAGE_URI"] = self._storage_uri
+        if self._storage_token:
+            env["AXO_ENDPOINT_STORAGE_TOKEN"] = self._storage_token
+        if cpu_cores is not None and memory_mb is not None:
+            env["AXO_ENDPOINT_CPU_CORES"] = str(cpu_cores)
+            env["AXO_ENDPOINT_MEMORY_MB"] = str(memory_mb)
+            env["AXO_ENDPOINT_RUNNER_BUDGET_ENFORCED"] = "true"
 
         spawn_result = self._spawner.spawn(
             mode=self._mode,
@@ -104,6 +126,11 @@ class LaunchEndpointNodeUseCase:
             # The launched node spawns its own function containers via its
             # own ContainerSummoner, which needs the host Docker socket.
             mounts=[MountSpec(source="/var/run/docker.sock", target="/var/run/docker.sock", mode="ro")],
+            # So the Control Plane's cleanup process can find containers
+            # whose VE or endpoint no longer exists.
+            labels={"axo.role": "endpoint", "axo.ve": virtual_environment_id or "", "axo.endpoint": endpoint_id},
+            mem_limit_bytes=memory_mb * 1024 * 1024 if memory_mb is not None else None,
+            nano_cpus=int(cpu_cores * 1_000_000_000) if cpu_cores is not None else None,
         )
         return spawn_result.map(
             lambda handle: LaunchEndpointNodeResult(
@@ -111,10 +138,10 @@ class LaunchEndpointNodeUseCase:
             )
         )
 
-    def _peer_addresses_for(self, virtual_environment_id: Optional[str]) -> List[str]:
-        if not virtual_environment_id or self._endpoint_repository is None:
+    def _peer_addresses(self) -> List[str]:
+        if self._endpoint_repository is None:
             return []
-        peers = self._endpoint_repository.list_by_virtual_environment(virtual_environment_id)
+        peers = self._endpoint_repository.list_all()
         addresses: List[str] = []
         for peer in peers:
             if peer.status not in (None, "running"):

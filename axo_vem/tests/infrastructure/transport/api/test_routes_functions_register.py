@@ -38,8 +38,7 @@ def _source_for(function_name: str) -> bytes:
     ).encode()
 
 
-def _create_ve(client, name="dev-env", cpu=2.0, ram=1024, disk=2048):
-    return client.post("/virtual-environments", json={"name": name, "cpu": cpu, "ram": ram, "disk": disk})
+VE_ID = "ve1"  # this VEM's own VE (see conftest's register_function_use_case)
 
 
 def _bind_probe():
@@ -53,18 +52,18 @@ def _bind_probe():
 
 def test_register_function_validates_source_and_forwards_it_untouched(client, collections):
     address = _bind_probe()
-    ve_id = _create_ve(client).json()["virtual_environment_id"]
+    ve_id = VE_ID
 
     # endpoint_id is set to the resolvable loopback host itself -- proves the
     # use case connects to <endpoint_id>:<port>, not whatever host is
     # stored in router_bind (see test below for the case where those differ).
-    collections.endpoints.insert_one({"_id": "127.0.0.1", "router_bind": address, "virtual_environment_id": ve_id})
+    collections.endpoints.insert_one({"_id": "127.0.0.1", "router_bind": address, "status": "running"})
     thread, captured = _run_fake_endpoint(address, reply_ok=True, metadata={"function_id": "add", "version": 1})
 
     source = _source_for("add")
     response = client.post(
         "/functions",
-        data={"virtual_environment_id": ve_id, "name": "add", "runtime_spec": '{"type": "process"}'},
+        data={"name": "add", "runtime_spec": '{"type": "process"}'},
         files={"code": ("add.py", source, "text/x-python")},
     )
     thread.join(timeout=2.0)
@@ -90,20 +89,20 @@ def test_register_function_validates_source_and_forwards_it_untouched(client, co
 def test_register_function_ignores_router_bind_host_and_uses_endpoint_id(client, collections):
     address = _bind_probe()
     port = address.rsplit(":", 1)[-1]
-    ve_id = _create_ve(client).json()["virtual_environment_id"]
+    ve_id = VE_ID
 
     # router_bind carries the real production shape (an unconnectable bind
     # address) while endpoint_id is the resolvable host -- this only
     # succeeds if the use case builds the connect target from endpoint_id,
     # not from router_bind's own host part.
     collections.endpoints.insert_one({
-        "_id": "127.0.0.1", "router_bind": f"tcp://0.0.0.0:{port}", "virtual_environment_id": ve_id,
+        "_id": "127.0.0.1", "router_bind": f"tcp://0.0.0.0:{port}", "status": "running",
     })
     thread, captured = _run_fake_endpoint(address, reply_ok=True, metadata={"function_id": "add", "version": 1})
 
     response = client.post(
         "/functions",
-        data={"virtual_environment_id": ve_id, "name": "add"},
+        data={"name": "add"},
         files={"code": ("add.py", _source_for("add"), "text/x-python")},
     )
     thread.join(timeout=2.0)
@@ -114,14 +113,14 @@ def test_register_function_ignores_router_bind_host_and_uses_endpoint_id(client,
 
 def test_register_function_relays_rejection_as_409(client, collections):
     address = _bind_probe()
-    ve_id = _create_ve(client).json()["virtual_environment_id"]
+    ve_id = VE_ID
 
-    collections.endpoints.insert_one({"_id": "127.0.0.1", "router_bind": address, "virtual_environment_id": ve_id})
+    collections.endpoints.insert_one({"_id": "127.0.0.1", "router_bind": address, "status": "running"})
     thread, _ = _run_fake_endpoint(address, reply_ok=False, error_message="storage failure")
 
     response = client.post(
         "/functions",
-        data={"virtual_environment_id": ve_id, "name": "add"},
+        data={"name": "add"},
         files={"code": ("add.py", _source_for("add"), "text/x-python")},
     )
     thread.join(timeout=2.0)
@@ -130,49 +129,22 @@ def test_register_function_relays_rejection_as_409(client, collections):
     assert response.json()["detail"] == "storage failure"
 
 
-def test_register_function_returns_404_for_unknown_virtual_environment(client):
+def test_register_function_returns_409_when_no_endpoint_is_running(client):
     response = client.post(
         "/functions",
-        data={"virtual_environment_id": "missing", "name": "add"},
-        files={"code": ("add.py", _source_for("add"), "text/x-python")},
-    )
-    assert response.status_code == 404
-
-
-def test_register_function_returns_409_when_ve_has_no_endpoint_assigned(client):
-    ve_id = _create_ve(client).json()["virtual_environment_id"]
-
-    response = client.post(
-        "/functions",
-        data={"virtual_environment_id": ve_id, "name": "add"},
+        data={"name": "add"},
         files={"code": ("add.py", _source_for("add"), "text/x-python")},
     )
 
     assert response.status_code == 409
-    assert "no endpoint assigned" in response.json()["detail"]
-
-
-def test_register_function_returns_403_for_foreign_virtual_environment(client, db):
-    db["virtual_environments"].insert_one({
-        "_id": "ve-other", "virtual_environment_id": "ve-other", "name": "not-mine",
-        "owner_user_id": "someone-else", "resource_quota": {"cpu": 1.0, "ram": 512, "disk": 1024},
-    })
-
-    response = client.post(
-        "/functions",
-        data={"virtual_environment_id": "ve-other", "name": "add"},
-        files={"code": ("add.py", _source_for("add"), "text/x-python")},
-    )
-
-    assert response.status_code == 403
+    assert "no running endpoint" in response.json()["detail"]
 
 
 def test_register_function_returns_422_for_invalid_runtime_spec_json(client):
-    # 422 validation happens before any VE/endpoint lookup, so no VE needs
-    # to exist for this case.
+    # 422 validation happens before any endpoint lookup.
     response = client.post(
         "/functions",
-        data={"virtual_environment_id": "missing", "name": "add", "runtime_spec": "not-json"},
+        data={"name": "add", "runtime_spec": "not-json"},
         files={"code": ("add.py", _source_for("add"), "text/x-python")},
     )
 
@@ -182,7 +154,7 @@ def test_register_function_returns_422_for_invalid_runtime_spec_json(client):
 def test_register_function_returns_422_for_syntax_error(client):
     response = client.post(
         "/functions",
-        data={"virtual_environment_id": "missing", "name": "add"},
+        data={"name": "add"},
         files={"code": ("add.py", b"def add(params, ctx:\n    pass\n", "text/x-python")},
     )
 
@@ -193,7 +165,7 @@ def test_register_function_returns_422_for_syntax_error(client):
 def test_register_function_returns_422_when_name_not_defined_in_source(client):
     response = client.post(
         "/functions",
-        data={"virtual_environment_id": "missing", "name": "add"},
+        data={"name": "add"},
         files={"code": ("add.py", _source_for("subtract"), "text/x-python")},
     )
 
@@ -202,14 +174,14 @@ def test_register_function_returns_422_when_name_not_defined_in_source(client):
 
 
 def test_register_function_times_out_when_endpoint_unreachable(client, collections):
-    ve_id = _create_ve(client).json()["virtual_environment_id"]
+    ve_id = VE_ID
     collections.endpoints.insert_one({
-        "_id": "127.0.0.1", "router_bind": "tcp://127.0.0.1:59998", "virtual_environment_id": ve_id,
+        "_id": "127.0.0.1", "router_bind": "tcp://127.0.0.1:59998", "status": "running",
     })
 
     response = client.post(
         "/functions",
-        data={"virtual_environment_id": ve_id, "name": "add"},
+        data={"name": "add"},
         files={"code": ("add.py", _source_for("add"), "text/x-python")},
     )
 

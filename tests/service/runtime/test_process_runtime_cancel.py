@@ -118,3 +118,59 @@ def test_cancelling_the_same_job_twice_only_succeeds_once(registry, tmp_path):
 
     assert _wait_until(lambda: len(completions) == 1)
     assert len(completions) == 1
+
+
+def test_max_wait_zero_fails_a_job_that_would_queue_behind_a_busy_worker(registry, tmp_path):
+    from axo_endpoint.core.runtime.queue_deadlines import QueueDeadlines
+
+    deadlines = QueueDeadlines()
+    key = _register(registry, "sleep_max_wait_zero", _sleep_then_pid)
+    runtime, completions = _make_runtime(registry, str(tmp_path / "scratch"), queue_deadlines=deadlines)
+
+    runtime.invoke(key, "running", {"sleep_seconds": 30.0})
+    assert _wait_until(lambda: runtime._workers.find_by_job_id("running") is not None)
+
+    deadlines.set("impatient", 0, received_at=time.time())
+    assert runtime.invoke(key, "impatient", {"sleep_seconds": 0}).is_ok
+    assert len(completions) == 1
+    handle, outcome = completions[0]
+    assert handle.job_id == "impatient"
+    assert outcome.unwrap_err().name == "QUEUE_WAIT_TIMEOUT"
+    runtime.cancel("running")
+
+
+def test_drop_queued_fails_a_waiting_job_with_the_given_error(registry, tmp_path):
+    from axo_endpoint.core.errors import QueueWaitTimeoutError
+    from axo_endpoint.core.runtime.queue_deadlines import QueueDeadlines
+
+    deadlines = QueueDeadlines()
+    key = _register(registry, "sleep_drop_queued", _sleep_then_pid)
+    runtime, completions = _make_runtime(registry, str(tmp_path / "scratch"), queue_deadlines=deadlines)
+
+    runtime.invoke(key, "running", {"sleep_seconds": 30.0})
+    assert _wait_until(lambda: runtime._workers.find_by_job_id("running") is not None)
+    runtime.invoke(key, "waiting", {"sleep_seconds": 0})
+
+    assert runtime.drop_queued("running", QueueWaitTimeoutError("x")) is False  # never touches a running job
+    assert runtime.drop_queued("waiting", QueueWaitTimeoutError("late")) is True
+    assert completions[0][0].job_id == "waiting"
+    assert completions[0][1].unwrap_err().name == "QUEUE_WAIT_TIMEOUT"
+    runtime.cancel("running")
+
+
+def test_a_job_dequeued_after_its_deadline_is_failed_instead_of_run(registry, tmp_path):
+    from axo_endpoint.core.runtime.queue_deadlines import QueueDeadlines
+
+    deadlines = QueueDeadlines()
+    key = _register(registry, "sleep_late_dequeue", _sleep_then_pid)
+    runtime, completions = _make_runtime(registry, str(tmp_path / "scratch"), queue_deadlines=deadlines)
+
+    runtime.invoke(key, "first", {"sleep_seconds": 0.5})
+    assert _wait_until(lambda: runtime._workers.find_by_job_id("first") is not None)
+    deadlines.set("late", 0.1, received_at=time.time())
+    runtime.invoke(key, "late", {"sleep_seconds": 0})
+
+    assert _wait_until(lambda: len(completions) == 2)
+    by_job = {handle.job_id: outcome for handle, outcome in completions}
+    assert by_job["first"].is_ok
+    assert by_job["late"].unwrap_err().name == "QUEUE_WAIT_TIMEOUT"

@@ -3,14 +3,10 @@ from axo_endpoint.core.consensus.state_machine import (
     ClusterState,
     InMemoryReplicatedStateMachine,
     StateMutation,
-    decode_bucket_changes,
     decode_cluster_state,
-    decode_data_changes,
     decode_function_changes,
     decode_state_changes,
-    encode_bucket_changes,
     encode_cluster_state,
-    encode_data_changes,
     encode_function_changes,
     encode_state_changes,
 )
@@ -66,58 +62,20 @@ def test_encode_decode_cluster_state_round_trip():
         leader_ids=frozenset({"a"}),
         members=frozenset({"a", "b"}),
         functions={"foo:1": b'{"name": "foo", "version": 1}'},
-        data={"bar:1": b'{"name": "bar", "version": 1}'},
-        buckets={"mybucket": b'{"name": "mybucket", "quota_bytes": 1024, "created_at": 0.0}'},
         version=7,
     )
     assert decode_cluster_state(encode_cluster_state(state)) == state
 
 
-def test_apply_local_marks_data_dirty_and_snapshot_reflects_it():
-    machine = InMemoryReplicatedStateMachine()
-    machine.apply_local(StateMutation(data_changes={"bar:1": b'{"name": "bar"}'}))
-
-    snapshot = machine.snapshot()
-    assert snapshot.data == {"bar:1": b'{"name": "bar"}'}
-    assert snapshot.version == 1
-
-
-def test_encode_decode_data_changes_round_trip():
-    changes = {"bar:1": b'{"name": "bar", "version": 1}'}
-    payload = encode_data_changes(changes)
-    assert decode_data_changes(payload) == changes
-
-
-def test_decode_data_changes_of_empty_payload_is_empty_dict():
-    assert decode_data_changes(b"") == {}
-
-
-def test_apply_local_marks_bucket_dirty_and_snapshot_reflects_it():
-    machine = InMemoryReplicatedStateMachine()
-    machine.apply_local(StateMutation(bucket_changes={"mybucket": b'{"name": "mybucket"}'}))
-
-    snapshot = machine.snapshot()
-    assert snapshot.buckets == {"mybucket": b'{"name": "mybucket"}'}
-    assert snapshot.version == 1
-
-
-def test_encode_decode_bucket_changes_round_trip():
-    changes = {"mybucket": b'{"name": "mybucket", "quota_bytes": 1024, "created_at": 0.0}'}
-    payload = encode_bucket_changes(changes)
-    assert decode_bucket_changes(payload) == changes
-
-
-def test_decode_bucket_changes_of_empty_payload_is_empty_dict():
-    assert decode_bucket_changes(b"") == {}
-
-
-def test_encode_decode_state_changes_round_trip_all_domains():
+def test_encode_decode_state_changes_round_trip():
     function_changes = {"foo:1": b'{"name": "foo", "version": 1}'}
-    data_changes = {"bar:1": b'{"name": "bar", "version": 1}'}
-    bucket_changes = {"mybucket": b'{"name": "mybucket", "quota_bytes": 1024, "created_at": 0.0}'}
-    payload = encode_state_changes(function_changes, data_changes, bucket_changes)
-    assert decode_state_changes(payload) == (function_changes, data_changes, bucket_changes)
+    assert decode_state_changes(encode_state_changes(function_changes)) == function_changes
 
 
-def test_decode_state_changes_of_empty_payload_is_three_empty_dicts():
-    assert decode_state_changes(b"") == ({}, {}, {})
+def test_decode_state_changes_ignores_domains_older_peers_still_send():
+    payload = b'{"functions": {"foo:1": {"name": "foo"}}, "data": {"bar:1": {}}, "buckets": {"b": {}}}'
+    assert decode_state_changes(payload) == {"foo:1": b'{"name": "foo"}'}
+
+
+def test_decode_state_changes_of_empty_payload_is_empty():
+    assert decode_state_changes(b"") == {}

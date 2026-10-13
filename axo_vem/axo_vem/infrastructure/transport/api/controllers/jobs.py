@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import Any, Callable, Dict, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pymongo.collection import Collection
-from xolo.client.models import UserDTO
+from axo_vem.infrastructure.auth.service_token import ActingUser
 
 from axo_shared import wire
 from axo_shared.protocol import Command
@@ -25,11 +25,15 @@ class _JobSubmitRequest(BaseModel):
 
 class _FunctionJobSubmitRequest(BaseModel):
     params: Dict[str, Any] = {}
+    # Optional caller-chosen id (the Control Plane brings one for a job it
+    # accepted while the VE was asleep); the same id twice runs once.
+    job_id: Optional[str] = Field(default=None, pattern=r"^[A-Za-z0-9_-]{8,64}$")
+    max_wait: Optional[float] = None
 
 
 def build_router(
     job_repository: JobRepository,
-    current_user_dependency: Callable[..., UserDTO],
+    current_user_dependency: Callable[..., ActingUser],
     endpoints: Optional[Collection] = None,
     command_timeout_seconds: float = 3.0,
     submit_function_job_use_case: Optional[SubmitFunctionJobUseCase] = None,
@@ -43,20 +47,21 @@ def build_router(
             function_id: str,
             version: int,
             body: _FunctionJobSubmitRequest,
-            _current_user: UserDTO = Depends(current_user_dependency),
+            current_user: ActingUser = Depends(current_user_dependency),
         ):
             """Callers never pick an endpoint -- the target node is resolved
-            server-side from the function's own virtual_environment_id (see
+            server-side as one of this VE's running endpoints (see
             SubmitFunctionJobUseCase). Returns the same shape
             POST /endpoints/{endpoint_id}/jobs does, plus which endpoint_id
             it actually landed on, so the caller can poll
             GET /endpoints/{endpoint_id}/jobs/{job_id} for the result."""
             return submit_function_job_use_case.execute(
-                function_id=function_id, version=version, params=body.params,
+                function_id=function_id, version=version, params=body.params, acting_user_id=current_user.key,
+                job_id=body.job_id, max_wait=body.max_wait,
             )
 
     @router.get("/jobs/{job_id}")
-    def get_job(job_id: str, _current_user: UserDTO = Depends(current_user_dependency)):
+    def get_job(job_id: str, _current_user: ActingUser = Depends(current_user_dependency)):
         job = job_repository.get(job_id)
         if job is None:
             raise NotFoundError("job not found")
@@ -66,7 +71,7 @@ def build_router(
     def list_jobs_for_function(
         function_id: str,
         version: Optional[int] = None,
-        _current_user: UserDTO = Depends(current_user_dependency),
+        _current_user: ActingUser = Depends(current_user_dependency),
     ):
         """Job history for one function (optionally scoped to one version),
         newest first -- backs the Jobs table on the function detail page.
@@ -79,7 +84,7 @@ def build_router(
         def submit_job(
             endpoint_id: str,
             body: _JobSubmitRequest,
-            _current_user: UserDTO = Depends(current_user_dependency),
+            current_user: ActingUser = Depends(current_user_dependency),
         ):
             """Proxies JOB_SUBMIT straight to the target endpoint's ROUTER --
             same relay shape as register_function/create_bucket. Submission
@@ -111,6 +116,9 @@ def build_router(
                     "function_name": body.function_name,
                     "function_version": body.function_version,
                     "params": body.params,
+                    "acting_user_id": current_user.key,
+                    "started_by_type": "user",
+                    "started_by_id": current_user.key,
                 },
             )
             result = send_command(rpc_uri, command, command_timeout_seconds)
@@ -125,7 +133,7 @@ def build_router(
         def poll_job_result(
             endpoint_id: str,
             job_id: str,
-            _current_user: UserDTO = Depends(current_user_dependency),
+            _current_user: ActingUser = Depends(current_user_dependency),
         ):
             """Relays JOB_RESULT directly to the node -- the low-latency
             polling path, ahead of the Kurrent-to-Mongo pipeline, and the

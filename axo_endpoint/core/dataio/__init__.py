@@ -11,16 +11,16 @@ from axo_endpoint.core.dataio.errors import (
     UnknownIORefKindError,
 )
 from axo_endpoint.core.dataio.formats import FORMATS, Format, get_format
+from axo_endpoint.core.dataio.cache import ChunkCache
 from axo_endpoint.core.dataio.protocol import (
     APPEND_CHUNK,
     CHUNK_STATUS,
     FINALIZE_STREAM,
-    KEY_TYPES,
     OPEN_STREAM,
     READ,
     READ_CHUNK,
     WRITE,
-    resolve_io_request,
+    DataIOResolver,
 )
 from axo_endpoint.core.dataio.ref import IORef
 
@@ -37,7 +37,6 @@ __all__ = [
     "IONotFoundError",
     "IOPathTraversalError",
     "IORef",
-    "KEY_TYPES",
     "MalformedIOFrameError",
     "OPEN_STREAM",
     "READ",
@@ -47,5 +46,6 @@ __all__ = [
     "UnknownIORefKindError",
     "WRITE",
     "get_format",
-    "resolve_io_request",
+    "DataIOResolver",
+    "ChunkCache",
 ]

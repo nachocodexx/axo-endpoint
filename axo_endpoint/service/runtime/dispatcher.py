@@ -4,7 +4,7 @@ from typing import Any, Dict, Union
 
 from option import Result
 
-from axo_endpoint.core.errors import InvocationError
+from axo_endpoint.core.errors import AxoError, InvocationError
 from axo_endpoint.core.functions import FunctionRegistry
 from axo_endpoint.core.runtime.base import FunctionRuntime, FunctionRuntimeError, InvocationHandle
 from axo_endpoint.core.storage.backend import StorageKey
@@ -56,3 +56,7 @@ class RuntimeDispatcher(FunctionRuntime):
         process_cancelled = self._process.cancel(job_id)
         container_cancelled = self._container.cancel(job_id)
         return process_cancelled or container_cancelled
+
+    def drop_queued(self, job_id: str, error: AxoError) -> bool:
+        """Same both-runtimes lookup as cancel(), for a job still waiting in a queue."""
+        return self._process.drop_queued(job_id, error) or self._container.drop_queued(job_id, error)

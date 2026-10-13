@@ -1,11 +1,6 @@
-from xolo.client.models import UserDTO
+from .conftest import FAKE_USER, acting_as
 
-from .conftest import FAKE_USER, _fake_current_user
-
-OTHER_USER = UserDTO(
-    key="user-2", username="bob", first_name="Bob", last_name="B",
-    email="bob@example.com", profile_photo="",
-)
+OTHER = acting_as("user-2")
 
 
 def _graph(**overrides):
@@ -164,17 +159,13 @@ def test_non_owner_gets_403_on_get_update_delete(client):
     create_response = _create(client)
     choreography_id = create_response.json()["choreography_id"]
 
-    client.app.dependency_overrides[_fake_current_user] = lambda: OTHER_USER
-    try:
-        get_response = client.get(f"/choreographies/{choreography_id}")
-        assert get_response.status_code == 403
+    get_response = client.get(f"/choreographies/{choreography_id}", headers=OTHER)
+    assert get_response.status_code == 403
 
-        put_response = client.put(f"/choreographies/{choreography_id}", json={
-            "name": "x", "graph": _graph(),
-        })
-        assert put_response.status_code == 403
+    put_response = client.put(f"/choreographies/{choreography_id}", headers=OTHER, json={
+        "name": "x", "graph": _graph(),
+    })
+    assert put_response.status_code == 403
 
-        delete_response = client.delete(f"/choreographies/{choreography_id}")
-        assert delete_response.status_code == 403
-    finally:
-        del client.app.dependency_overrides[_fake_current_user]
+    delete_response = client.delete(f"/choreographies/{choreography_id}", headers=OTHER)
+    assert delete_response.status_code == 403

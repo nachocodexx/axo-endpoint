@@ -29,37 +29,6 @@ def _register_command(name, code=b"code"):
     )
 
 
-def _register_and_upload_data(rpc_uri, name, version=1, data=b"data-bytes", chunk_bytes=4, format="raw", kind="fs"):
-    """Drives the full client-facing chunked protocol against ``rpc_uri``
-    (leader or follower -- DATA_REGISTER is transparently proxied either
-    way): register the metadata, then push every chunk directly to whichever
-    node the registration response names as leader (DATA_CHUNK_PUT is never
-    proxied). Returns the final chunk's CommandResult."""
-    register_result = _send_command(rpc_uri, Command(
-        operation=wire.DATA_REGISTER,
-        content_type="application/json",
-        envelope={
-            "name": name, "version": version, "format": format, "kind": kind,
-            "total_size": len(data), "chunk_bytes": chunk_bytes,
-        },
-    ))
-    if not register_result.ok:
-        return register_result
-
-    leader_rpc_uri = register_result.metadata["leader_rpc_uri"]
-    total_chunks = register_result.metadata["total_chunks"]
-    result = register_result
-    for i in range(total_chunks):
-        chunk = data[i * chunk_bytes:(i + 1) * chunk_bytes]
-        result = _send_command(leader_rpc_uri, Command(
-            operation=wire.DATA_CHUNK_PUT,
-            content_type="application/octet-stream",
-            envelope={"name": name, "version": version, "chunk_index": i},
-            payload=chunk,
-        ))
-    return result
-
-
 def _register_function_command(name, fn):
     return Command(
         operation=wire.FUNCTION_REGISTER,
@@ -67,13 +36,6 @@ def _register_function_command(name, fn):
         envelope={"function_id": name, "name": name},
         payload=cloudpickle.dumps(fn),
     )
-
-
-def _stream_write_fn(params, ctx):
-    from axo_endpoint import dataio
-
-    ref = dataio.write_chunks(params["name"], params["version"], [b"ab", b"cd", b"ef"], chunk_bytes=2)
-    return {"kind": ref.kind, "location": ref.location}
 
 
 def _leader_and_follower(nodes):
@@ -152,139 +114,6 @@ def test_max_dirty_count_flush_fires_before_idle_timeout_under_burst_load(tmp_pa
             ),
             timeout=5.0,
         )
-    finally:
-        for n in nodes:
-            n.stop()
-
-
-def test_data_only_registration_replicates_catalog_to_follower(tmp_path, clean_env, monkeypatch):
-    # No FUNCTION_REGISTER happens in this test at all -- a flush window with
-    # only data_changes pending, no function_changes. This is the regression
-    # guard for two bugs found while building the data domain: (1) DataRegistry
-    # emitting its event under the same string FunctionState.REGISTERED.value
-    # uses would make RegistrySyncBridge.on_function_event fire and crash on a
-    # missing "function_id" key; (2) run_consensus_tick's flush gate used to
-    # only check function_changes, so a data-only flush would never be pushed
-    # to peers at all. Both are fixed; this proves it end-to-end across real
-    # nodes rather than just at the unit level.
-    nodes = _two_node_cluster(tmp_path, monkeypatch)
-    try:
-        leader, follower = _leader_and_follower(nodes)
-
-        result = _register_and_upload_data(leader.config.AXO_ENDPOINT_ROUTER_BIND, "df1", data=b"data-bytes", chunk_bytes=4)
-        assert result.ok is True
-        assert result.metadata["complete"] is True
-
-        assert wait_until(
-            lambda: follower.data_store.get_by_id("df1").unwrap() is not None, timeout=5.0
-        )
-        record = follower.data_store.get_by_id("df1").unwrap()
-        assert record.kind == "fs"
-        assert record.total_chunks == 3
-
-        # The catalog entry replicates via the metadata-sync path (above);
-        # the actual chunk bytes replicate separately via the diff-based
-        # blob-replication background loop, using the leader's own
-        # DataRegistry to reconstruct -- confirm they eventually land on the
-        # follower's own local storage too, proving both channels cooperate
-        # end-to-end across real nodes.
-        assert wait_until(
-            lambda: follower.data_registry.status("df1", 1).complete, timeout=5.0,
-        )
-        assert follower.data_registry.read_whole("df1", 1).unwrap() == b"data-bytes"
-    finally:
-        for n in nodes:
-            n.stop()
-
-
-def test_data_register_against_follower_succeeds_transparently(tmp_path, clean_env, monkeypatch):
-    nodes = _two_node_cluster(tmp_path, monkeypatch)
-    try:
-        leader, follower = _leader_and_follower(nodes)
-
-        result = _register_and_upload_data(follower.config.AXO_ENDPOINT_ROUTER_BIND, "df2", data=b"data-bytes", chunk_bytes=4)
-
-        assert result.ok is True
-        assert result.metadata["data_id"] == "df2"
-        assert leader.data_store.get_by_id("df2").unwrap() is not None
-    finally:
-        for n in nodes:
-            n.stop()
-
-
-def test_incomplete_dataset_on_leader_never_replicates_to_follower(tmp_path, clean_env, monkeypatch):
-    nodes = _two_node_cluster(tmp_path, monkeypatch)
-    try:
-        leader, follower = _leader_and_follower(nodes)
-
-        register_result = _send_command(leader.config.AXO_ENDPOINT_ROUTER_BIND, Command(
-            operation=wire.DATA_REGISTER,
-            content_type="application/json",
-            envelope={
-                "name": "partial1", "version": 1, "format": "raw", "kind": "fs",
-                "total_size": 8, "chunk_bytes": 4,
-            },
-        ))
-        assert register_result.ok is True
-        leader_rpc_uri = register_result.metadata["leader_rpc_uri"]
-
-        # Only push chunk 0 of 2 -- the leader itself never becomes complete.
-        chunk_result = _send_command(leader_rpc_uri, Command(
-            operation=wire.DATA_CHUNK_PUT,
-            content_type="application/octet-stream",
-            envelope={"name": "partial1", "version": 1, "chunk_index": 0},
-            payload=b"abcd",
-        ))
-        assert chunk_result.ok is True
-        assert chunk_result.metadata["complete"] is False
-
-        # Give the replication loop several ticks' worth of time to (not) act.
-        time.sleep(1.0)
-
-        follower_status = follower.data_registry.status("partial1", 1)
-        assert follower_status.present_chunk_indices == []
-    finally:
-        for n in nodes:
-            n.stop()
-
-
-def test_function_stream_write_replicates_to_follower(tmp_path, clean_env, monkeypatch):
-    nodes = _two_node_cluster(tmp_path, monkeypatch)
-    try:
-        leader, follower = _leader_and_follower(nodes)
-
-        reg_result = _send_command(
-            leader.config.AXO_ENDPOINT_ROUTER_BIND, _register_function_command("stream_writer", _stream_write_fn),
-        )
-        assert reg_result.ok is True
-
-        submit_result = _send_command(leader.config.AXO_ENDPOINT_ROUTER_BIND, Command(
-            operation=wire.JOB_SUBMIT,
-            content_type="application/json",
-            envelope={
-                "function_id": "stream_writer", "function_name": "stream_writer", "function_version": 1,
-                "params": {"name": "streamed1", "version": 1},
-            },
-        ))
-        assert submit_result.ok is True
-        job_id = submit_result.metadata["job_id"]
-
-        def _job_completed():
-            r = _send_command(leader.config.AXO_ENDPOINT_ROUTER_BIND, Command(
-                operation=wire.JOB_RESULT, content_type="application/json", envelope={"job_id": job_id},
-            ))
-            return r.ok and r.metadata.get("status") == "COMPLETED"
-
-        assert wait_until(_job_completed, timeout=5.0)
-
-        # The stream-written output must show up on the follower via the
-        # same diff-based replication loop a client upload uses -- proving
-        # register-at-finalize (not register-then-stream) integrates
-        # cleanly with the leader-completeness-gated replication path.
-        assert wait_until(
-            lambda: follower.data_registry.status("streamed1", 1).complete, timeout=5.0,
-        )
-        assert follower.data_registry.read_whole("streamed1", 1).unwrap() == b"abcdef"
     finally:
         for n in nodes:
             n.stop()

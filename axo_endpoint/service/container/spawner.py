@@ -4,7 +4,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import requests
 
@@ -22,7 +22,7 @@ from axo_shared.activity.models import (
     FUNCTION_STOPPED_EVENT,
 )
 from axo_endpoint.core.consensus.concurrency import pool_metrics_key
-from axo_endpoint.core.errors import ContainerError
+from axo_endpoint.core.errors import ContainerError, RunnerBudgetExhaustedError
 from axo_endpoint.core.events.bus import Event as BusEvent, EventBus
 from axo_shared.container.handle import MountSpec, SpawnedContainerHandle
 from axo_shared.container.spawner import ContainerSpawner
@@ -67,6 +67,12 @@ class ContainerSummoner:
         self._build_locks: Dict[str, threading.Lock] = {}
         self._build_locks_guard = threading.Lock()
 
+        # Runner budget: what's left of this endpoint's size for runners.
+        mib = 1024 * 1024
+        self._budget_enforced: bool = config.AXO_ENDPOINT_RUNNER_BUDGET_ENFORCED
+        self._budget_cpu: float = config.AXO_ENDPOINT_CPU_CORES - config.AXO_ENDPOINT_RESERVED_CPU_CORES
+        self._budget_memory: int = (config.AXO_ENDPOINT_MEMORY_MB - config.AXO_ENDPOINT_RESERVED_MEMORY_MB) * mib
+
     # ── public API ─────────────────────────────────────────────────────────────
 
     def summon(
@@ -104,26 +110,21 @@ class ContainerSummoner:
                 return Ok(available)
             if len(live) >= max_concurrency:
                 return Ok(min(live, key=lambda h: h.invocation_count))
-            pool_index = len(pool)
+            handle = self._reserve_locked(function_id, version, spec, len(pool))
+            if handle is None and live:
+                # No room in the runner budget to grow: queue behind an
+                # existing member instead, exactly as if at max_concurrency.
+                return Ok(min(live, key=lambda h: h.invocation_count))
 
-            service_name = sanitize_container_name(function_id, version, pool_index)
-            job_port = self._config.AXO_ENDPOINT_CONTAINER_JOB_PORT
-            http_port = self._config.AXO_ENDPOINT_CONTAINER_FASTAPI_PORT
-            handle = ContainerHandle(
-                function_id=function_id,
-                version=version,
-                service_name=service_name,
-                mode=self._config.AXO_ENDPOINT_CONTAINER_BACKEND,
-                zmq_address=f"tcp://{service_name}:{job_port}",
-                http_address=f"http://{service_name}:{http_port}",
-                pool_index=pool_index,
-                max_duration_seconds=spec.max_duration_seconds,
-            )
-            # Reserved here, under the same lock that computed pool_index,
-            # so a concurrent summon() call for this (function_id, version)
-            # sees this slot already taken instead of recomputing the same
-            # pool_index and colliding on the same deterministic name.
-            self._handles.setdefault((function_id, version), []).append(handle)
+        if handle is None:
+            room = self._make_room(function_id, version, spec)
+            if room.is_err:
+                return Err(room.unwrap_err())
+            with self._lock:
+                pool = self._handles.get((function_id, version), [])
+                handle = self._reserve_locked(function_id, version, spec, len(pool))
+            if handle is None:
+                return Err(self._budget_error(function_id, spec))
 
         threading.Thread(
             target=self._spawn_in_background,
@@ -181,6 +182,58 @@ class ContainerSummoner:
         reserved, not-yet-real handle (status=STARTING)."""
         self._dismiss_stale(function_id, version)
 
+        with self._lock:
+            handle = self._reserve_locked(function_id, version, spec, pool_index)
+        if handle is None:
+            room = self._make_room(function_id, version, spec)
+            if room.is_err:
+                return Err(room.unwrap_err())
+            with self._lock:
+                handle = self._reserve_locked(function_id, version, spec, pool_index)
+            if handle is None:
+                return Err(self._budget_error(function_id, spec))
+
+        threading.Thread(
+            target=self._spawn_in_background,
+            args=(handle, spec),
+            daemon=True,
+        ).start()
+
+        return Ok(handle)
+
+    # ── runner budget ──────────────────────────────────────────────────────────
+
+    def _runner_size(self, spec: RuntimeSpec) -> Tuple[float, int]:
+        """(cores, bytes) one runner of this spec reserves -- the same
+        numbers used as its Docker limits."""
+        mem = spec.memory_limit_bytes or self._config.AXO_ENDPOINT_CONTAINER_MEMORY_LIMIT_BYTES
+        cpu = spec.cpu_limit or self._config.AXO_ENDPOINT_CONTAINER_CPU_LIMIT
+        return float(cpu), int(mem)
+
+    def _live_locked(self) -> List[ContainerHandle]:
+        return [
+            h for pool in self._handles.values() for h in pool
+            if h.status not in (ContainerStatus.CRASHED, ContainerStatus.DISMISSED)
+        ]
+
+    def _fits_locked(self, cpu: float, mem: int) -> bool:
+        if not self._budget_enforced:
+            return True
+        live = self._live_locked()
+        used_cpu = sum(h.cpu_cores for h in live)
+        used_mem = sum(h.memory_bytes for h in live)
+        return used_cpu + cpu <= self._budget_cpu + 1e-9 and used_mem + mem <= self._budget_memory
+
+    def _reserve_locked(
+        self, function_id: str, version: int, spec: RuntimeSpec, pool_index: int,
+    ) -> Optional[ContainerHandle]:
+        """Creates and registers a STARTING handle if the runner budget has
+        room for it, else None. Registered under the caller's lock -- the
+        same lock that computed pool_index and checked the budget -- so a
+        concurrent summon() sees both the slot and the reservation taken."""
+        cpu, mem = self._runner_size(spec)
+        if not self._fits_locked(cpu, mem):
+            return None
         service_name = sanitize_container_name(function_id, version, pool_index)
         job_port = self._config.AXO_ENDPOINT_CONTAINER_JOB_PORT
         http_port = self._config.AXO_ENDPOINT_CONTAINER_FASTAPI_PORT
@@ -193,17 +246,85 @@ class ContainerSummoner:
             http_address=f"http://{service_name}:{http_port}",
             pool_index=pool_index,
             max_duration_seconds=spec.max_duration_seconds,
+            idle_ttl_seconds=spec.idle_ttl_seconds,
+            cpu_cores=cpu,
+            memory_bytes=mem,
         )
+        self._handles.setdefault((function_id, version), []).append(handle)
+        return handle
+
+    def _make_room(self, function_id: str, version: int, spec: RuntimeSpec) -> Result[None, ContainerError]:
+        """Frees budget for one runner of ``spec`` by dismissing idle runners
+        of *other* functions, least recently used first. Always-warm runners
+        (idle_ttl_seconds < 0) are never evicted. Err only when the runner
+        could never fit, even in an empty budget -- the caller then fails the
+        job instead of letting it wait forever. Ok does not promise room:
+        the caller re-checks under the lock."""
+        if not self._budget_enforced:
+            return Ok(None)
+        cpu, mem = self._runner_size(spec)
+        if cpu > self._budget_cpu + 1e-9 or mem > self._budget_memory:
+            return Err(ContainerError(
+                f"runner needs {cpu:g} CPU / {mem // (1024 * 1024)} MB but this endpoint's whole "
+                f"runner budget is {self._budget_cpu:g} CPU / {self._budget_memory // (1024 * 1024)} MB",
+                context={"function_id": function_id},
+            ))
         with self._lock:
-            self._handles.setdefault((function_id, version), []).append(handle)
+            if self._fits_locked(cpu, mem):
+                return Ok(None)
+            live = self._live_locked()
+            free_cpu = self._budget_cpu - sum(h.cpu_cores for h in live)
+            free_mem = self._budget_memory - sum(h.memory_bytes for h in live)
+            idle = sorted(
+                (
+                    h for h in live
+                    if (h.function_id, h.version) != (function_id, version)
+                    and h.status in (ContainerStatus.READY, ContainerStatus.IDLE)
+                    and not (h.idle_ttl_seconds is not None and h.idle_ttl_seconds < 0)
+                ),
+                key=lambda h: h.last_used,
+            )
+            victims: List[ContainerHandle] = []
+            for h in idle:
+                if free_cpu + 1e-9 >= cpu and free_mem >= mem:
+                    break
+                victims.append(h)
+                free_cpu += h.cpu_cores
+                free_mem += h.memory_bytes
+            if not (free_cpu + 1e-9 >= cpu and free_mem >= mem):
+                victims = []  # evicting wouldn't be enough -- don't evict for nothing
+        for victim in victims:
+            self.dismiss(victim, reason="runner_budget")
+        return Ok(None)
 
-        threading.Thread(
-            target=self._spawn_in_background,
-            args=(handle, spec),
-            daemon=True,
-        ).start()
+    def _budget_error(self, function_id: str, spec: RuntimeSpec) -> RunnerBudgetExhaustedError:
+        cpu, mem = self._runner_size(spec)
+        with self._lock:
+            live = self._live_locked()
+            used_cpu = sum(h.cpu_cores for h in live)
+            used_mem = sum(h.memory_bytes for h in live)
+        return RunnerBudgetExhaustedError(
+            f"no room for a new runner: needs {cpu:g} CPU, {max(0.0, self._budget_cpu - used_cpu):g} available",
+            context={
+                "function_id": function_id,
+                "needed_cpu": cpu, "needed_memory_bytes": mem,
+                "free_cpu": round(self._budget_cpu - used_cpu, 3),
+                "free_memory_bytes": self._budget_memory - used_mem,
+            },
+        )
 
-        return Ok(handle)
+    def budget_summary(self) -> Dict[str, Any]:
+        """Runner budget vs. what live runners reserve (for metrics/UI)."""
+        with self._lock:
+            live = self._live_locked()
+            return {
+                "enforced": self._budget_enforced,
+                "cpu_budget": self._budget_cpu,
+                "memory_budget_bytes": self._budget_memory,
+                "cpu_reserved": sum(h.cpu_cores for h in live),
+                "memory_reserved_bytes": sum(h.memory_bytes for h in live),
+                "runners": len(live),
+            }
 
     def pool_summary(self) -> Dict[str, Dict[str, int]]:
         """Every (function, version)'s live/idle container counts, keyed by
@@ -309,14 +430,20 @@ class ContainerSummoner:
             return [h for pool in self._handles.values() for h in pool]
 
     def sweep_idle(self, ttl_seconds: float, now: float) -> List[str]:
-        """Dismisses containers that have been idle longer than ttl_seconds."""
+        """Dismisses containers idle longer than their function's own
+        idle_ttl_seconds (negative = never), or ttl_seconds when unset."""
         evicted: List[str] = []
+
+        def overdue(h: ContainerHandle) -> bool:
+            ttl = h.idle_ttl_seconds if h.idle_ttl_seconds is not None else ttl_seconds
+            return ttl >= 0 and (now - h.last_used) > ttl
+
         with self._lock:
             candidates = [
                 h for pool in self._handles.values() for h in pool
                 if h.status == ContainerStatus.IDLE
                 and h.last_used > 0
-                and (now - h.last_used) > ttl_seconds
+                and overdue(h)
             ]
         for handle in candidates:
             self.dismiss(handle, reason="idle_ttl")
@@ -483,8 +610,7 @@ class ContainerSummoner:
             **spec.env_vars,
         }
 
-        mem_limit_bytes = spec.memory_limit_bytes or self._config.AXO_ENDPOINT_CONTAINER_MEMORY_LIMIT_BYTES
-        cpu_limit = spec.cpu_limit or self._config.AXO_ENDPOINT_CONTAINER_CPU_LIMIT
+        cpu_limit, mem_limit_bytes = self._runner_size(spec)
         spawn_result = self._spawner.spawn(
             mode=self._config.AXO_ENDPOINT_CONTAINER_BACKEND,
             image=image,
@@ -496,6 +622,8 @@ class ContainerSummoner:
             )],
             mem_limit_bytes=mem_limit_bytes,
             nano_cpus=int(cpu_limit * 1_000_000_000),
+            labels=self._labels(handle),
+            cgroup_parent=self._config.AXO_ENDPOINT_RUNNER_CGROUP_PARENT or None,
         )
         if spawn_result.is_err:
             err = ContainerError(
@@ -541,6 +669,18 @@ class ContainerSummoner:
             args=(handle,),
             daemon=True,
         ).start()
+
+    def _labels(self, handle: ContainerHandle) -> Dict[str, str]:
+        """Who created this runner, so the Control Plane's cleanup process
+        can find runners whose VE or endpoint no longer exists."""
+        return {
+            "axo.role": "runner",
+            "axo.ve": self._config.AXO_ENDPOINT_VIRTUAL_ENV_ID or "",
+            "axo.endpoint": self._config.AXO_ENDPOINT_ID,
+            "axo.function": handle.function_id,
+            "axo.function_version": str(handle.version),
+            "axo.pool_index": str(handle.pool_index),
+        }
 
     def _endpoint_host(self) -> str:
         """Returns the hostname containers should use to reach this endpoint."""

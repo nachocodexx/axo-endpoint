@@ -12,8 +12,7 @@ _Logger = Union[Log, DumbLogger]
 
 
 class ConsistencyCheckRequestHandler(CommandHandler):
-    """The one axo_vem -> endpoint request for this feature (alongside
-    VIRTUAL_ENV_ASSIGN): either "verify this one job now" (added on top of
+    """The axo_vem -> endpoint request for this feature: either "verify this one job now" (added on top of
     the periodic sweep's normal per-tick budget) or "run a full pass now"
     instead of waiting for the next scheduled tick. Always wrapped in
     LeaderProxyHandler -- only the leader owns the sweeper."""

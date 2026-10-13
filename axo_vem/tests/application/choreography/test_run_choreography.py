@@ -58,10 +58,10 @@ class _FakeSubmitUseCase:
         self.calls = []
         self._counter = 0
 
-    def execute(self, *, function_id, version, params):
+    def execute(self, *, function_id, version, params, **started_by):
         self._counter += 1
         job_id = f"job-{function_id}-{self._counter}"
-        self.calls.append({"function_id": function_id, "params": params, "job_id": job_id})
+        self.calls.append({"function_id": function_id, "params": params, "job_id": job_id, **started_by})
         return {"endpoint_id": "ep1", "job_id": job_id}
 
 
@@ -121,7 +121,6 @@ def _make_use_case(choreography, job_outcomes, function_specs=None):
         run_repository=run_repo,
         function_repository=_FakeFunctionRepository(function_specs),
         endpoint_repository=_FakeEndpointRepository(),
-        data_item_repository=SimpleNamespace(list_by_bucket=lambda name: []),
         submit_function_job_use_case=submit_use_case,
     )
     return use_case, run_repo, submit_use_case
@@ -223,3 +222,31 @@ def test_cancel_run_stops_further_dispatch():
     run = run_repo.get(run_id)
     assert run.status == "cancelled"
     assert not any(c["function_id"] == "fn-b" for c in submit_use_case.calls)
+
+
+def test_jobs_act_for_the_user_who_started_the_run():
+    graph = ChoreographyGraph(nodes=[_fn_node("a", "fn-a")], edges=[])
+    choreography = _choreography(graph)
+    use_case, run_repo, submit_use_case = _make_use_case(choreography, job_outcomes={"job-fn-a-1": ("completed", 1)})
+
+    result = use_case.execute(choreography_id="c1", current_user_id="user-1")
+    _wait_for_terminal(run_repo, result["run_id"])
+
+    call = submit_use_case.calls[0]
+    assert call["acting_user_id"] == "user-1"
+    assert call["started_by_type"] == "choreography" and call["started_by_id"] == "c1"
+
+
+def test_functions_learn_the_buckets_their_edges_point_at():
+    graph = ChoreographyGraph(
+        nodes=[_fn_node("a", "fn-a"), _fn_node("b", "fn-b"),
+               ChoreographyNode(node_id="out", kind="bucket", position={"x": 0, "y": 0}, bucket_name="reports")],
+        edges=[ChoreographyEdge(edge_id="e1", source_node_id="a", target_node_id="out", kind="fn_to_bucket"),
+               ChoreographyEdge(edge_id="e2", source_node_id="a", target_node_id="b", kind="fn_to_fn", target_param="x")],
+    )
+    use_case, run_repo, submit_use_case = _make_use_case(_choreography(graph), job_outcomes={})
+    run = _wait_for_terminal(run_repo, use_case.execute(choreography_id="c1", current_user_id="user-1")["run_id"])
+    assert run.status == "completed"
+    by_fn = {c["function_id"]: c for c in submit_use_case.calls}
+    assert by_fn["fn-a"]["output_buckets"] == ["reports"]
+    assert by_fn["fn-b"]["output_buckets"] == []

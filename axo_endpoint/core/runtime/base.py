@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from option import Result
 
@@ -44,10 +44,33 @@ class InvocationContext:
     job_id: str
     scratch_dir: str
     warnings: List[str] = field(default_factory=list)
+    # Buckets this job's choreography node is connected to (FN -> bucket
+    # edges): the function may write its own objects there via dataio.
+    output_buckets: List[str] = field(default_factory=list)
 
     def warn(self, message: str) -> None:
         """Records a warning that travels back with this job's result."""
         self.warnings.append(message)
+
+
+# Travels inside the params so every transport (pipe, container, JOB_FORWARD)
+# carries it unchanged; the worker takes it out before calling the function.
+OUTPUT_BUCKETS_PARAM = "__axo_output_buckets__"
+
+
+def split_output_buckets(params: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """(params without the reserved key, the output bucket names)."""
+    if not isinstance(params, dict) or OUTPUT_BUCKETS_PARAM not in params:
+        return params, []
+    rest = {k: v for k, v in params.items() if k != OUTPUT_BUCKETS_PARAM}
+    buckets = params[OUTPUT_BUCKETS_PARAM]
+    return rest, [str(b) for b in buckets] if isinstance(buckets, list) else []
+
+
+def build_invocation(job_id: str, scratch_dir: str, params: Dict[str, Any]) -> Tuple[InvocationContext, Dict[str, Any]]:
+    """The ctx and the params a function is actually called with."""
+    params, buckets = split_output_buckets(params)
+    return InvocationContext(job_id=job_id, scratch_dir=scratch_dir, output_buckets=buckets), params
 
 
 class FunctionRuntime(ABC):

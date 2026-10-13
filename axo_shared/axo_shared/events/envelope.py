@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple, Type
+from typing import Any, Dict, Optional, Tuple, Type
 
 from option import Err, Ok, Result
 
@@ -49,6 +49,9 @@ EVENT_TYPES: Dict[str, Type[Any]] = {
     models.JOB_STARTED: models.JobStarted,
     models.JOB_COMPLETED: models.JobCompleted,
     models.JOB_FAILED: models.JobFailed,
+    models.JOB_ATTEMPT_RECORDED: models.JobAttemptRecorded,
+    models.VE_HEARTBEAT: models.VirtualEnvironmentHeartbeat,
+    models.METRIC_SUMMARY_REPORTED: models.MetricSummaryReported,
     models.USER_PROFILE_CREATED: models.UserProfileCreated,
     models.USER_PROFILE_UPDATED: models.UserProfileUpdated,
     models.USER_PROFILE_DELETED: models.UserProfileDeleted,
@@ -62,22 +65,35 @@ EVENT_TYPES: Dict[str, Type[Any]] = {
 }
 
 
-def encode_event(event_type: str, endpoint_id: str, data: Dict[str, Any]) -> Command:
+def encode_event(
+    event_type: str,
+    endpoint_id: str,
+    data: Dict[str, Any],
+    message_id: Optional[str] = None,
+) -> Command:
     """Wraps one taxonomy event as a Command carried over the existing wire
     protocol. ``endpoint_id`` is the reporting endpoint's id -- this path is
     only ever used for events genuinely published by a running axo_endpoint
     node (see axo_endpoint.service.transport.event_publisher.ZmqEventPublisher);
     UserProfile/VirtualEnvironment events originate inside axo_vem
-    itself and are appended directly, never through this envelope."""
+    itself and are appended directly, never through this envelope.
+
+    ``message_id`` is only set by axo_shared.messaging's reliable channel: the
+    receiver echoes it back in its ack (see messaging.receiver.build_ack) so the
+    sender can drop that message from its journal. Left out entirely when not
+    given, so fire-and-forget senders produce the exact same envelope as before."""
+    envelope: Dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION,
+        "event_type": event_type,
+        "endpoint_id": endpoint_id,
+        "data": data,
+    }
+    if message_id is not None:
+        envelope["message_id"] = message_id
     return Command(
         operation=wire.EVENT_PUBLISH,
         content_type="application/json",
-        envelope={
-            "schema_version": SCHEMA_VERSION,
-            "event_type": event_type,
-            "endpoint_id": endpoint_id,
-            "data": data,
-        },
+        envelope=envelope,
         payload=b"",
     )
 

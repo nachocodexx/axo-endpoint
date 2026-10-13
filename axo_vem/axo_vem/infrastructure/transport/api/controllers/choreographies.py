@@ -3,8 +3,8 @@ from __future__ import annotations
 from typing import Callable, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
-from xolo.client.models import UserDTO
+from pydantic import BaseModel, Field
+from axo_vem.infrastructure.auth.service_token import ActingUser
 
 from axo_vem.application.choreography.cancel_choreography_run import CancelChoreographyRunUseCase
 from axo_vem.application.choreography.create_choreography import CreateChoreographyUseCase
@@ -28,6 +28,11 @@ class _ChoreographyUpdateRequest(BaseModel):
     graph: ChoreographyGraph
 
 
+class _RunRequest(BaseModel):
+    # Optional caller-chosen id (8-64 letters, digits, '-', '_'); same id = same run.
+    run_id: Optional[str] = Field(default=None, pattern=r"^[A-Za-z0-9_-]{8,64}$")
+
+
 def build_router(
     repository: ChoreographyRepository,
     run_repository: ChoreographyRunRepository,
@@ -35,7 +40,7 @@ def build_router(
     update_use_case: UpdateChoreographyUseCase,
     delete_use_case: DeleteChoreographyUseCase,
     purge_use_case: PurgeChoreographyUseCase,
-    current_user_dependency: Callable[..., UserDTO],
+    current_user_dependency: Callable[..., ActingUser],
     run_use_case: Optional[RunChoreographyUseCase] = None,
     cancel_run_use_case: Optional[CancelChoreographyRunUseCase] = None,
 ) -> APIRouter:
@@ -44,16 +49,16 @@ def build_router(
     @router.post("/choreographies", status_code=201)
     def create_choreography(
         body: _ChoreographyCreateRequest,
-        current_user: UserDTO = Depends(current_user_dependency),
+        current_user: ActingUser = Depends(current_user_dependency),
     ):
         return create_use_case.execute(name=body.name, owner_user_id=current_user.key, graph=body.graph)
 
     @router.get("/choreographies")
-    def list_choreographies(current_user: UserDTO = Depends(current_user_dependency)):
+    def list_choreographies(current_user: ActingUser = Depends(current_user_dependency)):
         return [c.to_dict() for c in repository.list(owner_user_id=current_user.key)]
 
     @router.get("/choreographies/{choreography_id}")
-    def get_choreography(choreography_id: str, current_user: UserDTO = Depends(current_user_dependency)):
+    def get_choreography(choreography_id: str, current_user: ActingUser = Depends(current_user_dependency)):
         choreography = repository.get(choreography_id)
         if choreography is None:
             raise HTTPException(status_code=404, detail="choreography not found")
@@ -66,25 +71,25 @@ def build_router(
     def update_choreography(
         choreography_id: str,
         body: _ChoreographyUpdateRequest,
-        current_user: UserDTO = Depends(current_user_dependency),
+        current_user: ActingUser = Depends(current_user_dependency),
     ):
         return update_use_case.execute(
             choreography_id=choreography_id, current_user_id=current_user.key, name=body.name, graph=body.graph,
         )
 
     @router.delete("/choreographies/{choreography_id}", status_code=204)
-    def delete_choreography(choreography_id: str, current_user: UserDTO = Depends(current_user_dependency)):
+    def delete_choreography(choreography_id: str, current_user: ActingUser = Depends(current_user_dependency)):
         delete_use_case.execute(choreography_id=choreography_id, current_user_id=current_user.key)
         return None
 
     @router.delete("/choreographies/{choreography_id}/purge")
-    def purge_choreography(choreography_id: str, current_user: UserDTO = Depends(current_user_dependency)):
+    def purge_choreography(choreography_id: str, current_user: ActingUser = Depends(current_user_dependency)):
         purge_use_case.execute(choreography_id=choreography_id, current_user_id=current_user.key)
         return {"choreography_id": choreography_id}
 
     if run_use_case is not None:
         @router.post("/choreographies/{choreography_id}/validate")
-        def validate_choreography(choreography_id: str, current_user: UserDTO = Depends(current_user_dependency)):
+        def validate_choreography(choreography_id: str, current_user: ActingUser = Depends(current_user_dependency)):
             choreography = repository.get(choreography_id)
             if choreography is None:
                 raise HTTPException(status_code=404, detail="choreography not found")
@@ -102,11 +107,13 @@ def build_router(
             }
 
         @router.post("/choreographies/{choreography_id}/run")
-        def run_choreography(choreography_id: str, current_user: UserDTO = Depends(current_user_dependency)):
-            return run_use_case.execute(choreography_id=choreography_id, current_user_id=current_user.key)
+        def run_choreography(choreography_id: str, body: Optional[_RunRequest] = None,
+                             current_user: ActingUser = Depends(current_user_dependency)):
+            return run_use_case.execute(choreography_id=choreography_id, current_user_id=current_user.key,
+                                        run_id=body.run_id if body is not None else None)
 
         @router.get("/choreographies/{choreography_id}/runs")
-        def list_runs(choreography_id: str, current_user: UserDTO = Depends(current_user_dependency)):
+        def list_runs(choreography_id: str, current_user: ActingUser = Depends(current_user_dependency)):
             choreography = repository.get(choreography_id)
             if choreography is None:
                 raise HTTPException(status_code=404, detail="choreography not found")
@@ -114,7 +121,7 @@ def build_router(
             return [r.to_dict() for r in run_repository.list_by_choreography(choreography_id)]
 
         @router.get("/choreographies/{choreography_id}/runs/{run_id}")
-        def get_run(choreography_id: str, run_id: str, current_user: UserDTO = Depends(current_user_dependency)):
+        def get_run(choreography_id: str, run_id: str, current_user: ActingUser = Depends(current_user_dependency)):
             choreography = repository.get(choreography_id)
             if choreography is None:
                 raise HTTPException(status_code=404, detail="choreography not found")
@@ -126,7 +133,7 @@ def build_router(
 
     if cancel_run_use_case is not None:
         @router.post("/choreographies/{choreography_id}/runs/{run_id}/cancel")
-        def cancel_run(choreography_id: str, run_id: str, current_user: UserDTO = Depends(current_user_dependency)):
+        def cancel_run(choreography_id: str, run_id: str, current_user: ActingUser = Depends(current_user_dependency)):
             try:
                 return cancel_run_use_case.execute(run_id=run_id, current_user_id=current_user.key)
             except NotFoundError:

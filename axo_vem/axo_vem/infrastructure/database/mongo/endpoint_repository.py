@@ -51,15 +51,9 @@ class MongoEndpointRepository(EndpointRepository):
         projector/upserts.py's former upsert_endpoint(collection, endpoint_id, data)."""
         self._collection.update_one({"_id": endpoint_id}, {"$set": data}, upsert=True)
 
-    def list_by_virtual_environment(self, virtual_environment_id: str) -> List[Endpoint]:
+    def list_all(self) -> List[Endpoint]:
         """Ordered most-recently-seen first (last_seen_at desc, i.e. the doc's
         `created_at` from whichever EndpointStarted/MetricsReported/Stopped
-        event landed most recently), tie-broken by endpoint_id ascending for
-        determinism. EndpointVirtualEnvironmentDetached's event leaves
-        virtual_environment_id at its EventEnvelope default of None, so a
-        detached endpoint's doc is correctly excluded here without any extra
-        filtering."""
-        docs = self._collection.find(
-            {"virtual_environment_id": virtual_environment_id}
-        ).sort([("created_at", -1), ("_id", 1)])
+        event landed most recently), tie-broken by endpoint_id ascending."""
+        docs = self._collection.find({}).sort([("created_at", -1), ("_id", 1)])
         return [self._doc_to_endpoint(doc) for doc in docs]

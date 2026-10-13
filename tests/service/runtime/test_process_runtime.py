@@ -169,3 +169,12 @@ def test_sweep_max_invocations_evicts_only_handles_past_cap():
     assert evicted == ["over_cap"]
     assert registry.get_idle_or_none("over_cap", None) is None
     assert registry.get_idle_or_none("under_cap", None) is under_cap
+
+
+def test_is_idle_uses_the_functions_own_idle_time_and_never():
+    own = WorkerHandle(function_id="f", idle_ttl_seconds=5.0)
+    never = WorkerHandle(function_id="f", idle_ttl_seconds=-1)
+    for handle in (own, never):
+        handle.touch(now=100.0)
+    assert own.is_idle(ttl_seconds=300.0, now=106.0) is True
+    assert never.is_idle(ttl_seconds=0.0, now=1_000_000.0) is False

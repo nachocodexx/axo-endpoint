@@ -147,3 +147,20 @@ def test_pool_metrics_key_round_trips():
 
 def test_parse_pool_metrics_key_rejects_malformed_input():
     assert parse_pool_metrics_key("not-a-valid-key") is None
+
+
+def test_draining_endpoints_get_no_new_placements():
+    from axo_endpoint.core.consensus.concurrency import ConcurrencyLedger
+
+    ledger = ConcurrencyLedger()
+    ledger.reconcile({})
+    assert ledger.request_slot("f", 1, 2, requester_id="a").action == "granted"
+    assert ledger.request_slot("f", 1, 2, requester_id="b").action == "granted"
+    ledger.ingest_peer_metrics("a", {"f::1": {"live": 1, "idle": 1}})
+    ledger.set_draining("a", True)
+
+    decision = ledger.request_slot("f", 1, 2, requester_id="c")
+    assert decision.action == "place" and decision.target_endpoint_id == "b"   # not idle-but-draining "a"
+
+    ledger.set_draining("b", True)
+    assert ledger.request_slot("f", 1, 2, requester_id="c").action == "retry"  # everyone draining: wait

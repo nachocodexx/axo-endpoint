@@ -31,17 +31,34 @@ class JobNotFoundError(AxoError):
     name = "JOB_NOT_FOUND"
 
 
+class FunctionVersionExistsError(AxoError):
+    """A restore asked for a function version that's already registered --
+    versions never change once written."""
+
+    code = 2006
+    name = "FUNCTION_VERSION_EXISTS"
+
+
+class EndpointDrainingError(AxoError):
+    """This endpoint is draining (about to be removed or stopped) and takes
+    no new jobs -- the VEM sends them to another endpoint."""
+
+    code = 2007
+    name = "ENDPOINT_DRAINING"
+
+
 class InvalidStateError(AxoError):
     code = 2003
     name = "INVALID_STATE_TRANSITION"
 
 
-class EndpointBusyError(AxoError):
-    """A VIRTUAL_ENV_ASSIGN command arrived while this endpoint has one or
-    more active jobs -- reassignment is only allowed while idle."""
+class ForeignVirtualEnvironmentError(AxoError):
+    """A peer from a different Virtual Environment tried to join this
+    endpoint's mesh -- endpoints only ever talk within their own VE.
+    (2004 was ENDPOINT_BUSY, removed together with VIRTUAL_ENV_ASSIGN.)"""
 
-    code = 2004
-    name = "ENDPOINT_BUSY"
+    code = 2005
+    name = "FOREIGN_VIRTUAL_ENVIRONMENT"
 
 
 # ── 3xxx: runtime / execution ─────────────────────────────────────────────────
@@ -52,6 +69,9 @@ class WorkerCrashedError(AxoError):
 
 
 class FunctionExecError(AxoError):
+    """The registered function itself raised -- a failure caused by user code
+    (billed), as opposed to the worker/container dying (not billed)."""
+
     code = 3002
     name = "FUNCTION_EXEC_FAILED"
 
@@ -96,6 +116,24 @@ class JobCancelledError(AxoError):
     name = "JOB_CANCELLED"
 
 
+class QueueWaitTimeoutError(AxoError):
+    """A job waited longer than its max_wait for a free runner and was
+    dropped before it ever ran -- never billed (it consumed no execution)."""
+
+    code = 3009
+    name = "QUEUE_WAIT_TIMEOUT"
+
+
+class RunnerBudgetExhaustedError(AxoError):
+    """No room left in this endpoint's CPU/RAM budget for one more runner
+    (container) -- the job waits until a runner is freed. Internal signal
+    between ContainerSummoner and ContainerFunctionRuntime; it only ever
+    reaches a client if the job's max_wait runs out first."""
+
+    code = 3010
+    name = "RUNNER_BUDGET_EXHAUSTED"
+
+
 # ── 4xxx: infrastructure ──────────────────────────────────────────────────────
 
 class QueueFullError(AxoError):
@@ -124,62 +162,6 @@ class StorageFailureError(AxoError):
 # (MalformedFrameCountError/MalformedEnvelopeError/MalformedMetadataError moved
 # to axo_shared.errors — they're used by axo_shared.wire, which must not
 # depend back on axo_endpoint.)
-
-# ── 6xxx: chunked data upload ─────────────────────────────────────────────────
-
-class DataNotRegisteredError(AxoError):
-    """A chunk (or a status/read query) named a (name, version) that has
-    never been through DATA_REGISTER on this node."""
-
-    code = 6001
-    name = "DATA_NOT_REGISTERED"
-
-
-class ChunkIndexOutOfRangeError(AxoError):
-    code = 6002
-    name = "CHUNK_INDEX_OUT_OF_RANGE"
-
-
-class ChunkSizeMismatchError(AxoError):
-    code = 6003
-    name = "CHUNK_SIZE_MISMATCH"
-
-
-class StreamNotOpenError(AxoError):
-    """append_chunk/finalize_stream called for a (name, version) with no
-    preceding open_stream on this node."""
-
-    code = 6004
-    name = "STREAM_NOT_OPEN"
-
-
-class StreamAlreadyFinalizedError(AxoError):
-    code = 6005
-    name = "STREAM_ALREADY_FINALIZED"
-
-
-# ── 7xxx: data buckets ────────────────────────────────────────────────────────
-
-class BucketNotFoundError(AxoError):
-    """A namespaced DATA_REGISTER (or BUCKET_REGISTER lookup) named a bucket
-    that has never been through BUCKET_REGISTER on this node."""
-
-    code = 7001
-    name = "BUCKET_NOT_FOUND"
-
-
-class BucketAlreadyExistsError(AxoError):
-    code = 7002
-    name = "BUCKET_ALREADY_EXISTS"
-
-
-class QuotaExceededError(AxoError):
-    """A DATA_REGISTER into a bucket would push that bucket's total
-    registered size over its declared quota_bytes."""
-
-    code = 7003
-    name = "QUOTA_EXCEEDED"
-
 
 # ── 8xxx: job result replication ──────────────────────────────────────────────
 

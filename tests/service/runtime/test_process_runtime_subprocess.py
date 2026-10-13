@@ -5,7 +5,6 @@ import cloudpickle
 import pytest
 
 from axo_endpoint.core.dataio import IORef
-from axo_endpoint.core.storage import FilesystemStorageBackend
 from axo_endpoint.core.events import InMemoryEventBus
 from axo_endpoint.core.functions import FunctionRegistry
 from axo_endpoint.core.storage import InMemoryStorageBackend
@@ -57,7 +56,7 @@ def _busy_loop(params, ctx):
 def _dataio_roundtrip(params, ctx):
     from axo_endpoint import dataio
 
-    ref = IORef(kind="fs", location=params["location"], format=params["format"])
+    ref = IORef(bucket="lab", name=params["name"], format=params["format"])
     dataio.write(params["value"], ref)
     return dataio.read(ref)
 
@@ -65,7 +64,7 @@ def _dataio_roundtrip(params, ctx):
 def _dataio_write(params, ctx):
     from axo_endpoint import dataio
 
-    ref = IORef(kind="fs", location=params["location"], format=params.get("format", "raw"))
+    ref = IORef(bucket=params.get("bucket", "lab"), name=params["name"], format=params.get("format", "raw"))
     dataio.write(params["value"], ref)
     return "written"
 
@@ -73,7 +72,7 @@ def _dataio_write(params, ctx):
 def _dataio_stream_roundtrip(params, ctx):
     from axo_endpoint import dataio
 
-    ref = dataio.write_chunks(params["name"], params["version"], [b"abcd", b"efgh"], chunk_bytes=4)
+    ref = dataio.write_chunks(IORef(bucket="lab", name=params["name"]), [b"abcd", b"efgh"], chunk_bytes=4)
     return b"".join(dataio.iter_chunks(ref))
 
 
@@ -82,7 +81,7 @@ def _dataio_then_crash(params, ctx):
 
     from axo_endpoint import dataio
 
-    ref = IORef(kind="fs", location=params["location"], format="raw")
+    ref = IORef(bucket="lab", name=params["name"], format="raw")
     dataio.write(b"before-crash", ref)
     result = dataio.read(ref)
     assert result == b"before-crash"
@@ -379,8 +378,32 @@ def test_sweep_max_invocations_kills_the_worker_process(registry, tmp_path):
     assert _wait_until(lambda: not process_before.is_alive())
 
 
-def _storage_backends(tmp_path):
-    return {"fs": FilesystemStorageBackend(root=str(tmp_path / "dataio"))}
+@pytest.fixture
+def dataio_resolver():
+    """A real in-process axo_storage with bucket "lab" (open to everyone),
+    and the endpoint-side resolver a worker's dataio requests go through."""
+    from axo_endpoint.core.dataio import ChunkCache, DataIOResolver
+    from axo_shared.axo_storage import AxoStorageClient, ServiceCredentials, VeCredentials
+    from axo_storage.access import AllowAllAccessChecker
+    from axo_storage.auth import Authenticator
+    from axo_storage.catalog import StorageCatalog
+    from axo_storage.chunk_store import MemoryChunkStore
+    from axo_storage.server import StorageRouterServer
+    from axo_storage.service import StorageService
+
+    service = StorageService(
+        catalog=StorageCatalog(":memory:"), chunks=MemoryChunkStore(),
+        authenticator=Authenticator({"ve": "tok"}, ["svc"]), access=AllowAllAccessChecker(),
+    )
+    server = StorageRouterServer("tcp://127.0.0.1:0", service, workers=2)
+    server.start()
+    admin = AxoStorageClient(server.bind_address, ServiceCredentials("svc"))
+    admin.create_bucket("tester", "lab").unwrap()
+    client = AxoStorageClient(server.bind_address, VeCredentials("ve", "tok"))
+    yield DataIOResolver(client=client, cache=ChunkCache(1_000_000), user_for_job=lambda job_id: "tester")
+    client.close()
+    admin.close()
+    server.stop()
 
 
 @pytest.mark.parametrize(
@@ -391,11 +414,11 @@ def _storage_backends(tmp_path):
         ("npy", __import__("numpy").array([1, 2, 3])),
     ],
 )
-def test_dataio_write_then_read_round_trips_through_pipe(registry, tmp_path, format, value):
+def test_dataio_write_then_read_round_trips_through_pipe(registry, tmp_path, dataio_resolver, format, value):
     key = _register(registry, f"dataio_{format}", _dataio_roundtrip)
-    runtime, completions = _make_runtime(registry, str(tmp_path / "scratch"), storage_backends=_storage_backends(tmp_path))
+    runtime, completions = _make_runtime(registry, str(tmp_path / "scratch"), dataio=dataio_resolver)
 
-    runtime.invoke(key, "job1", {"location": f"blob.{format}", "format": format, "value": value})
+    runtime.invoke(key, "job1", {"name": f"blob.{format}", "format": format, "value": value})
     assert _wait_until(lambda: len(completions) == 1)
     outcome = completions[0][1]
     assert outcome.is_ok
@@ -406,77 +429,67 @@ def test_dataio_write_then_read_round_trips_through_pipe(registry, tmp_path, for
         assert outcome.unwrap() == value
 
 
-def test_dataio_csv_round_trips_through_pipe(registry, tmp_path):
+def test_dataio_csv_round_trips_through_pipe(registry, tmp_path, dataio_resolver):
     import pandas as pd
 
     key = _register(registry, "dataio_csv", _dataio_roundtrip)
-    runtime, completions = _make_runtime(registry, str(tmp_path / "scratch"), storage_backends=_storage_backends(tmp_path))
+    runtime, completions = _make_runtime(registry, str(tmp_path / "scratch"), dataio=dataio_resolver)
 
     df = pd.DataFrame({"a": [1, 2], "b": [3, 4]})
-    runtime.invoke(key, "job1", {"location": "blob.csv", "format": "csv", "value": df})
+    runtime.invoke(key, "job1", {"name": "blob.csv", "format": "csv", "value": df})
     assert _wait_until(lambda: len(completions) == 1)
     outcome = completions[0][1]
     assert outcome.is_ok
     pd.testing.assert_frame_equal(outcome.unwrap(), df)
 
 
-def test_dataio_write_chunks_then_iter_chunks_round_trips_through_pipe(registry, tmp_path):
-    from axo_endpoint.core.data import DataRegistry
-    from axo_endpoint.core.events import InMemoryEventBus
-    from axo_endpoint.core.storage import InMemoryStorageBackend
-
-    storage_backends = _storage_backends(tmp_path)
-    data_registry = DataRegistry(
-        catalog=InMemoryStorageBackend(), blob_backends=storage_backends, event_bus=InMemoryEventBus(),
-    )
+def test_dataio_write_chunks_then_iter_chunks_round_trips_through_pipe(registry, tmp_path, dataio_resolver):
     key = _register(registry, "dataio_stream", _dataio_stream_roundtrip)
-    runtime, completions = _make_runtime(
-        registry, str(tmp_path / "scratch"), storage_backends=storage_backends, data_registry=data_registry,
-    )
+    runtime, completions = _make_runtime(registry, str(tmp_path / "scratch"), dataio=dataio_resolver)
 
-    runtime.invoke(key, "job1", {"name": "streamed", "version": 1})
+    runtime.invoke(key, "job1", {"name": "streamed"})
     assert _wait_until(lambda: len(completions) == 1)
     outcome = completions[0][1]
     assert outcome.is_ok
     assert outcome.unwrap() == b"abcdefgh"
 
 
-def test_dataio_path_traversal_is_rejected(registry, tmp_path):
+def test_dataio_names_cannot_escape_their_bucket(registry, tmp_path, dataio_resolver):
     key = _register(registry, "dataio_traversal", _dataio_write)
-    runtime, completions = _make_runtime(registry, str(tmp_path / "scratch"), storage_backends=_storage_backends(tmp_path))
+    runtime, completions = _make_runtime(registry, str(tmp_path / "scratch"), dataio=dataio_resolver)
 
-    runtime.invoke(key, "job1", {"location": "../../etc/passwd", "value": b"x"})
+    runtime.invoke(key, "job1", {"name": "../../etc/passwd", "value": b"x"})
     assert _wait_until(lambda: len(completions) == 1)
     outcome = completions[0][1]
     assert outcome.is_err
-    assert "IO_PATH_TRAVERSAL" in str(outcome.unwrap_err()) or "escapes" in str(outcome.unwrap_err())
+    assert "STORAGE_INVALID_REQUEST" in str(outcome.unwrap_err())
 
 
-def test_dataio_unknown_format_is_rejected_cleanly(registry, tmp_path):
+def test_dataio_unknown_format_is_rejected_cleanly(registry, tmp_path, dataio_resolver):
     key = _register(registry, "dataio_bad_format", _dataio_write)
-    runtime, completions = _make_runtime(registry, str(tmp_path / "scratch"), storage_backends=_storage_backends(tmp_path))
+    runtime, completions = _make_runtime(registry, str(tmp_path / "scratch"), dataio=dataio_resolver)
 
-    runtime.invoke(key, "job1", {"location": "blob.parquet", "format": "parquet", "value": b"x"})
+    runtime.invoke(key, "job1", {"name": "blob.parquet", "format": "parquet", "value": b"x"})
     assert _wait_until(lambda: len(completions) == 1)
     outcome = completions[0][1]
     assert outcome.is_err
     assert "UNKNOWN_IO_FORMAT" in str(outcome.unwrap_err()) or "unknown io format" in str(outcome.unwrap_err())
 
     # Worker must still be alive/reusable after a clean dataio error -- not a crash.
-    runtime.invoke(key, "job2", {"location": "blob.raw", "format": "raw", "value": b"ok"})
+    runtime.invoke(key, "job2", {"name": "blob.raw", "format": "raw", "value": b"ok"})
     assert _wait_until(lambda: len(completions) == 2)
     assert completions[1][1].is_ok
 
 
-def test_worker_crash_after_dataio_round_trip_still_fails_job_and_evicts_worker(registry, tmp_path):
+def test_worker_crash_after_dataio_round_trip_still_fails_job_and_evicts_worker(registry, tmp_path, dataio_resolver):
     key = _register(registry, "dataio_then_crash", _dataio_then_crash)
-    runtime, completions = _make_runtime(registry, str(tmp_path / "scratch"), storage_backends=_storage_backends(tmp_path))
+    runtime, completions = _make_runtime(registry, str(tmp_path / "scratch"), dataio=dataio_resolver)
 
-    runtime.invoke(key, "job1", {"location": "blob.raw"})
+    runtime.invoke(key, "job1", {"name": "blob.raw"})
     assert _wait_until(lambda: len(completions) == 1)
     assert completions[0][1].is_err
 
     # Next invocation must cold-start a brand new worker -- the crashed one is gone.
-    runtime.invoke(key, "job2", {"location": "blob2.raw"})
+    runtime.invoke(key, "job2", {"name": "blob2.raw"})
     assert _wait_until(lambda: len(completions) == 2)
     assert completions[1][1].is_err  # crashes again (same function), proving a fresh worker was spawned each time

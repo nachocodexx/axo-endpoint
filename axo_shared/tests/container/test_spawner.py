@@ -381,3 +381,43 @@ def test_build_image_returns_err_on_build_error(spawner, monkeypatch):
 
     result = spawner.build_image(context_path="/repo", dockerfile="/repo/Dockerfile", tag="x")
     assert result.is_err
+
+
+class _Lifecycle:
+    """A container that remembers stop/start calls."""
+
+    def __init__(self, status="running"):
+        self.status = status
+        self.calls = []
+
+    def stop(self, timeout=5):
+        self.calls.append("stop")
+        self.status = "exited"
+
+    def start(self):
+        self.calls.append("start")
+        self.status = "running"
+
+    def remove(self):
+        self.calls.append("remove")
+
+
+def test_halt_keeps_the_container_and_start_brings_it_back(spawner, monkeypatch):
+    container = _Lifecycle()
+    monkeypatch.setattr(spawner, "_docker", lambda: SimpleNamespace(containers=SimpleNamespace(get=lambda _id: container)))
+    handle = SpawnedContainerHandle(name="ep-1", mode="docker", container_id="c1")
+
+    assert spawner.halt(handle).is_ok
+    assert spawner.state("docker", "ep-1") == "exited"
+    assert spawner.start(handle).is_ok
+    assert spawner.state("docker", "ep-1") == "running"
+    assert container.calls == ["stop", "start"]  # never removed
+
+
+def test_state_of_a_missing_container_is_none(spawner, monkeypatch):
+    def missing(_name):
+        raise docker.errors.NotFound("gone")
+
+    monkeypatch.setattr(spawner, "_docker", lambda: SimpleNamespace(containers=SimpleNamespace(get=missing)))
+    assert spawner.state("docker", "ep-1") is None
+    assert spawner.halt(SpawnedContainerHandle(name="ep-1", mode="docker", container_id="c1")).is_err

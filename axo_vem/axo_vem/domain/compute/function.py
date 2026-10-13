@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from axo_vem.domain.workspace.value_objects import ResourceCapacity
+from axo_vem.domain.compute.value_objects import ResourceCapacity
 
 
 @dataclass
@@ -51,3 +51,6 @@ class Function:
     # (see application/projector/compute_handler.py). "running" or "stopped";
     # None until the first such event lands.
     container_status: Optional[str] = None
+    # From FunctionRegistered -- what Restoring needs to re-register it.
+    name: Optional[str] = None
+    params_schema: Optional[List[Dict[str, Any]]] = None

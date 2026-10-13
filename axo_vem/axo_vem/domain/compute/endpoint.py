@@ -6,7 +6,7 @@ from typing import List, Optional
 from axo_vem.domain.compute.active_object import ActiveObject
 from axo_vem.domain.compute.errors import NodeCapacityExceededError
 from axo_vem.domain.compute.function import Function
-from axo_vem.domain.workspace.value_objects import ResourceCapacity
+from axo_vem.domain.compute.value_objects import ResourceCapacity
 
 
 @dataclass

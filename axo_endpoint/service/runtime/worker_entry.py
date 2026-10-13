@@ -10,7 +10,7 @@ import cloudpickle
 from axo_shared.functions.source import materialize_function_from_source
 
 from axo_endpoint.core.dataio import DataIOError, IORef
-from axo_endpoint.core.runtime import InvocationContext
+from axo_endpoint.core.runtime import build_invocation
 from axo_endpoint.dataio import bind_channel, reset_channel
 
 # Sentinel sent down the pipe to tell a worker to stop its receive loop.
@@ -82,7 +82,7 @@ def worker_main(
 
         # message is always ("dispatch", job_id, scratch_dir, params) by protocol invariant
         _, job_id, scratch_dir, params = message
-        ctx = InvocationContext(job_id=job_id, scratch_dir=scratch_dir)
+        ctx, params = build_invocation(job_id, scratch_dir, params)
         token = bind_channel(PipeIOChannel(conn))
         try:
             value = func(params, ctx)

@@ -41,6 +41,7 @@ class UpdateFunctionUseCase:
         current_user_id: str,
         params_schema: Optional[List[Dict[str, Any]]] = None,
         env_vars: Optional[Dict[str, str]] = None,
+        max_concurrency: Optional[int] = None,
     ) -> Dict[str, Any]:
         function = self._function_repository.get(function_id, version)
         if function is None:
@@ -53,6 +54,8 @@ class UpdateFunctionUseCase:
             envelope["params_schema"] = params_schema
         if env_vars:
             envelope["env_vars"] = env_vars
+        if max_concurrency is not None:
+            envelope["max_concurrency"] = max_concurrency
         command = Command(operation=wire.FUNCTION_UPDATE, content_type="application/json", envelope=envelope)
 
         last_error: Optional[str] = None

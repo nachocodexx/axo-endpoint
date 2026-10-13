@@ -9,7 +9,6 @@ import zmq
 from option import Err, Ok
 
 from axo_endpoint.core.runtime.base import InvocationHandle
-from axo_endpoint.core.storage import FilesystemStorageBackend, FsKey
 from axo_endpoint.core.storage.backend import StorageKey
 from axo_endpoint.service.container.handle import ContainerHandle, ContainerStatus
 from axo_endpoint.service.runtime.container_runtime import ContainerFunctionRuntime
@@ -73,7 +72,7 @@ class _NoOpSummoner:
         self.dismiss_calls.append((handle, reason))
 
 
-def _make_runtime(tmp_path, data_registry=None, storage_backends=None):
+def _make_runtime(tmp_path, dataio=None):
     completions = []
 
     def on_complete(handle, result, warnings=None):
@@ -84,8 +83,7 @@ def _make_runtime(tmp_path, data_registry=None, storage_backends=None):
         summoner=_NoOpSummoner(),
         on_complete=on_complete,
         config=None,
-        storage_backends=storage_backends or {"fs": FilesystemStorageBackend(root=str(tmp_path))},
-        data_registry=data_registry,
+        dataio=dataio,
     )
     return runtime, completions
 
@@ -182,7 +180,6 @@ def _make_runtime_for_invoke(tmp_path, handle, readiness_timeout=2.0):
         summoner=_FakeSummoner(handle),
         on_complete=on_complete,
         config=_FakeConfig(readiness_timeout, str(tmp_path / "scratch")),
-        storage_backends={"fs": FilesystemStorageBackend(root=str(tmp_path / "dataio"))},
     )
     return runtime, completions
 
@@ -301,7 +298,6 @@ def test_invoke_dispatches_concurrent_jobs_to_distinct_pool_members(tmp_path):
         summoner=_FakePoolSummoner(handles),
         on_complete=on_complete,
         config=_FakeConfig(2.0, str(tmp_path / "scratch")),
-        storage_backends={"fs": FilesystemStorageBackend(root=str(tmp_path / "dataio"))},
     )
 
     for i in range(3):
@@ -357,23 +353,44 @@ def test_happy_path_dispatch_result(tmp_path):
     container.close()
 
 
-def test_io_request_is_resolved_against_real_blob_backend(tmp_path):
+class _FakeResolver:
+    """Stands in for DataIOResolver: the transport only has to route each
+    io_request to it (with the job's id) and send its answer back."""
+
+    def __init__(self, answers):
+        self.answers = answers
+        self.calls = []
+
+    def resolve(self, job_id, op, ref, data):
+        self.calls.append((job_id, op, ref, data))
+        return self.answers[op]
+
+
+def test_io_requests_are_answered_by_the_resolver_for_that_job(tmp_path):
+    from option import Err
+
+    from axo_endpoint.core.dataio import IORef, IOBackendError
+
+    resolver = _FakeResolver({
+        "read": Ok(b"container-fetched-me"),
+        "write": Err(IOBackendError("STORAGE_ACCESS_DENIED: user has no write access to bucket")),
+    })
     container = FakeContainer()
-    runtime, completions = _make_runtime(tmp_path)
-    runtime._storage_backends["fs"].put(FsKey(path="in.bin"), b"container-fetched-me")
+    runtime, completions = _make_runtime(tmp_path, dataio=resolver)
 
     sock = _dealer(container.port)
     handle = _handle(container.port)
     inv_handle = InvocationHandle(job_id="job1", function_id="fn1")
+    ref = {"bucket": "sales", "name": "in.bin", "version": None, "format": "raw", "chunk_index": None}
 
     def container_side():
         identity = container.recv_dispatch()
-        container.send_io_request(identity, "req1", "read", {"kind": "fs", "location": "in.bin", "format": "raw"})
+        container.send_io_request(identity, "req1", "read", ref)
         frames = container.recv_any()
-        assert frames[1] == b"io_reply"
-        assert frames[2] == b"req1"
-        assert frames[3] == b"ok"
-        assert frames[4] == b"container-fetched-me"
+        assert frames[1:5] == [b"io_reply", b"req1", b"ok", b"container-fetched-me"]
+        container.send_io_request(identity, "req2", "write", ref, b"data")
+        frames = container.recv_any()
+        assert frames[3] == b"err" and b"STORAGE_ACCESS_DENIED" in frames[4]
         container.send_result(identity, "job1", "ok", json.dumps("done").encode())
 
     t = threading.Thread(target=container_side, daemon=True)
@@ -384,63 +401,8 @@ def test_io_request_is_resolved_against_real_blob_backend(tmp_path):
 
     assert ok is True
     assert completions[0][1] == Ok("done")
-    sock.close()
-    container.close()
-
-
-def test_chunk_stream_ops_resolve_against_data_registry(tmp_path):
-    from axo_endpoint.core.data import DataRegistry
-    from axo_endpoint.core.events import InMemoryEventBus
-    from axo_endpoint.core.storage import InMemoryStorageBackend
-
-    storage_backends = {"fs": FilesystemStorageBackend(root=str(tmp_path))}
-    data_registry = DataRegistry(
-        catalog=InMemoryStorageBackend(), blob_backends=storage_backends, event_bus=InMemoryEventBus(),
-    )
-    container = FakeContainer()
-    runtime, completions = _make_runtime(tmp_path, data_registry=data_registry, storage_backends=storage_backends)
-
-    sock = _dealer(container.port)
-    handle = _handle(container.port)
-    inv_handle = InvocationHandle(job_id="job1", function_id="fn1")
-
-    def container_side():
-        identity = container.recv_dispatch()
-        ref = {"kind": "fs", "location": "out1/1", "format": "raw", "chunk_index": None}
-
-        container.send_io_request(identity, "r1", "open_stream", ref, json.dumps({"chunk_bytes": 4}).encode())
-        frames = container.recv_any()
-        assert frames[3] == b"ok"
-
-        container.send_io_request(identity, "r2", "append_chunk", ref, b"abcd")
-        frames = container.recv_any()
-        assert frames[3] == b"ok"
-
-        container.send_io_request(identity, "r3", "append_chunk", ref, b"ef")
-        frames = container.recv_any()
-        assert frames[3] == b"ok"
-
-        container.send_io_request(identity, "r4", "finalize_stream", ref, b"")
-        frames = container.recv_any()
-        assert frames[3] == b"ok"
-
-        chunk0_ref = {**ref, "chunk_index": 0}
-        container.send_io_request(identity, "r5", "read_chunk", chunk0_ref)
-        frames = container.recv_any()
-        assert frames[3] == b"ok"
-        assert frames[4] == b"abcd"
-
-        container.send_result(identity, "job1", "ok", json.dumps("done").encode())
-
-    t = threading.Thread(target=container_side, daemon=True)
-    t.start()
-
-    ok = runtime._pump_one_job(sock, handle, inv_handle, "job1", "/tmp/scratch1", {})
-    t.join(timeout=2.0)
-
-    assert ok is True
-    assert completions[0][1] == Ok("done")
-    assert data_registry.read_whole("out1", 1).unwrap() == b"abcdef"
+    assert resolver.calls[0][:3] == ("job1", "read", IORef(bucket="sales", name="in.bin"))
+    assert resolver.calls[1][3] == b"data"
     sock.close()
     container.close()
 

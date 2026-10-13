@@ -87,10 +87,8 @@ class MongoActivityRepository(ActivityRecorder):
         """Newest-first, optionally filtered along any combination of the
         five indexed dimensions. function_id/active_object_id filter on
         their nested meta.* location -- see record()'s top-level/meta split.
-        ``since`` (typically resolved from the caller's
-        activity_window_minutes preference by the /history routes) excludes
-        anything older -- purely a display-side filter, independent of
-        purge_older_than()'s actual retention cutoff."""
+        ``since`` (the VE's retention, or a narrower caller window) excludes
+        anything older -- rows are never deleted for retention, only hidden."""
         query: Dict[str, Any] = {}
         if user_id is not None:
             query["user_id"] = user_id
@@ -136,54 +134,3 @@ class MongoActivityRepository(ActivityRecorder):
             query["meta.choreography_id"] = choreography_id
         assert query, "purge() requires at least one filter"
         return self._collection.delete_many(query).deleted_count
-
-    def purge_older_than(self, cutoff: datetime, exclude_event_types: Optional[List[str]] = None) -> int:
-        """Hard-deletes every unified_activity row older than ``cutoff`` --
-        the actual retention ceiling (AXO_VEM_ACTIVITY_RETENTION_HOURS),
-        called from the background retention worker on its own tick, fully
-        independent of any individual user's activity_window_minutes
-        display preference (see get_timeline()'s ``since``).
-
-        ``exclude_event_types`` must list every "supersedable" event type
-        handled by purge_superseded instead (see ActivityRetentionWorker.tick) --
-        otherwise this blanket age-based delete would remove a group's
-        single latest row right out from under purge_superseded's own
-        "keep the newest forever" guarantee before it ever runs."""
-        query: Dict[str, Any] = {"created_at": {"$lt": cutoff}}
-        if exclude_event_types:
-            query["event_type"] = {"$nin": exclude_event_types}
-        return self._collection.delete_many(query).deleted_count
-
-    def purge_superseded(self, event_type: str, group_by_fields: List[str], cutoff: datetime) -> int:
-        """For one "supersedable" event_type (each new row fully replaces an
-        earlier one's meaning for the same group, e.g. FunctionUpdated for a
-        given (function_id, function_version)), keeps the single overall
-        newest row per group forever and deletes every other row in that
-        group once it's older than ``cutoff``. Unlike purge_older_than, this
-        never deletes the most recent row for a group, however old it gets
-        -- only superseded ones. group_by_fields names meta.* keys (e.g.
-        ["function_id", "function_version"])."""
-        group_key = {field: f"$meta.{field}" for field in group_by_fields}
-        pipeline = [
-            {"$match": {"event_type": event_type}},
-            {"$sort": {"created_at": -1}},
-            {"$group": {
-                "_id": group_key,
-                "keep_id": {"$first": "$_id"},
-                "rows": {"$push": {"id": "$_id", "created_at": "$created_at"}},
-            }},
-        ]
-        to_delete: List[Any] = []
-        for group in self._collection.aggregate(pipeline):
-            keep_id = group["keep_id"]
-            for row in group["rows"]:
-                created_at = row["created_at"]
-                if created_at.tzinfo is None:
-                    # Same naive-vs-aware quirk _doc_to_dict works around --
-                    # every value written by record() is UTC regardless.
-                    created_at = created_at.replace(tzinfo=timezone.utc)
-                if row["id"] != keep_id and created_at < cutoff:
-                    to_delete.append(row["id"])
-        if not to_delete:
-            return 0
-        return self._collection.delete_many({"_id": {"$in": to_delete}}).deleted_count

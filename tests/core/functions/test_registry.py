@@ -47,7 +47,7 @@ def test_register_emits_registered_event(registry, event_bus):
     assert received == [
         Event(
             event_type="REGISTERED",
-            payload={"function_id": "add_one", "version": 1},
+            payload={"function_id": "add_one", "version": 1, "restored": False},
             timestamp=100.0,
         )
     ]
@@ -186,3 +186,34 @@ def test_update_with_no_changes_is_a_no_op_that_still_emits(registry, event_bus)
     assert result.unwrap().params_schema is None
     assert result.unwrap().runtime_spec is None
     assert len(received) == 1
+
+
+def test_restore_registers_at_the_exact_version_but_never_overwrites():
+    from axo_endpoint.core.events import InMemoryEventBus
+    from axo_endpoint.core.functions import FunctionRegistry
+    from axo_endpoint.core.storage import InMemoryStorageBackend
+
+    events = []
+    bus = InMemoryEventBus()
+    bus.subscribe("REGISTERED", events.append)
+    registry = FunctionRegistry(backend=InMemoryStorageBackend(), event_bus=bus)
+
+    key = registry.register("fn", "fn", b"code-v3", now=1.0, restore_version=3).unwrap()
+    assert key.version == 3
+    assert events[-1].payload["restored"] is True
+    assert registry.register("fn", "fn", b"next", now=2.0).unwrap().version == 4   # numbering continues after it
+    clash = registry.register("fn", "fn", b"other", now=3.0, restore_version=3)
+    assert clash.unwrap_err().name == "FUNCTION_VERSION_EXISTS"
+
+
+def test_update_changes_max_concurrency_in_place():
+    from axo_shared.runtime.spec import RuntimeSpec
+    from axo_endpoint.core.events import InMemoryEventBus
+    from axo_endpoint.core.functions import FunctionRegistry
+    from axo_endpoint.core.storage import InMemoryStorageBackend
+
+    registry = FunctionRegistry(backend=InMemoryStorageBackend(), event_bus=InMemoryEventBus())
+    key = registry.register("fn", "fn", b"code", now=1.0, runtime_spec=RuntimeSpec(type="container")).unwrap()
+    updated = registry.update(key, now=2.0, max_concurrency=4).unwrap()
+    assert updated.runtime_spec.max_concurrency == 4
+    assert updated.version == key.version and updated.runtime_spec.type == "container"

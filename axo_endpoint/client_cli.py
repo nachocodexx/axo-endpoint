@@ -72,19 +72,6 @@ def cmd_result(args) -> None:
         _print_result(c.get_job_result(args.job_id))
 
 
-def cmd_register_data(args) -> None:
-    with _client(args) as c:
-        _print_result(c.upload_data(
-            args.name, args.version, args.file, format=args.format, kind=args.kind,
-            chunk_bytes=args.chunk_bytes, resume=not args.no_resume,
-        ))
-
-
-def cmd_data_info(args) -> None:
-    with _client(args) as c:
-        _print_result(c.data_info(args.name, args.version))
-
-
 def cmd_activity(args) -> None:
     with _client(args) as c:
         _print_result(c.list_activity(function_id=args.function_id, limit=args.limit))
@@ -187,27 +174,6 @@ def main() -> None:
     p_res.add_argument("job_id", help="Job ID returned by submit")
     p_res.set_defaults(func=cmd_result)
 
-    # register-data
-    from axo_endpoint.dataio import DEFAULT_CHUNK_BYTES
-    p_data_reg = sub.add_parser("register-data", help="Register and chunk-upload a file's data")
-    p_data_reg.add_argument("address", help="Node address")
-    p_data_reg.add_argument("name", help="Data name to register as")
-    p_data_reg.add_argument("version", type=int, help="Data version")
-    p_data_reg.add_argument("file", help="Path to the file to upload")
-    p_data_reg.add_argument("--format", default="raw", help="dataio format (raw/pickle/csv/npy, default: raw)")
-    p_data_reg.add_argument("--kind", default="fs", help="Storage backend kind (default: fs)")
-    p_data_reg.add_argument("--chunk-bytes", type=int, default=DEFAULT_CHUNK_BYTES, dest="chunk_bytes",
-                             metavar="BYTES", help=f"Chunk size in bytes (default: {DEFAULT_CHUNK_BYTES})")
-    p_data_reg.add_argument("--no-resume", action="store_true",
-                             help="Always re-upload every chunk instead of skipping already-present ones")
-    p_data_reg.set_defaults(func=cmd_register_data)
-
-    # data-info
-    p_data_info = sub.add_parser("data-info", help="Query registered data status/replication info")
-    p_data_info.add_argument("address", help="Node address")
-    p_data_info.add_argument("name", help="Data name")
-    p_data_info.add_argument("version", type=int, help="Data version")
-    p_data_info.set_defaults(func=cmd_data_info)
 
     # activity
     p_activity = sub.add_parser("activity", help="List recorded job/container activity for this node")

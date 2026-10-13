@@ -13,7 +13,7 @@ class EndpointRepository(ABC):
     application/projector/compute_handler.py. Read access for GET routes
     stays dict-based against the raw Mongo collection (decision 3 in the
     migration plan: Endpoint has no well-defined shape to safely reconstruct
-    into an aggregate for HTTP responses), so get()/list_by_virtual_environment()
+    into an aggregate for HTTP responses), so get()/list_all()
     stay narrow, aggregate-shaped reads for internal decision logic only --
     not a replacement for the raw-dict GET routes.
 
@@ -27,7 +27,7 @@ class EndpointRepository(ABC):
     real write contract; save()/get() exist for symmetry with the other
     aggregate repositories and future capacity-aware use cases.
 
-    list_by_virtual_environment() is the first read method consumed outside
+    list_all() is the first read method consumed outside
     the projector's own write path -- RegisterFunctionUseCase uses it to
     auto-pick a routing target for a function registered into a given VE,
     and LaunchEndpointNodeUseCase uses it (filtering to status == "running",
@@ -45,10 +45,10 @@ class EndpointRepository(ABC):
     def apply_event_data(self, endpoint_id: str, data: Dict[str, Any]) -> None: ...
 
     @abstractmethod
-    def list_by_virtual_environment(self, virtual_environment_id: str) -> List[Endpoint]:
-        """Endpoints currently assigned to this VE, ordered most-recently-seen
-        first (see Endpoint.last_seen_at), tie-broken by endpoint_id ascending.
-        Callers that just want a single routing target take index 0."""
+    def list_all(self) -> List[Endpoint]:
+        """Every endpoint of this VEM's VE (a VEM manages exactly one VE),
+        ordered most-recently-seen first (see Endpoint.last_seen_at),
+        tie-broken by endpoint_id ascending."""
 
 
 class FunctionRepository(ABC):
@@ -86,6 +86,10 @@ class FunctionRepository(ABC):
         """Removes one endpoint_id from this function version's list
         (FunctionEndpointDetached) -- used when that endpoint is purged but
         other endpoints still hold the function, so it isn't soft-deleted."""
+
+    @abstractmethod
+    def list_active(self) -> List[Function]:
+        """Every function version not soft-deleted (Restoring re-registers these)."""
 
     @abstractmethod
     def list_by_endpoint_id(self, endpoint_id: str) -> List[Function]:

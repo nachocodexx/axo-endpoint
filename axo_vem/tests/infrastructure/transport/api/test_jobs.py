@@ -112,6 +112,8 @@ def test_submit_job_forwards_command_and_relays_success(client, collections):
     assert command.operation == wire.JOB_SUBMIT
     assert command.envelope == {
         "function_id": "add-hash", "function_name": "add", "function_version": 1, "params": {"a": 1},
+        # the job acts for the logged-in user (axo_storage checks their bucket access)
+        "acting_user_id": "user-1", "started_by_type": "user", "started_by_id": "user-1",
     }
 
 
@@ -137,57 +139,30 @@ def test_submit_job_returns_404_for_unknown_endpoint(client):
     assert response.status_code == 404
 
 
-def test_submit_function_job_routes_to_ve_leader(client, collections, kurrent_appender):
+def test_submit_function_job_skips_endpoints_that_are_not_running(client, collections, kurrent_appender):
     address, thread, captured = _run_fake_endpoint(reply_ok=True, metadata={"job_id": "job1", "status": "QUEUED"})
-
-    # A VE doc must already exist for set_leader_endpoint_id() to take (it's
-    # a conditional update, never an upsert).
-    kurrent_appender.append_to_stream(
-        "virtual-environments-ve-1", models.VIRTUAL_ENV_CREATED,
-        models.VirtualEnvironmentCreated(
-            virtual_environment_id="ve-1", name="ve1", owner_user_id="alice",
-            resource_quota=models.ResourceQuota(cpu=1, ram=1, disk=1),
-        ).model_dump(mode="json"),
-    )
     kurrent_appender.append_to_stream(
         "functions-add:1", models.FUNCTION_REGISTERED,
-        models.FunctionRegistered(
-            endpoint_id="127.0.0.1", virtual_environment_id="ve-1", function_id="add-hash", version=1, name="add",
-        ).model_dump(mode="json"),
+        models.FunctionRegistered(endpoint_id="127.0.0.1", function_id="add-hash", version=1, name="add")
+        .model_dump(mode="json"),
     )
-    # Two endpoints assigned to the VE -- n1 is merely most-recently-seen (and
-    # never actually dialed, so an unreachable placeholder bind is fine),
-    # 127.0.0.1 is the elected leader and must win over that recency pick.
-    # resolve_rpc_uri() reconstructs the connect host from endpoint_id itself
-    # (never from the stored router_bind's host -- see its docstring), so the
-    # leader's endpoint_id must literally be the fake router's real host.
-    for endpoint_id, bind in (("127.0.0.1", address), ("n1", "tcp://127.0.0.1:1")):
-        kurrent_appender.append_to_stream(
-            f"endpoints-{endpoint_id}", models.ENDPOINT_STARTED,
-            models.EndpointStarted(endpoint_id=endpoint_id, router_bind=bind, pub_bind="tcp://127.0.0.1:2").model_dump(mode="json"),
-        )
-        kurrent_appender.append_to_stream(
-            f"endpoints-{endpoint_id}", models.ENDPOINT_VIRTUAL_ENV_ASSIGNED,
-            models.EndpointVirtualEnvironmentAssigned(endpoint_id=endpoint_id, virtual_environment_id="ve-1").model_dump(mode="json"),
-        )
+    # "n1" is seen more recently but stopped -- only the running one may get jobs.
     kurrent_appender.append_to_stream(
-        "consensus-1", models.LEADER_ELECTED,
-        models.LeaderElected(endpoint_id="127.0.0.1", leader_ids=["127.0.0.1"], term=1).model_dump(mode="json"),
+        "endpoints-127.0.0.1", models.ENDPOINT_STARTED,
+        models.EndpointStarted(endpoint_id="127.0.0.1", router_bind=address, pub_bind="tcp://127.0.0.1:2")
+        .model_dump(mode="json"),
+    )
+    kurrent_appender.append_to_stream(
+        "endpoints-n1", models.ENDPOINT_STOPPED,
+        models.EndpointStopped(endpoint_id="n1", uptime_ms=1.0).model_dump(mode="json"),
     )
 
     response = client.post("/functions/add-hash/1/jobs", json={"params": {"a": 1}})
     thread.join(timeout=2.0)
 
     assert response.status_code == 200
-    body = response.json()
-    assert body["endpoint_id"] == "127.0.0.1"
-    assert body["job_id"] == "job1"
-
-    command = captured["command"]
-    assert command.operation == wire.JOB_SUBMIT
-    assert command.envelope["function_id"] == "add-hash"
-    assert command.envelope["function_version"] == 1
-    assert command.envelope["params"] == {"a": 1}
+    assert response.json()["endpoint_id"] == "127.0.0.1"
+    assert captured["command"].operation == wire.JOB_SUBMIT
 
 
 def test_submit_function_job_falls_back_to_most_recently_seen_endpoint(client, collections, kurrent_appender):

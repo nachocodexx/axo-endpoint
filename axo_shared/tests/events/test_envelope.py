@@ -1,7 +1,17 @@
+from datetime import datetime, timezone
+
 import pytest
 
 from axo_shared import wire
 from axo_shared.events import envelope, models
+from axo_shared.metrics import StatSummary
+
+
+def _summary_dict():
+    stats = StatSummary()
+    for v in (10, 20, 30):
+        stats.add(v)
+    return stats.to_dict()
 
 
 def test_encode_decode_round_trips_endpoint_started():
@@ -61,6 +71,25 @@ def test_encode_decode_round_trips_all_event_kinds():
             endpoint_id="n0", virtual_environment_id="ve1")),
         (models.ENDPOINT_VIRTUAL_ENV_DETACHED, models.EndpointVirtualEnvironmentDetached(
             endpoint_id="n0", previous_virtual_environment_id="ve1")),
+        (models.JOB_ATTEMPT_RECORDED, models.JobAttemptRecorded(
+            endpoint_id="n0", virtual_environment_id="ve1", job_id="job1", attempt=2, trace_id="t1",
+            outcome="failed_user", owner_type="team", owner_id="ml-lab", started_by_type="api_key",
+            started_by_id="k-123", function_id="add", function_version=3, endpoint_cores=2.0,
+            endpoint_ram_mb=4096, received_at=datetime(2026, 10, 11, 12, 0, tzinfo=timezone.utc),
+            started_at=datetime(2026, 10, 11, 12, 0, 1, tzinfo=timezone.utc),
+            finished_at=datetime(2026, 10, 11, 12, 0, 3, tzinfo=timezone.utc),
+            layer_waits_ms={"control_plane": 5.0, "vem": 3.0, "endpoint": 120.0, "runner": 40.0},
+            execution_ms=2400.0, bytes_read={"BK1": 50_000}, bytes_written={"BK2": 10_000},
+            cache_hits=3, cache_misses=1)),
+        (models.VE_HEARTBEAT, models.VirtualEnvironmentHeartbeat(
+            virtual_environment_id="ve1", lifecycle="Scaling", health="Degraded",
+            target_endpoints=6, min_endpoints=2, running=3, starting=1, failed=2)),
+        (models.VE_HEARTBEAT, models.VirtualEnvironmentHeartbeat(
+            virtual_environment_id="ve1", lifecycle="Sleeping", target_endpoints=1, min_endpoints=1)),
+        (models.METRIC_SUMMARY_REPORTED, models.MetricSummaryReported(
+            virtual_environment_id="ve1", component_kind="endpoint", component_id="n0",
+            bin_start=1000.0, bin_width_s=60, summaries=[models.MetricSummary(
+                metric="job.exec_ms", dims={"function": "add"}, stats=_summary_dict())])),
     ]
 
     for event_type, event in cases:
@@ -118,3 +147,33 @@ def test_rehydrate_choreography_created_raises_key_error_pending_envelope_regist
     and intentional-looking, not to silently assume it's fine forever."""
     with pytest.raises(KeyError):
         envelope.rehydrate(models.CHOREOGRAPHY_CREATED, {"choreography_id": "c1"})
+
+
+def test_message_id_is_only_added_when_given():
+    plain = envelope.encode_event(models.JOB_QUEUED, "n0", {})
+    assert "message_id" not in plain.envelope
+    tagged = envelope.encode_event(models.JOB_QUEUED, "n0", {}, message_id="m-1")
+    assert tagged.envelope["message_id"] == "m-1"
+    assert envelope.decode_event(tagged).unwrap() == (models.JOB_QUEUED, "n0", {})
+
+
+@pytest.mark.parametrize("outcome,billable", [
+    ("completed", True),
+    ("failed_user", True),
+    ("cancelled", True),
+    ("failed_platform", False),
+    ("timed_out_in_queue", False),
+])
+def test_is_billable(outcome, billable):
+    assert models.is_billable(outcome) is billable
+
+
+def test_metric_summary_stats_rebuild_into_a_stat_summary():
+    event = models.MetricSummaryReported(
+        component_kind="vem", component_id="vem-1", bin_start=0.0, bin_width_s=60,
+        summaries=[models.MetricSummary(metric="queue.length", stats=_summary_dict())],
+    )
+    data = envelope.decode_event(envelope.encode_event(models.METRIC_SUMMARY_REPORTED, "vem-1",
+                                                      event.model_dump(mode="json"))).unwrap()[2]
+    rebuilt = StatSummary.from_dict(envelope.rehydrate(models.METRIC_SUMMARY_REPORTED, data).summaries[0].stats)
+    assert rebuilt.mean() == 20

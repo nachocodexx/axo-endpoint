@@ -19,12 +19,6 @@ def test_defaults_with_no_env_vars(clean_env):
     assert config.AXO_ENDPOINT_WORKER_RLIMIT_CPU_SECONDS == 30
     assert config.AXO_ENDPOINT_SCRATCH_ROOT == "/tmp/axo_endpoint/scratch"
     assert config.AXO_ENDPOINT_SCRATCH_GC_INTERVAL_SECONDS == 60.0
-    assert config.AXO_ENDPOINT_CONSENSUS_BLOB_CHUNK_BYTES == 262144
-    assert config.AXO_ENDPOINT_CONSENSUS_BLOB_RATE_LIMIT_BYTES_PER_SECOND == 1048576
-    assert config.AXO_ENDPOINT_CONSENSUS_BLOB_TICK_INTERVAL_SECONDS == 0.1
-    assert config.AXO_ENDPOINT_BLOB_REPLICATION_IDLE_SECONDS == 60.0
-    assert config.AXO_ENDPOINT_BLOB_REPLICATION_ENABLED_KINDS == ["fs"]
-    assert config.AXO_ENDPOINT_BLOB_REPLICATION_RECHECK_SECONDS == 300.0
     assert config.AXO_ENDPOINT_ACTIVITY_LOG_MAX_ENTRIES == 10000
     assert config.AXO_ENDPOINT_API_URI is None
     assert config.AXO_ENDPOINT_API_PUBLISH_TIMEOUT_MS == 1000
@@ -43,12 +37,6 @@ def test_env_var_overrides_with_correct_type_coercion(clean_env, monkeypatch):
     monkeypatch.setenv("AXO_ENDPOINT_QUEUE_MAX_DEPTH", "50")
     monkeypatch.setenv("AXO_ENDPOINT_HEARTBEAT_INTERVAL_SECONDS", "2.5")
     monkeypatch.setenv("AXO_ENDPOINT_WORKER_MAX_INVOCATIONS", "100")
-    monkeypatch.setenv("AXO_ENDPOINT_CONSENSUS_BLOB_CHUNK_BYTES", "1024")
-    monkeypatch.setenv("AXO_ENDPOINT_CONSENSUS_BLOB_RATE_LIMIT_BYTES_PER_SECOND", "2048")
-    monkeypatch.setenv("AXO_ENDPOINT_CONSENSUS_BLOB_TICK_INTERVAL_SECONDS", "0.5")
-    monkeypatch.setenv("AXO_ENDPOINT_BLOB_REPLICATION_IDLE_SECONDS", "30")
-    monkeypatch.setenv("AXO_ENDPOINT_BLOB_REPLICATION_ENABLED_KINDS", "fs,s3")
-    monkeypatch.setenv("AXO_ENDPOINT_BLOB_REPLICATION_RECHECK_SECONDS", "120")
     monkeypatch.setenv("AXO_ENDPOINT_ACTIVITY_LOG_MAX_ENTRIES", "500")
     monkeypatch.setenv("AXO_ENDPOINT_CONTAINER_MEMORY_LIMIT_BYTES", "268435456")
     monkeypatch.setenv("AXO_ENDPOINT_CONTAINER_CPU_LIMIT", "0.5")
@@ -61,12 +49,6 @@ def test_env_var_overrides_with_correct_type_coercion(clean_env, monkeypatch):
     assert config.AXO_ENDPOINT_HEARTBEAT_INTERVAL_SECONDS == 2.5
     assert isinstance(config.AXO_ENDPOINT_HEARTBEAT_INTERVAL_SECONDS, float)
     assert config.AXO_ENDPOINT_WORKER_MAX_INVOCATIONS == 100
-    assert config.AXO_ENDPOINT_CONSENSUS_BLOB_CHUNK_BYTES == 1024
-    assert config.AXO_ENDPOINT_CONSENSUS_BLOB_RATE_LIMIT_BYTES_PER_SECOND == 2048
-    assert config.AXO_ENDPOINT_CONSENSUS_BLOB_TICK_INTERVAL_SECONDS == 0.5
-    assert config.AXO_ENDPOINT_BLOB_REPLICATION_IDLE_SECONDS == 30.0
-    assert config.AXO_ENDPOINT_BLOB_REPLICATION_ENABLED_KINDS == ["fs", "s3"]
-    assert config.AXO_ENDPOINT_BLOB_REPLICATION_RECHECK_SECONDS == 120.0
     assert config.AXO_ENDPOINT_ACTIVITY_LOG_MAX_ENTRIES == 500
     assert config.AXO_ENDPOINT_CONTAINER_MEMORY_LIMIT_BYTES == 268435456
     assert config.AXO_ENDPOINT_CONTAINER_CPU_LIMIT == 0.5

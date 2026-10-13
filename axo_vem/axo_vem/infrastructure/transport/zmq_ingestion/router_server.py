@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Optional, Union
+from typing import Any, Callable, Dict, Optional, Union
 
 import zmq
 
 from axo_shared import wire
+from axo_shared.messaging import RecentIds, build_ack, extract_message_id
 from axo_shared.protocol import CommandResult
 
 from axo_vem.domain.events import envelope
@@ -29,10 +30,11 @@ class IngestionRouterServer:
     an ephemeral port (tcp://127.0.0.1:0, as tests do) can read the resolved
     bind address back immediately.
 
-    The ack sent back per event is best-effort only -- ZmqEventPublisher on
-    the node side never calls recv_multipart, so a dropped ack changes
-    nothing observable; it exists purely as a hook for a future retry-aware
-    publisher, not a correctness requirement today.
+    Each event is acked (echoing its message_id) only after the Kurrent
+    append succeeds. Endpoints deliver through axo_shared.messaging's
+    ReliableSender, which resends anything unacked -- so a failed append just
+    means "no ack, try again later", and a redelivered duplicate is skipped
+    via RecentIds and acked again.
 
     Moved from ingestion/router_server.py -- appender is now typed against
     the domain.events.publisher.EventPublisher ABC instead of a local
@@ -48,8 +50,14 @@ class IngestionRouterServer:
         max_attempts: int = 10,
         base_delay_seconds: float = 1.0,
         max_delay_seconds: float = 30.0,
+        local_handlers: Optional[Dict[str, Callable[[Dict[str, Any]], bool]]] = None,
     ) -> None:
         self._bind_address = bind_address
+        # Event types the VEM handles itself instead of appending to its event
+        # log (job attempts -> durable outbox to the Control Plane; 10 s
+        # metric bins -> in-memory metrics). Acked only if the handler
+        # returns True, so the endpoint resends otherwise.
+        self._local_handlers = dict(local_handlers or {})
         self._appender = appender
         self._context = context or zmq.Context.instance()
         self._socket: Optional["zmq.Socket"] = None
@@ -59,6 +67,9 @@ class IngestionRouterServer:
         self._max_attempts = max_attempts
         self._base_delay_seconds = base_delay_seconds
         self._max_delay_seconds = max_delay_seconds
+        # Endpoints resend until acked (axo_shared.messaging), so a message
+        # whose ack was lost arrives again: skip the append, ack again.
+        self._recent_ids = RecentIds()
 
     @property
     def bind_address(self) -> str:
@@ -123,11 +134,51 @@ class IngestionRouterServer:
             )
             return
         event_type, endpoint_id, data = event_result.unwrap()
+        message_id = extract_message_id(command)
 
-        stream_name = stream_name_for(event_type, endpoint_id, data)
+        if message_id is not None and self._recent_ids.seen(message_id):
+            self._logger.debug_event(
+                Event.Ingestion.DUPLICATE_SKIPPED,
+                component=Component.INGESTION,
+                event_type=event_type,
+                message_id=message_id,
+            )
+            self._ack(identity, message_id)
+            return
+
+        local = self._local_handlers.get(event_type)
+        if local is not None:
+            try:
+                handled = local(data)
+            except Exception as exc:  # a handler bug must not stop ingestion
+                self._logger.error_event(
+                    Event.Ingestion.LOCAL_HANDLER_FAILED, component=Component.INGESTION,
+                    event_type=event_type, error=repr(exc),
+                )
+                handled = False
+            if handled:
+                self._ack(identity, message_id)
+            elif message_id is not None:
+                self._recent_ids.forget(message_id)
+            return
+
+        try:
+            stream_name = stream_name_for(event_type, endpoint_id, data)
+        except ValueError:
+            # An event type this VEM doesn't know (e.g. a newer endpoint).
+            # Ack it: resending would never succeed and would clog the
+            # sender's journal.
+            self._logger.warning_event(
+                Event.Ingestion.UNKNOWN_EVENT_TYPE, component=Component.INGESTION,
+                event_type=event_type, endpoint_id=endpoint_id,
+            )
+            self._ack(identity, message_id)
+            return
         if not self._append_with_retry(stream_name, event_type, data):
-            return  # exhausted retries -- already logged, drop this frame rather than kill the thread
-        self._ack(identity)
+            if message_id is not None:
+                self._recent_ids.forget(message_id)  # not stored: let the resend through
+            return  # exhausted retries -- already logged, no ack, so the sender resends
+        self._ack(identity, message_id)
 
     def _append_with_retry(self, stream_name: str, event_type: str, data) -> bool:
         """Returns True on success, False if retries were exhausted (and
@@ -179,10 +230,14 @@ class IngestionRouterServer:
         )
         return True
 
-    def _ack(self, identity: bytes) -> None:
+    def _ack(self, identity: bytes, message_id: Optional[str] = None) -> None:
+        """Sent only after the event is durably appended. Reliable senders
+        drop the message from their journal when they see its message_id
+        echoed back; older fire-and-forget senders simply ignore the reply."""
+        result = build_ack(message_id) if message_id is not None else CommandResult(ok=True)
         try:
             self._socket.send_multipart(
-                [identity, *wire.encode_command_result(CommandResult(ok=True))],
+                [identity, *wire.encode_command_result(result)],
                 flags=zmq.NOBLOCK,
             )
         except zmq.ZMQError:

@@ -307,7 +307,7 @@ def test_on_function_build_event_forwards_started_completed_failed():
 def test_on_function_updated_forwards_current_record_env_vars_and_params_schema():
     bridge, publisher, registry = _bridge(runtime_spec=RuntimeSpec(type="process"))
     key = StorageKey(id="add", version=1, alias="add")
-    registry.update(key, now=150.0, env_vars={"A": "1"})
+    registry.update(key, now=150.0, env_vars={"A": "1"}, max_concurrency=3)
 
     bridge.on_function_updated(Event(
         event_type="FUNCTION_UPDATED", payload={"function_id": "add", "version": 1}, timestamp=150.0,
@@ -318,6 +318,8 @@ def test_on_function_updated_forwards_current_record_env_vars_and_params_schema(
     assert data["function_id"] == "add"
     assert data["version"] == 1
     assert data["env_vars"] == {"A": "1"}
+    # a runner policy's change reaches the VEM's read model
+    assert data["runtime_spec"]["max_concurrency"] == 3
 
 
 def test_on_function_deleted_and_delete_failed():
@@ -492,76 +494,6 @@ def test_on_job_finished_forwards_job_failed_with_failure_detail():
     assert job_data["failure"]["message"] == "boom"
     assert fn_event_type == event_models.FUNCTION_DEACTIVATED
     assert fn_data["state"] == "FAILED"
-
-
-def test_on_bucket_registered_forwards_data_bucket_created():
-    bridge, publisher, _ = _bridge()
-
-    bridge.on_bucket_registered(Event(
-        event_type="BUCKET_REGISTERED",
-        payload={"name": "mybucket", "quota_bytes": 1024, "created_at": 100.0},
-        timestamp=100.0,
-    ))
-
-    event_type, data = publisher.published[0]
-    assert event_type == event_models.DATA_BUCKET_CREATED
-    assert data["name"] == "mybucket"
-    assert data["quota_bytes"] == 1024
-    assert data["endpoint_id"] == "n0"
-
-
-def test_on_data_registered_forwards_data_registered():
-    bridge, publisher, _ = _bridge()
-
-    bridge.on_data_registered(Event(
-        event_type="DATA_REGISTERED",
-        payload={
-            "data_id": "mybucket/df1", "version": 1, "total_chunks": 2,
-            "format": "raw", "kind": "fs", "total_size": 8,
-        },
-        timestamp=100.0,
-    ))
-
-    event_type, data = publisher.published[0]
-    assert event_type == event_models.DATA_REGISTERED
-    assert data["name"] == "mybucket/df1"
-    assert data["version"] == 1
-    assert data["format"] == "raw"
-    assert data["kind"] == "fs"
-    assert data["total_size"] == 8
-    assert data["total_chunks"] == 2
-
-
-def test_on_data_upload_completed_forwards_data_upload_completed():
-    bridge, publisher, _ = _bridge()
-
-    bridge.on_data_upload_completed(Event(
-        event_type="DATA_UPLOAD_COMPLETED",
-        payload={"data_id": "mybucket/df1", "version": 1},
-        timestamp=100.0,
-    ))
-
-    event_type, data = publisher.published[0]
-    assert event_type == event_models.DATA_UPLOAD_COMPLETED
-    assert data["name"] == "mybucket/df1"
-    assert data["version"] == 1
-    assert data["endpoint_id"] == "n0"
-
-
-def test_on_data_deleted_forwards_data_deleted():
-    bridge, publisher, _ = _bridge()
-
-    bridge.on_data_deleted(Event(
-        event_type="DATA_DELETED",
-        payload={"data_id": "mybucket/df1", "version": 1},
-        timestamp=100.0,
-    ))
-
-    event_type, data = publisher.published[0]
-    assert event_type == event_models.DATA_DELETED
-    assert data["name"] == "mybucket/df1"
-    assert data["version"] == 1
-    assert data["endpoint_id"] == "n0"
 
 
 def test_on_leader_elected_forwards_leader_elected():

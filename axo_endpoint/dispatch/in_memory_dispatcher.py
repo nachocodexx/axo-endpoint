@@ -26,10 +26,11 @@ class InMemoryCommandDispatcher(CommandDispatcher):
 
     def __init__(self, max_queue_size: int, worker_count: int, logger: _Logger = None) -> None:
         self._handlers: Dict[str, CommandHandler] = {}
+        self._max_queue_size = max_queue_size
         self._queue: "queue.Queue[Optional[_WorkItem]]" = queue.Queue(maxsize=max_queue_size)
         self._lock = threading.Lock()
         self._closed = False
-        self._metrics = {"submitted": 0, "completed": 0, "failed": 0}
+        self._metrics = {"submitted": 0, "completed": 0, "failed": 0, "rejected": 0}
         self._logger: _Logger = logger or DumbLogger()
         self._workers = [
             threading.Thread(target=self._run_worker, daemon=True) for _ in range(worker_count)
@@ -71,6 +72,8 @@ class InMemoryCommandDispatcher(CommandDispatcher):
         try:
             self._queue.put_nowait(_WorkItem(command=command, handler=handler, future=future))
         except queue.Full:
+            with self._lock:
+                self._metrics["rejected"] += 1
             err = QueueFullError("queue is at capacity", context={"operation": command.operation})
             self._logger.debug_event(
                 Event.Dispatcher.QUEUE_FULL,
@@ -92,10 +95,12 @@ class InMemoryCommandDispatcher(CommandDispatcher):
         return result
 
     def metrics(self) -> Dict[str, int]:
-        """Returns counts of submitted, completed, and failed commands, plus the current queue size."""
+        """Returns counts of submitted, completed, failed and rejected (queue
+        full) commands, plus the current queue size and its capacity."""
         with self._lock:
             snapshot = dict(self._metrics)
         snapshot["queue_depth"] = self._queue.qsize()
+        snapshot["queue_capacity"] = self._max_queue_size
         return snapshot
 
     def close(self) -> None:

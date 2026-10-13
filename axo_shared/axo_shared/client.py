@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import os
+
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional
 
 import cloudpickle
 import zmq
@@ -11,11 +11,6 @@ from axo_shared.functions.identity import compute_function_id
 from axo_shared.protocol import Command, CommandResult
 from axo_shared.wire import (
     ACTIVITY_LIST,
-    BUCKET_REGISTER,
-    DATA_CHUNK_PUT,
-    DATA_INFO,
-    DATA_REGISTER,
-    DATA_STATUS,
     FUNCTION_DELETE,
     FUNCTION_REGISTER,
     FUNCTION_UPDATE,
@@ -27,10 +22,9 @@ from axo_shared.wire import (
     encode_command,
 )
 
-# Must stay in sync with axo_endpoint/dataio.py's own DEFAULT_CHUNK_BYTES --
-# duplicated rather than imported so axo_shared doesn't pull in
-# axo_endpoint.core.dataio/core.storage for one constant.
-DEFAULT_CHUNK_BYTES = 262144
+# Data (buckets, objects, chunks) is axo_storage's job now -- see
+# axo_shared.axo_storage.AxoStorageClient. Re-exported for older importers.
+from axo_shared.axo_storage.client import DEFAULT_CHUNK_BYTES  # noqa: E402,F401
 
 
 class AxoClientError(Exception):
@@ -39,19 +33,6 @@ class AxoClientError(Exception):
 
 class AxoClientTimeout(AxoClientError):
     pass
-
-
-def _read_chunk(data: "Union[bytes, str]", chunk_index: int, chunk_bytes: int, total_size: int) -> bytes:
-    """Reads one chunk's worth of bytes at the right offset -- straight out
-    of ``data`` if it's already bytes, or from disk (never loading the whole
-    file into memory) if it's a path."""
-    start = chunk_index * chunk_bytes
-    end = min(start + chunk_bytes, total_size)
-    if isinstance(data, (bytes, bytearray)):
-        return bytes(data[start:end])
-    with open(data, "rb") as f:
-        f.seek(start)
-        return f.read(end - start)
 
 
 class AxoEndpointClient:
@@ -163,108 +144,6 @@ class AxoEndpointClient:
             payload=b"",
         ))
 
-    def create_bucket(self, name: str, quota_bytes: int) -> CommandResult:
-        """Declares a named, quota-enforced namespace to register data into --
-        DATA_REGISTER with a "{bucket}/{key}" name rejects once the bucket
-        would exceed quota_bytes. Leader-gated, like register_data."""
-        return self._send(Command(
-            operation=BUCKET_REGISTER,
-            content_type="application/json",
-            envelope={"name": name, "quota_bytes": quota_bytes},
-        ))
-
-    def register_data(
-        self,
-        name: str,
-        version: int,
-        total_size: int,
-        chunk_bytes: int,
-        format: str = "raw",
-        kind: str = "fs",
-        content_hash: Optional[str] = None,
-        content_hash_algo: str = "sha256",
-    ) -> CommandResult:
-        """Declares a piece of data's metadata ahead of the actual bytes.
-        The response's ``leader_rpc_uri`` is exactly where to send the
-        following DATA_CHUNK_PUT/DATA_STATUS calls -- those two ops are
-        never leader-proxied, unlike this one."""
-        envelope: Dict[str, Any] = {
-            "name": name, "version": version, "format": format, "kind": kind,
-            "total_size": total_size, "chunk_bytes": chunk_bytes,
-        }
-        if content_hash is not None:
-            envelope["content_hash"] = content_hash
-            envelope["content_hash_algo"] = content_hash_algo
-        return self._send(Command(operation=DATA_REGISTER, content_type="application/json", envelope=envelope))
-
-    def put_data_chunk(self, name: str, version: int, chunk_index: int, chunk: bytes) -> CommandResult:
-        return self._send(Command(
-            operation=DATA_CHUNK_PUT,
-            content_type="application/octet-stream",
-            envelope={"name": name, "version": version, "chunk_index": chunk_index},
-            payload=chunk,
-        ))
-
-    def data_status(self, name: str, version: int) -> CommandResult:
-        return self._send(Command(
-            operation=DATA_STATUS, content_type="application/json", envelope={"name": name, "version": version},
-        ))
-
-    def data_info(self, name: str, version: int) -> CommandResult:
-        return self._send(Command(
-            operation=DATA_INFO, content_type="application/json", envelope={"name": name, "version": version},
-        ))
-
-    def upload_data(
-        self,
-        name: str,
-        version: int,
-        data: Union[bytes, str],
-        format: str = "raw",
-        kind: str = "fs",
-        chunk_bytes: int = DEFAULT_CHUNK_BYTES,
-        resume: bool = True,
-    ) -> CommandResult:
-        """Registers then chunk-uploads data, reading a file path
-        chunk-by-chunk if ``data`` is a path (never loading the whole file
-        into memory) or slicing straight out of ``data`` if it's already
-        bytes. Resumable: with resume=True, asks the leader what it already
-        has via DATA_STATUS and only sends what's missing."""
-        total_size = len(data) if isinstance(data, (bytes, bytearray)) else os.path.getsize(data)
-
-        register_result = self.register_data(
-            name, version, total_size=total_size, chunk_bytes=chunk_bytes, format=format, kind=kind,
-        )
-        if not register_result.ok:
-            return register_result
-
-        leader_rpc_uri = register_result.metadata.get("leader_rpc_uri")
-        total_chunks = register_result.metadata["total_chunks"]
-        leader = self if leader_rpc_uri in (None, self._address) else AxoEndpointClient(
-            leader_rpc_uri, timeout_ms=self._timeout_ms,
-        )
-        try:
-            present: List[int] = []
-            if resume:
-                status_result = leader.data_status(name, version)
-                if status_result.ok:
-                    present = status_result.metadata.get("present_chunk_indices", [])
-
-            missing = [i for i in range(total_chunks) if i not in present]
-            last_result = register_result
-            for chunk_index in missing:
-                chunk = _read_chunk(data, chunk_index, chunk_bytes, total_size)
-                last_result = leader.put_data_chunk(name, version, chunk_index, chunk)
-                if not last_result.ok:
-                    return last_result
-
-            if not missing:
-                last_result = leader.data_status(name, version)
-            return last_result
-        finally:
-            if leader is not self:
-                leader.close()
-
     def submit_job(
         self,
         user_id: str,
@@ -282,6 +161,11 @@ class AxoEndpointClient:
                 "function_name": function_name,
                 "function_version": version,
                 "params": params or {},
+                # The job acts for this user: axo_storage checks their bucket
+                # access for the job's dataio.
+                "acting_user_id": user_id,
+                "started_by_type": "user",
+                "started_by_id": user_id,
             },
             payload=b"",
         ))

@@ -3,17 +3,9 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, Optional, Union
 
-from axo_vem.application.projector import (
-    bucket_handler,
-    choreography_handler,
-    compute_handler,
-    identity_handler,
-    job_handler,
-    workspace_handler,
-)
+from axo_vem.application.projector import choreography_handler, compute_handler, job_handler
 from axo_vem.application.projector.handlers import ProjectorHandlers
 from axo_vem.domain.events import models
-from axo_vem.domain.events.publisher import EventPublisher
 from axo_vem.infrastructure.transport.ws.broadcaster import Broadcaster
 from axo_vem.log import DumbLogger, Log
 from axo_vem.log.catalog import Component, Event
@@ -33,14 +25,25 @@ _ENTITY_ID_FIELDS = (
 # Job* events have their own dedicated jobs collection (job_handler.py) and
 # are deliberately NOT in this set.
 ACTIVITY_ONLY_EVENT_TYPES = frozenset({
+    models.VE_SETTINGS_CHANGED,         # who changed which setting, and why
+    models.ENDPOINT_LIFECYCLE_CHANGED,  # every endpoint state change, with its reason
+    models.VE_LIFECYCLE_CHANGED,        # stop / start / restore / delete of the whole VE
+    models.POLICY_SAVED, models.POLICY_DELETED, models.POLICIES_PAUSED,
+    models.POLICY_DECISION_RECORDED,    # what a scaling policy did, and why
     models.FUNCTION_DELETE_FAILED,
     models.FUNCTION_BUILD_STARTED, models.FUNCTION_BUILD_COMPLETED, models.FUNCTION_BUILD_FAILED,
 })
 
-_USER_PROFILE_EVENT_TYPES = identity_handler.UPSERT_EVENT_TYPES | {models.USER_PROFILE_DELETED}
-_VIRTUAL_ENV_EVENT_TYPES = frozenset({
+# No longer projected by a single-VE VEM: profiles and VEs belong to the
+# Control Plane, buckets to axo_storage, and an endpoint's VE is fixed at
+# launch. Skipped quietly (not ValueError) so an older event log replays
+# cleanly.
+LEGACY_EVENT_TYPES = frozenset({
+    models.ENDPOINT_VIRTUAL_ENV_ASSIGNED, models.ENDPOINT_VIRTUAL_ENV_DETACHED,
+    models.USER_PROFILE_CREATED, models.USER_PROFILE_UPDATED, models.USER_PROFILE_DELETED,
     models.VIRTUAL_ENV_CREATED, models.VIRTUAL_ENV_UPDATED, models.VIRTUAL_ENV_DELETED,
     models.VIRTUAL_ENV_LEADER_CHANGED,
+    models.DATA_BUCKET_CREATED, models.DATA_REGISTERED, models.DATA_UPLOAD_COMPLETED, models.DATA_DELETED,
 })
 
 # Every event type apply_event recognizes -- checked up front so an
@@ -50,14 +53,13 @@ _ALL_KNOWN_EVENT_TYPES = (
     compute_handler.ENDPOINT_EVENT_TYPES | compute_handler.FUNCTION_EVENT_TYPES
     | {models.FUNCTION_DELETED, models.FUNCTION_ENDPOINT_DETACHED}
     | ACTIVITY_ONLY_EVENT_TYPES | compute_handler.CONSENSUS_EVENT_TYPES
-    | _USER_PROFILE_EVENT_TYPES | _VIRTUAL_ENV_EVENT_TYPES | job_handler.JOB_EVENT_TYPES
-    | bucket_handler.BUCKET_EVENT_TYPES | choreography_handler.CHOREOGRAPHY_EVENT_TYPES
+    | job_handler.JOB_EVENT_TYPES | choreography_handler.CHOREOGRAPHY_EVENT_TYPES
 )
 
 
 def apply_event(
     handlers: ProjectorHandlers, event_type: str, data: Dict[str, Any], broadcaster: Optional[Broadcaster] = None,
-    logger: _Logger = None, event_publisher: Optional[EventPublisher] = None,
+    logger: _Logger = None,
 ) -> None:
     """Dispatches one decoded (event_type, data) pair to the right
     aggregate handler. endpoint_id is read out of `data` itself rather than
@@ -78,11 +80,13 @@ def apply_event(
     ``logger`` defaults to a no-op DumbLogger for the same reason. On
     success this is the single place that logs EVENT_APPLIED for every
     entity type this projector handles -- one log line here covers
-    endpoints/functions/consensus/profiles/virtual-environments/jobs/buckets
+    endpoints/functions/consensus/jobs/choreographies
     without threading a logger through each of the per-type handler modules
     individually."""
     _logger: _Logger = logger or DumbLogger()
 
+    if event_type in LEGACY_EVENT_TYPES:
+        return
     if event_type not in _ALL_KNOWN_EVENT_TYPES:
         raise ValueError(f"unknown event_type: {event_type!r}")
 
@@ -95,19 +99,11 @@ def apply_event(
         compute_handler.apply(
             handlers.endpoint_repository, handlers.function_repository, handlers.consensus_recorder,
             event_type, data, broadcaster,
-            virtual_environment_repository=handlers.virtual_environment_repository,
-            event_publisher=event_publisher,
         )
     elif event_type in ACTIVITY_ONLY_EVENT_TYPES:
         pass  # already recorded above; no other aggregate handler to route to
-    elif event_type in _USER_PROFILE_EVENT_TYPES:
-        identity_handler.apply(handlers.user_profile_repository, event_type, data)
-    elif event_type in _VIRTUAL_ENV_EVENT_TYPES:
-        workspace_handler.apply(handlers.virtual_environment_repository, event_type, data)
     elif event_type in job_handler.JOB_EVENT_TYPES:
         job_handler.apply(handlers.job_repository, event_type, data)
-    elif event_type in bucket_handler.BUCKET_EVENT_TYPES:
-        bucket_handler.apply(handlers.bucket_repository, handlers.data_item_repository, event_type, data, broadcaster)
     elif event_type in choreography_handler.CHOREOGRAPHY_EVENT_TYPES:
         choreography_handler.apply(handlers.choreography_repository, event_type, data)
 

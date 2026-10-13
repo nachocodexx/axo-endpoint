@@ -17,13 +17,19 @@ from axo_shared.activity.models import (
     FUNCTION_STOPPED_EVENT,
     JOB_STARTED_EVENT,
 )
-from axo_endpoint.core.data import DataRegistry
-from axo_endpoint.core.dataio import resolve_io_request
-from axo_endpoint.core.storage.backend import StorageBackend
-from axo_endpoint.core.errors import FunctionNotFoundError, JobCancelledError, JobTimeoutError, WorkerCrashedError
+from axo_endpoint.core.dataio import DataIOResolver, DataIOUnavailableError
+from axo_endpoint.core.errors import (
+    AxoError,
+    FunctionExecError,
+    FunctionNotFoundError,
+    JobCancelledError,
+    JobTimeoutError,
+    WorkerCrashedError,
+)
 from axo_endpoint.core.events.bus import Event as BusEvent, EventBus
 from axo_endpoint.core.functions import FunctionRegistry
 from axo_endpoint.core.runtime import FunctionRuntime, FunctionRuntimeError, InvocationHandle
+from axo_endpoint.core.runtime.queue_deadlines import QueueDeadlines
 from axo_endpoint.core.storage.backend import StorageKey
 from axo_endpoint.log import DumbLogger, Log
 from axo_endpoint.log.catalog import Component, Event
@@ -51,8 +57,12 @@ class WorkerHandle:
         conn: Optional[Any] = None,
         request_queue: Optional["queue.Queue[Any]"] = None,
         max_duration_seconds: float = 0,
+        idle_ttl_seconds: Optional[float] = None,
     ) -> None:
         self.function_id = function_id
+        # From RuntimeSpec.idle_ttl_seconds: None = the sweep's default,
+        # negative = never reaped for idleness (always warm).
+        self.idle_ttl_seconds = idle_ttl_seconds
         self.version = version
         self.process = process
         self.conn = conn
@@ -83,8 +93,13 @@ class WorkerHandle:
         self.invocation_count += 1
 
     def is_idle(self, ttl_seconds: float, now: float) -> bool:
-        """Checks whether this worker has been unused for too long."""
-        return not self.busy and now - self.last_used > ttl_seconds
+        """Checks whether this worker has been unused for too long --
+        against its function's own idle_ttl_seconds when set, else
+        ttl_seconds (the endpoint default)."""
+        ttl = self.idle_ttl_seconds if self.idle_ttl_seconds is not None else ttl_seconds
+        if ttl < 0:
+            return False
+        return not self.busy and now - self.last_used > ttl
 
     def exceeded_max_invocations(self, max_invocations: int) -> bool:
         """Checks whether this worker has handled too many calls and should be recycled."""
@@ -195,18 +210,18 @@ class ProcessFunctionRuntime(FunctionRuntime):
         scratch_root: str = "/tmp/axo_endpoint/scratch",
         memory_limit_bytes: int = 512 * 1024 * 1024,
         cpu_limit_seconds: int = 30,
-        storage_backends: Optional[Dict[str, StorageBackend]] = None,
-        data_registry: Optional[DataRegistry] = None,
+        dataio: Optional[DataIOResolver] = None,
         event_bus: Optional[EventBus] = None,
+        queue_deadlines: Optional[QueueDeadlines] = None,
         logger: _Logger = None,
     ) -> None:
         self._function_registry  = function_registry
+        self._queue_deadlines    = queue_deadlines or QueueDeadlines()
         self._on_complete        = on_complete
         self._scratch_root       = scratch_root
         self._memory_limit_bytes = memory_limit_bytes
         self._cpu_limit_seconds  = cpu_limit_seconds
-        self._storage_backends   = storage_backends or {}
-        self._data_registry      = data_registry
+        self._dataio             = dataio
         self._event_bus          = event_bus
         self._workers            = WorkerRegistry()
         self._spawn_lock         = threading.Lock()
@@ -242,6 +257,14 @@ class ProcessFunctionRuntime(FunctionRuntime):
                 return Err(spawn_result.unwrap_err())
             handle = spawn_result.unwrap()
 
+        accepted = InvocationHandle(job_id=job_id, function_id=function_ref.id, version=function_ref.version)
+        rejected = self._queue_deadlines.admit(job_id, runner_free=not handle.busy and handle.request_queue.empty())
+        if rejected is not None:
+            # max_wait=0 and the job would have to queue: finish it as
+            # timed_out_in_queue (recorded, never billed) rather than refuse it.
+            self._on_complete(accepted, Err(rejected))
+            return Ok(accepted)
+
         handle.request_queue.put((job_id, params))
         self._logger.debug_event(
             Event.Runtime.JOB_INVOKED,
@@ -250,7 +273,7 @@ class ProcessFunctionRuntime(FunctionRuntime):
             job_id=job_id,
             params_keys=list(params.keys()),
         )
-        return Ok(InvocationHandle(job_id=job_id, function_id=function_ref.id, version=function_ref.version))
+        return Ok(accepted)
 
     def _max_concurrency_for(self, function_ref: StorageKey) -> int:
         """Looks up the function's configured RuntimeSpec.max_concurrency,
@@ -300,6 +323,7 @@ class ProcessFunctionRuntime(FunctionRuntime):
             function_id=function_ref.id, version=function_ref.version,
             process=process, conn=parent_conn, request_queue=queue.Queue(),
             max_duration_seconds=record.runtime_spec.max_duration_seconds if record.runtime_spec else 0,
+            idle_ttl_seconds=record.runtime_spec.idle_ttl_seconds if record.runtime_spec else None,
         )
         self._workers.register(handle)
         self._logger.debug_event(
@@ -392,6 +416,13 @@ class ProcessFunctionRuntime(FunctionRuntime):
                 break
             job_id, params = item
 
+            late = self._queue_deadlines.take(job_id, time.time())
+            if late is not None:
+                self._on_complete(
+                    InvocationHandle(job_id=job_id, function_id=handle.function_id, version=handle.version), Err(late),
+                )
+                continue
+
             handle.busy = True
             handle.current_job_id = job_id
             scratch_dir = allocate_scratch_dir(self._scratch_root, job_id)
@@ -445,13 +476,13 @@ class ProcessFunctionRuntime(FunctionRuntime):
                         break
                     elif kind == "io_request":
                         _, request_id, op, ref, io_data = message
-                        result = resolve_io_request(op, ref, io_data, self._storage_backends, self._data_registry)
+                        result = self._resolve_io(job_id, op, ref, io_data)
                         self._logger.debug_event(
                             Event.DataIO.REQUEST_RECEIVED if result.is_ok else Event.DataIO.REQUEST_FAILED,
                             component=Component.DATAIO,
                             job_id=job_id,
                             op=op,
-                            ref_kind=ref.kind,
+                            bucket=ref.bucket,
                         )
                         reply = ("io_reply", request_id, "ok", result.unwrap()) if result.is_ok \
                             else ("io_reply", request_id, "err", str(result.unwrap_err()))
@@ -469,7 +500,7 @@ class ProcessFunctionRuntime(FunctionRuntime):
                 if status == "ok":
                     self._on_complete(invocation_handle, Ok(payload), result_warnings)
                 else:
-                    self._on_complete(invocation_handle, Err(FunctionRuntimeError(payload)), result_warnings)
+                    self._on_complete(invocation_handle, Err(FunctionExecError(payload)), result_warnings)
             finally:
                 cleanup_scratch_dir(scratch_dir)
                 handle.busy = False
@@ -479,6 +510,12 @@ class ProcessFunctionRuntime(FunctionRuntime):
             handle.conn.close()
         except OSError:
             pass
+
+    def _resolve_io(self, job_id: str, op: str, ref: Any, data: Optional[bytes]):
+        """One dataio request from the running function, answered via axo_storage."""
+        if self._dataio is None:
+            return Err(DataIOUnavailableError("this endpoint has no axo_storage configured", context={"op": op}))
+        return self._dataio.resolve(job_id, op, ref, data)
 
     def cancel(self, job_id: str) -> bool:
         """Stops job_id: kills its worker (SIGKILL, same as _handle_timeout)
@@ -529,8 +566,16 @@ class ProcessFunctionRuntime(FunctionRuntime):
             return True
 
         # Not currently dispatched to any worker -- it may still be queued
-        # behind one. Drain and rebuild each worker's queue in place, minus
-        # job_id, rather than touching the worker itself.
+        # behind one.
+        return self.drop_queued(job_id, JobCancelledError(
+            "job was cancelled before it started", context={"job_id": job_id},
+        ))
+
+    def drop_queued(self, job_id: str, error: AxoError) -> bool:
+        """Finishes job_id with ``error`` if it is still waiting in some
+        worker's queue (never touches a running job). Drains and rebuilds
+        each worker's queue in place, minus job_id, rather than touching the
+        worker itself. Used by cancel() and by the max_wait sweep."""
         for candidate in self._workers.list_handles():
             remaining: List[Tuple[str, Dict[str, Any]]] = []
             found = False
@@ -552,14 +597,13 @@ class ProcessFunctionRuntime(FunctionRuntime):
                     function_id=candidate.function_id,
                     job_id=job_id,
                     status="queued",
+                    reason=error.name,
                 )
+                self._queue_deadlines.discard(job_id)
                 invocation_handle = InvocationHandle(
                     job_id=job_id, function_id=candidate.function_id, version=candidate.version,
                 )
-                self._on_complete(invocation_handle, Err(JobCancelledError(
-                    "job was cancelled before it started",
-                    context={"function_id": candidate.function_id, "job_id": job_id},
-                )))
+                self._on_complete(invocation_handle, Err(error))
                 return True
         return False
 

@@ -22,13 +22,13 @@ from axo_endpoint.service.consensus_loop import (
     CLUSTER_QUORUM_LOST_EVENT,
     CLUSTER_QUORUM_RESTORED_EVENT,
 )
-from axo_endpoint.service.transport.event_publisher import ZmqEventPublisher
+from axo_endpoint.service.transport.reliable_event_publisher import ReliableEventPublisher
 
 _Logger = Union[Log, DumbLogger]
 
 
 class ExternalEventForwardingBridge:
-    """Bridges the internal event bus <-> ZmqEventPublisher, translating
+    """Bridges the internal event bus <-> ReliableEventPublisher, translating
     already-emitted internal lifecycle events into the axo_shared.events
     taxonomy and forwarding them to axo_vem. Same one-method-
     per-event-group shape as ActivityTrackingBridge -- a separate bridge
@@ -43,7 +43,7 @@ class ExternalEventForwardingBridge:
 
     def __init__(
         self,
-        publisher: ZmqEventPublisher,
+        publisher: ReliableEventPublisher,
         endpoint_id: str,
         results: StorageBackend,
         function_registry: FunctionRegistry,
@@ -140,9 +140,10 @@ class ExternalEventForwardingBridge:
         record = self._get_function_record(function_id, version)
         params_schema = params_schema_to_list(record.params_schema) if record else None
         env_vars = record.runtime_spec.env_vars if record and record.runtime_spec else None
+        runtime_spec = record.runtime_spec.to_dict() if record and record.runtime_spec else None
         self._publish(event_models.FUNCTION_UPDATED, event_models.FunctionUpdated(
             endpoint_id=self._endpoint_id, function_id=function_id, version=version,
-            params_schema=params_schema, env_vars=env_vars,
+            params_schema=params_schema, env_vars=env_vars, runtime_spec=runtime_spec,
         ))
 
     def on_function_register_failed(self, event: Event) -> None:
@@ -377,57 +378,6 @@ class ExternalEventForwardingBridge:
         self._publish(event_models.FUNCTION_DEACTIVATED, event_models.FunctionDeactivated(
             endpoint_id=self._endpoint_id, function_id=function_id, version=version,
             state=state, runtime_type=runtime_type,
-        ))
-
-    # ── data & buckets ───────────────────────────────────────────────────────
-
-    def on_bucket_registered(self, event: Event) -> None:
-        """Subscribed to BUCKET_REGISTERED_EVENT (BucketRegistry.register())."""
-        self._publish(event_models.DATA_BUCKET_CREATED, event_models.DataBucketCreated(
-            endpoint_id=self._endpoint_id,
-            name=event.payload["name"],
-            quota_bytes=event.payload["quota_bytes"],
-        ))
-
-    def on_data_registered(self, event: Event) -> None:
-        """Subscribed to DATA_REGISTERED_EVENT (DataRegistry.register()/
-        finalize_stream()). The bus payload carries format/kind/total_size
-        directly (extended alongside this bridge method -- previously only
-        data_id/version/total_chunks, too thin to forward a complete
-        DataRegistered event without a registry lookup this bridge doesn't
-        hold a reference for)."""
-        self._publish(event_models.DATA_REGISTERED, event_models.DataRegistered(
-            endpoint_id=self._endpoint_id,
-            name=event.payload["data_id"],
-            version=event.payload["version"],
-            format=event.payload["format"],
-            kind=event.payload["kind"],
-            total_size=event.payload["total_size"],
-            total_chunks=event.payload["total_chunks"],
-        ))
-
-    def on_data_upload_completed(self, event: Event) -> None:
-        """Subscribed to DATA_UPLOAD_COMPLETED_EVENT (DataRegistry.store_chunk()/
-        register()/finalize_stream(), fired once this node has every chunk of
-        a record present locally). Thin on purpose -- name/version is all the
-        bucket read model needs to flip a DataItem from "pending" to
-        "ready"."""
-        self._publish(event_models.DATA_UPLOAD_COMPLETED, event_models.DataUploadCompleted(
-            endpoint_id=self._endpoint_id,
-            name=event.payload["data_id"],
-            version=event.payload["version"],
-        ))
-
-    def on_data_deleted(self, event: Event) -> None:
-        """Subscribed to DATA_DELETED_EVENT (DataRegistry.delete(), fired by
-        the node that actually served the DATA_DELETE command and, again,
-        independently by every follower once replication applies the
-        tombstone locally -- see DataRegistrySyncBridge.apply_incoming()).
-        Thin on purpose, same reasoning as on_data_upload_completed."""
-        self._publish(event_models.DATA_DELETED, event_models.DataDeleted(
-            endpoint_id=self._endpoint_id,
-            name=event.payload["data_id"],
-            version=event.payload["version"],
         ))
 
     # ── consensus ────────────────────────────────────────────────────────────

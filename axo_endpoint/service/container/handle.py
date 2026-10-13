@@ -41,6 +41,13 @@ class ContainerHandle:
     # per-(function, version) constant) -- the pump doesn't otherwise have
     # access to the RuntimeSpec. 0 = unlimited, same convention as the spec.
     max_duration_seconds: float = 0
+    # Stashed from RuntimeSpec.idle_ttl_seconds: None = the sweep's default,
+    # negative = never dismissed for idleness (always warm).
+    idle_ttl_seconds: Optional[float] = None
+    # What this runner reserves out of its endpoint's budget (see
+    # ContainerSummoner's runner budget). Also its Docker limits.
+    cpu_cores: float = 0.0
+    memory_bytes: int = 0
     ready_event: threading.Event = field(default_factory=threading.Event)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     # The job_id currently dispatched to this container, if any -- set right

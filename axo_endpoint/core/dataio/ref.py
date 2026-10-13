@@ -6,30 +6,31 @@ from typing import Any, Dict, Optional
 
 @dataclass(frozen=True)
 class IORef:
-    """Points at one blob a function can read or write via the dataio channel.
+    """Points at one object in axo_storage: ``bucket`` + ``name`` +
+    ``version``. Every object lives in a bucket.
 
-    ``kind`` selects which blob backend resolves it (only "fs" exists today).
-    ``format`` selects the (de)serializer applied client-side, after the raw
-    bytes have crossed the wire -- the endpoint only ever moves raw bytes.
-    ``chunk_index`` is only meaningful for the "read_chunk" op (chunk-by-chunk
-    reads of registered data) -- None for every other op, including ordinary
-    whole-blob read/write.
+    - ``version`` None: a read gets the latest COMPLETE version; a write
+      creates the next version. Versions never change once complete.
+    - ``format`` selects the (de)serializer, applied inside the worker /
+      container -- the endpoint only ever moves raw bytes.
+    - ``chunk_index`` is only used by the chunk-by-chunk ops.
     """
 
-    kind: str
-    location: str
+    bucket: str
+    name: str
+    version: Optional[int] = None
     format: str = "raw"
     chunk_index: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "kind": self.kind, "location": self.location, "format": self.format,
-            "chunk_index": self.chunk_index,
+            "bucket": self.bucket, "name": self.name, "version": self.version,
+            "format": self.format, "chunk_index": self.chunk_index,
         }
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "IORef":
         return IORef(
-            kind=d["kind"], location=d["location"], format=d.get("format", "raw"),
-            chunk_index=d.get("chunk_index"),
+            bucket=d["bucket"], name=d["name"], version=d.get("version"),
+            format=d.get("format", "raw"), chunk_index=d.get("chunk_index"),
         )

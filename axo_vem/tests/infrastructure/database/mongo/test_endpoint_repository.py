@@ -39,52 +39,39 @@ def test_get_maps_pub_bind_and_status():
     assert endpoint.status == "running"
 
 
-def test_list_by_virtual_environment_maps_pub_bind_and_status():
+def test_list_all_maps_pub_bind_and_status():
     repository = _repository()
     repository._collection.insert_one({
         "_id": "n0", "router_bind": "tcp://0.0.0.0:5555", "virtual_environment_id": "ve1",
         "created_at": "2026-01-01T00:00:00", "pub_bind": "tcp://0.0.0.0:5556", "status": "unreachable",
     })
 
-    endpoints = repository.list_by_virtual_environment("ve1")
+    endpoints = repository.list_all()
 
     assert endpoints[0].pub_bind == "tcp://0.0.0.0:5556"
     assert endpoints[0].status == "unreachable"
 
 
-def test_list_by_virtual_environment_orders_most_recently_seen_first():
+def test_list_all_orders_most_recently_seen_first():
     repository = _repository()
     repository._collection.insert_many([
         {"_id": "n0", "router_bind": "tcp://0.0.0.0:5555", "virtual_environment_id": "ve1", "created_at": "2026-01-01T00:00:00"},
         {"_id": "n1", "router_bind": "tcp://0.0.0.0:5555", "virtual_environment_id": "ve1", "created_at": "2026-01-03T00:00:00"},
         {"_id": "n2", "router_bind": "tcp://0.0.0.0:5555", "virtual_environment_id": "ve1", "created_at": "2026-01-02T00:00:00"},
-        {"_id": "n3", "router_bind": "tcp://0.0.0.0:5555", "virtual_environment_id": "ve-other", "created_at": "2026-01-04T00:00:00"},
     ])
 
-    endpoints = repository.list_by_virtual_environment("ve1")
+    endpoints = repository.list_all()
 
     assert [e.endpoint_id for e in endpoints] == ["n1", "n2", "n0"]
 
 
-def test_list_by_virtual_environment_tie_breaks_by_endpoint_id_ascending():
+def test_list_all_tie_breaks_by_endpoint_id_ascending():
     repository = _repository()
     repository._collection.insert_many([
         {"_id": "n9", "router_bind": "tcp://0.0.0.0:5555", "virtual_environment_id": "ve1", "created_at": "2026-01-01T00:00:00"},
         {"_id": "n1", "router_bind": "tcp://0.0.0.0:5555", "virtual_environment_id": "ve1", "created_at": "2026-01-01T00:00:00"},
     ])
 
-    endpoints = repository.list_by_virtual_environment("ve1")
+    endpoints = repository.list_all()
 
     assert [e.endpoint_id for e in endpoints] == ["n1", "n9"]
-
-
-def test_list_by_virtual_environment_excludes_detached_endpoints():
-    """EndpointVirtualEnvironmentDetached's event leaves virtual_environment_id
-    at its EventEnvelope default of None -- the projector's $set upsert nulls
-    the doc's field, so a detached endpoint must not appear here."""
-    repository = _repository()
-    repository._collection.insert_one({
-        "_id": "n0", "router_bind": "tcp://0.0.0.0:5555", "virtual_environment_id": None, "created_at": "2026-01-01T00:00:00",
-    })
-
-    assert repository.list_by_virtual_environment("ve1") == []

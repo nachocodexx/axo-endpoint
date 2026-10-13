@@ -1,0 +1,28 @@
+[tool.poetry]
+name = "axo_storage"
+version = "0.1.0"
+description = "Platform bucket service -- every dataset lives here; endpoints only keep an ephemeral chunk cache"
+authors = ["Ignacio Castillo <ignacio.bcastillo@gmail.com>"]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<4"
+pyzmq = "^26.0.3"
+option = ">=2.1.0,<3.0.0"
+python-dotenv = "^1.0.1"
+rich = "^15.0.0"
+httpx = "^0.27.0"
+axo_shared = {path = "../axo_shared", develop = true}
+
+[tool.poetry.scripts]
+axo-storage = "axo_storage.cli:main"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.2.2"
+pytest-cov = "^7.1.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
