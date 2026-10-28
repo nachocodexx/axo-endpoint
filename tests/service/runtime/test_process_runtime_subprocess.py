@@ -12,76 +12,75 @@ from axo_endpoint.service.runtime.process_runtime import ProcessFunctionRuntime
 from axo_shared.runtime.spec import RuntimeSpec
 
 
-def _get_pid(params, ctx):
+def _get_pid():
     import os
 
     return os.getpid()
 
 
-def _crash_once(params, ctx):
+def _crash_once(marker):
     import os
 
-    marker = params["marker"]
     if not os.path.exists(marker):
         open(marker, "w").close()
         os._exit(1)
     return "recovered"
 
 
-def _maybe_raise(params, ctx):
+def _maybe_raise(boom=False):
     import os
 
-    if params.get("boom"):
+    if boom:
         raise ValueError("boom")
     return os.getpid()
 
 
-def _report_scratch_dir(params, ctx):
+def _report_scratch_dir(ctx):
     import os
 
     return {"scratch_dir": ctx.scratch_dir, "existed_during_call": os.path.isdir(ctx.scratch_dir)}
 
 
-def _allocate_too_much_memory(params, ctx):
+def _allocate_too_much_memory():
     data = bytearray(200 * 1024 * 1024)  # 200MB, expected to exceed a tight test rlimit
     return len(data)
 
 
-def _busy_loop(params, ctx):
+def _busy_loop():
     x = 0
     while True:
         x += 1
 
 
-def _dataio_roundtrip(params, ctx):
+def _dataio_roundtrip(name, format, value):
     from axo_endpoint import dataio
 
-    ref = IORef(bucket="lab", name=params["name"], format=params["format"])
-    dataio.write(params["value"], ref)
+    ref = IORef(bucket="lab", name=name, format=format)
+    dataio.write(value, ref)
     return dataio.read(ref)
 
 
-def _dataio_write(params, ctx):
+def _dataio_write(name, value, bucket="lab", format="raw"):
     from axo_endpoint import dataio
 
-    ref = IORef(bucket=params.get("bucket", "lab"), name=params["name"], format=params.get("format", "raw"))
-    dataio.write(params["value"], ref)
+    ref = IORef(bucket=bucket, name=name, format=format)
+    dataio.write(value, ref)
     return "written"
 
 
-def _dataio_stream_roundtrip(params, ctx):
+def _dataio_stream_roundtrip(name):
     from axo_endpoint import dataio
 
-    ref = dataio.write_chunks(IORef(bucket="lab", name=params["name"]), [b"abcd", b"efgh"], chunk_bytes=4)
+    ref = dataio.write_chunks(IORef(bucket="lab", name=name), [b"abcd", b"efgh"], chunk_bytes=4)
     return b"".join(dataio.iter_chunks(ref))
 
 
-def _dataio_then_crash(params, ctx):
+def _dataio_then_crash(name):
     import os
 
     from axo_endpoint import dataio
 
-    ref = IORef(bucket="lab", name=params["name"], format="raw")
+    ref = IORef(bucket="lab", name=name, format="raw")
     dataio.write(b"before-crash", ref)
     result = dataio.read(ref)
     assert result == b"before-crash"
@@ -130,7 +129,7 @@ def _wait_until(predicate, timeout=5.0):
 
 
 def test_invoke_runs_registered_function_and_reports_result(registry, tmp_path):
-    key = _register(registry, "add", lambda params, ctx: params["a"] + params["b"])
+    key = _register(registry, "add", lambda a, b: a + b)
     runtime, completions = _make_runtime(registry, str(tmp_path / "scratch"))
     print("COMPLETIONS BEFORE INVOKE:", completions)
     result = runtime.invoke(key, "job1", {"a": 2, "b": 3})
@@ -146,7 +145,7 @@ def test_invoke_runs_registered_function_and_reports_result(registry, tmp_path):
 
 
 def test_worker_env_vars_from_runtime_spec_are_applied_before_cold_start(registry, tmp_path):
-    def _read_env(params, ctx):
+    def _read_env():
         import os
         return os.environ.get("AXO_TEST_VAR")
 
@@ -167,8 +166,8 @@ def test_invoke_runs_a_source_format_function_via_deferred_exec(registry, tmp_pa
         f"MARKER_PATH = {str(marker)!r}\n"
         "with open(MARKER_PATH, 'w') as f:\n"
         "    f.write('exec happened')\n\n"
-        "def add(params, ctx):\n"
-        "    return params['a'] + params['b']\n"
+        "def add(a, b):\n"
+        "    return a + b\n"
     ).encode()
 
     assert not marker.exists()
@@ -270,11 +269,11 @@ def test_rlimit_cpu_kills_busy_loop_and_marks_invocation_failed(registry, tmp_pa
     assert completions[0][1].is_err
 
 
-def _sleep_then_pid(params, ctx):
+def _sleep_then_pid(sleep_seconds):
     import os
     import time
 
-    time.sleep(params["sleep_seconds"])
+    time.sleep(sleep_seconds)
     return os.getpid()
 
 

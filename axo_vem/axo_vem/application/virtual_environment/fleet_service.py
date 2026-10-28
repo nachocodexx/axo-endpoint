@@ -8,7 +8,7 @@ from typing import Callable, List, Optional
 
 from axo_vem.domain.events import models
 from axo_vem.domain.events.publisher import EventPublisher
-from axo_vem.domain.virtual_environment.fleet import Fleet, ManagedEndpoint, stream_name
+from axo_vem.domain.virtual_environment.fleet import FAILED, FORGOTTEN, REMOVED, Fleet, ManagedEndpoint, stream_name
 
 
 class FleetService:
@@ -72,6 +72,20 @@ class FleetService:
         for listener in self._listeners:
             listener(endpoint)
         return endpoint
+
+    def forget(self, endpoint_id: str, by: Optional[str] = None) -> bool:
+        """Drops a removed / failed endpoint from the fleet for good (its
+        list entry). Anything else stays; False if there was nothing to drop."""
+        with self._lock:
+            current = self._fleet.get(endpoint_id)
+            if current is None or current.state not in (REMOVED, FAILED):
+                return False
+            self.record(endpoint_id, FORGOTTEN, f"forgotten by {by}" if by else "forgotten")
+            return True
+
+    def is_forgotten(self, endpoint_id: str) -> bool:
+        with self._lock:
+            return self._fleet.is_forgotten(endpoint_id)
 
     def get(self, endpoint_id: str) -> Optional[ManagedEndpoint]:
         with self._lock:

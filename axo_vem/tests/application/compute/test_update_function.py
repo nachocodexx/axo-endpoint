@@ -106,3 +106,26 @@ def test_execute_raises_upstream_timeout_once_every_candidate_is_exhausted(monke
 
     with pytest.raises(UpstreamTimeoutError):
         use_case.execute(function_id="add", version=1, current_user_id="user-1", env_vars={"FOO": "bar"})
+
+
+def test_a_runner_size_change_is_checked_and_an_empty_one_means_the_plans_default(monkeypatch):
+    from axo_vem.domain.compute.runner_size import MB, with_runner_size
+    from axo_vem.domain.errors import InvalidRequestError
+    from axo_vem.domain.virtual_environment.settings import PlanLimits
+
+    free = PlanLimits(runner_cpu_cores=0.5, runner_memory_mb=512, runner_max_cpu_cores=0.5, runner_max_memory_mb=512)
+    function = Function(function_id="add", version=1, endpoint_id=["n0"], runtime_spec={"type": "container"})
+    endpoint = Endpoint(endpoint_id="n0", router_bind="tcp://0.0.0.0:5555")
+    use_case = UpdateFunctionUseCase(_FakeFunctionRepository(function), _FakeEndpointRepository([endpoint]), 0.3,
+                                     runner_size=lambda spec: with_runner_size(spec, free, 1.0, 1024))
+    captured = {}
+    monkeypatch.setattr(update_function_module, "send_command",
+                        lambda uri, command, timeout: captured.update(envelope=command.envelope) or Ok(CommandResult(ok=True)))
+
+    with pytest.raises(InvalidRequestError):
+        use_case.execute(function_id="add", version=1, current_user_id="u", runtime={"cpu_limit": 2.0})
+    assert captured == {}                                  # nothing sent
+
+    use_case.execute(function_id="add", version=1, current_user_id="u",
+                     runtime={"cpu_limit": None, "memory_limit_bytes": None, "max_attempts": 2})
+    assert captured["envelope"]["runtime"] == {"cpu_limit": 0.5, "memory_limit_bytes": 512 * MB, "max_attempts": 2}

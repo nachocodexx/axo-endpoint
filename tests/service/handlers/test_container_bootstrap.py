@@ -15,7 +15,7 @@ def registry():
 
 def test_bootstrap_returns_code_requirements_and_code_format(registry):
     registry.register(
-        function_id="add", name="add", code=b"def add(params, ctx): ...", now=100.0,
+        function_id="add", name="add", code=b"def add(a, b): ...", now=100.0,
         runtime_spec=RuntimeSpec(requirements=["pandas"]), code_format="source",
     )
     handler = ContainerBootstrapHandler(registry=registry)
@@ -26,8 +26,9 @@ def test_bootstrap_returns_code_requirements_and_code_format(registry):
     ))
 
     assert result.ok is True
-    assert result.payload == b"def add(params, ctx): ..."
-    assert result.metadata == {"requirements": ["pandas"], "code_format": "source", "name": "add"}
+    assert result.payload == b"def add(a, b): ..."
+    assert result.metadata == {"requirements": ["pandas"], "code_format": "source", "name": "add",
+                               "call_style": "kwargs"}
 
 
 def test_bootstrap_returns_the_record_name_not_the_function_id(registry):
@@ -37,7 +38,7 @@ def test_bootstrap_returns_the_record_name_not_the_function_id(registry):
     real name even when it differs from the id."""
     registry.register(
         function_id="377022c9ad309107a47495eb5599f711f8881837a888180f9b039a690ecb1bde",
-        name="fy", code=b"def fy(params, ctx): ...", now=100.0, code_format="source",
+        name="fy", code=b"def fy(x): ...", now=100.0, code_format="source",
     )
     handler = ContainerBootstrapHandler(registry=registry)
 

@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+from axo_shared.error_catalog import code_of
+
 
 class DomainError(Exception):
     """Expected failures of a Control Plane operation, mapped to one HTTP
-    status by the API layer. ``code`` is a stable machine-readable name."""
+    status by the API layer. ``code`` is a stable machine-readable name;
+    its number, description and hint live in the shared error catalog
+    (``axo_shared.error_catalog``, 95xx) -- add the entry with a new code."""
 
     status_code = 400
     code = "INVALID"
@@ -18,7 +22,7 @@ class DomainError(Exception):
         self.details = dict(details or {})
 
     def to_dict(self) -> Dict[str, Any]:
-        out: Dict[str, Any] = {"error": self.code, "message": self.message}
+        out: Dict[str, Any] = {"error": self.code, "error_code": code_of(self.code), "message": self.message}
         if self.details:
             out["details"] = self.details
         return out

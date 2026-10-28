@@ -1,4 +1,6 @@
 import time
+
+real_sleep = time.sleep
 from types import SimpleNamespace
 
 import pytest
@@ -29,6 +31,7 @@ class _FakeConfig:
     AXO_ENDPOINT_CONTAINER_RUNNER_IMAGE = "axo-runner"
     AXO_ENDPOINT_CONTAINER_AUTO_BUILD_IMAGE = True
     AXO_ENDPOINT_CONTAINER_READINESS_TIMEOUT_SECONDS = 0.3
+    AXO_ENDPOINT_CONTAINER_INSTALL_TIMEOUT_SECONDS = 0.6
     AXO_ENDPOINT_CONTAINER_MEMORY_LIMIT_BYTES = 1073741824
     AXO_ENDPOINT_CONTAINER_CPU_LIMIT = 1.0
     AXO_ENDPOINT_VIRTUAL_ENV_ID = None
@@ -239,6 +242,90 @@ def test_poll_readiness_timeout_emits_container_crashed(summoner, event_bus, mon
         "function_id": "fn1", "version": 1, "service_name": "fn-fn1-v1",
         "error_message": "container did not become ready within 0.3s",
     }
+
+
+def _answers(*replies):
+    """A fake requests.get giving these /health answers in turn (the last
+    one repeats): a status code alone, (code, json body), or an exception."""
+    queue = list(replies)
+
+    def get(url, timeout):
+        reply = queue.pop(0) if len(queue) > 1 else queue[0]
+        if isinstance(reply, Exception):
+            raise reply
+        code, body = reply if isinstance(reply, tuple) else (reply, None)
+        return SimpleNamespace(status_code=code, json=lambda: body if body is not None else (_ for _ in ()).throw(ValueError()))
+    return get
+
+
+def test_an_installing_runner_gets_the_install_limit_not_the_start_up_one(summoner, event_bus, monkeypatch):
+    """Installing packages isn't counted in the start-up limit: the runner
+    reports its stage at once, and from then on the (longer) install limit
+    applies -- 0.3 s start-up, 0.6 s install in the fake config."""
+    monkeypatch.setattr(spawner_module.time, "sleep", lambda s: real_sleep(0.1))
+    started = time.monotonic()
+    installing = (503, {"stage": "installing", "error": None})
+    replies = [installing] * 5 + [200]                       # ready after ~0.5 s: past 0.3, within 0.6
+    monkeypatch.setattr(spawner_module.requests, "get", _answers(*replies))
+
+    handle = _handle()
+    summoner._poll_readiness(handle)
+
+    assert handle.status == ContainerStatus.READY
+    assert time.monotonic() - started > 0.3
+
+
+def test_an_install_that_runs_out_of_time_says_so(summoner, event_bus, monkeypatch):
+    received = _collect(event_bus, CONTAINER_CRASHED_EVENT)
+    monkeypatch.setattr(spawner_module.time, "sleep", lambda s: real_sleep(0.05))
+    monkeypatch.setattr(spawner_module.requests, "get", _answers((503, {"stage": "installing", "error": None})))
+
+    handle = _handle()
+    summoner._poll_readiness(handle)
+
+    assert handle.status == ContainerStatus.CRASHED
+    assert handle.start_error == "container did not finish installing packages within 0.6s"
+    assert received[0].payload["error_message"] == handle.start_error
+
+
+def test_a_failed_install_ends_the_wait_at_once_with_the_runners_message(summoner, event_bus, monkeypatch):
+    monkeypatch.setattr(spawner_module.time, "sleep", lambda s: None)
+    failed = (503, {"stage": "failed", "error": "the packages couldn't be installed: ERROR: No matching distribution"})
+    monkeypatch.setattr(spawner_module.requests, "get", _answers((503, {"stage": "installing", "error": None}), failed))
+
+    started = time.monotonic()
+    handle = _handle()
+    summoner._poll_readiness(handle)
+
+    assert handle.status == ContainerStatus.CRASHED
+    assert handle.ready_event.is_set()
+    assert handle.start_error == "the packages couldn't be installed: ERROR: No matching distribution"
+    assert time.monotonic() - started < 0.2
+
+
+def test_a_runner_that_stops_while_installing_ends_the_wait(summoner, event_bus, monkeypatch):
+    monkeypatch.setattr(spawner_module.time, "sleep", lambda s: None)
+    gone = spawner_module.requests.RequestException("connection refused")
+    monkeypatch.setattr(spawner_module.requests, "get", _answers((503, {"stage": "installing", "error": None}), gone))
+    monkeypatch.setattr(summoner._spawner, "state", lambda mode, name: "exited")
+
+    handle = _handle()
+    summoner._poll_readiness(handle)
+
+    assert handle.status == ContainerStatus.CRASHED
+    assert handle.start_error == "the runner stopped while installing packages"
+
+
+def test_an_older_runner_that_only_answers_when_ready_keeps_the_start_up_limit(summoner, event_bus, monkeypatch):
+    """No start-up stage in the answer (an older runner image): the first
+    limit covers everything, as before."""
+    monkeypatch.setattr(spawner_module.time, "sleep", lambda s: real_sleep(0.05))
+    monkeypatch.setattr(spawner_module.requests, "get", _answers((503, {"detail": "bootstrapping"})))
+
+    handle = _handle()
+    summoner._poll_readiness(handle)
+
+    assert handle.start_error == "container did not become ready within 0.3s"
 
 
 def test_summon_stops_and_removes_stale_crashed_container_before_respawning(summoner, event_bus, monkeypatch):

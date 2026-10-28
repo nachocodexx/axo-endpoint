@@ -24,7 +24,11 @@ from axo_vem.domain.virtual_environment.fleet import (
     ManagedEndpoint,
 )
 
-_GAVE_UP = "gave up"
+_WAITING = "waiting"
+# After max_failures in a row, how long to wait before each next try (the
+# last one repeats): a slot that keeps failing is retried less and less
+# often, but never left broken for good.
+RETRY_WAITS_S = (60.0, 300.0, 900.0, 1800.0)
 
 
 def _epoch(iso: str, fallback: float = 0.0) -> float:
@@ -36,6 +40,12 @@ def _epoch(iso: str, fallback: float = 0.0) -> float:
         return fallback
 
 
+def retry_wait(extra_failures: int) -> float:
+    """Seconds to wait before the next try, ``extra_failures`` failures
+    past max_failures (0 = the first wait)."""
+    return RETRY_WAITS_S[min(max(extra_failures, 0), len(RETRY_WAITS_S) - 1)]
+
+
 class Reconciler:
     """Keeps this VE's endpoints matching its settings. One tick:
 
@@ -45,8 +55,9 @@ class Reconciler:
        answering, is failed (an unplanned failure -- planned ones go through
        sleeping/draining instead);
     3. failed endpoints (auto-replace on): first a restart, then a
-       replacement with the same size, giving up after ``max_failures``
-       consecutive failures of that slot;
+       replacement with the same size; after ``max_failures`` consecutive
+       failures of that slot each next try waits longer (``RETRY_WAITS_S``)
+       -- never given up for good;
     4. draining endpoints finish their jobs (or hit ``drain_timeout_s``),
        then are removed -- scale-down never kills a running job;
     5. present endpoints are brought to target_endpoints: new ones get the
@@ -94,7 +105,7 @@ class Reconciler:
             self._detect_failures(now)
             if self._paused:
                 return
-            self._handle_failed()
+            self._handle_failed(now)
             self._progress_draining(now)
             self._scale_to_target()
             self._sleep_idle(now)
@@ -167,6 +178,20 @@ class Reconciler:
             self._jobs.touch(endpoint_id)
             return self._fleet.record(endpoint_id, STARTING, f"restarted by {by}")
 
+    def retry_failed_now(self, by: Optional[str]) -> List[str]:
+        """A repair: every failed endpoint is tried again at once (restarted,
+        else replaced), whatever wait it was in, with its failure count
+        started over. The ids tried."""
+        tried: List[str] = []
+        with self._lock:
+            self._detect_failures(self._now_fn())     # gone containers count as failed first
+            for endpoint in self._fleet.in_states(FAILED):
+                fresh = self._fleet.record(endpoint.endpoint_id, FAILED, f"trying again now (repair by {by})",
+                                           failures=0)
+                self._retry(fresh)
+                tried.append(endpoint.endpoint_id)
+        return tried
+
     def wake_one(self, reason: str) -> Optional[str]:
         """Wakes one sleeping endpoint unless one is already waking. Returns
         the endpoint being woken (or already waking), or None if none sleeps."""
@@ -177,7 +202,9 @@ class Reconciler:
             for sleeper in reversed(self._fleet.in_states(SLEEPING)):  # most recently slept first
                 error = self._ops.start(sleeper.endpoint_id)
                 if error:
+                    # Failed: restarted, else replaced, like any other failure.
                     self.last_errors.append(f"waking {sleeper.endpoint_id}: {error}")
+                    self._fail(sleeper, f"couldn't wake: {error}")
                     continue
                 self._jobs.touch(sleeper.endpoint_id)
                 self._fleet.record(sleeper.endpoint_id, STARTING, f"waking: {reason}")
@@ -209,30 +236,43 @@ class Reconciler:
                 self._fail(endpoint, "stopped answering")
             elif endpoint.failures and now - _epoch(endpoint.since, now) > self._stable_after_s:
                 self._fleet.record(endpoint.endpoint_id, RUNNING, "stable again", failures=0)
+        # A sleeping endpoint's container is halted, never gone: one that
+        # disappeared (Docker restarted, removed by hand) would otherwise hold
+        # its slot forever and fail every wake.
+        for endpoint in self._fleet.in_states(SLEEPING):
+            if self._ops.container_state(endpoint.endpoint_id) is None:
+                self._fail(endpoint, "container missing while sleeping")
 
-    def _handle_failed(self) -> None:
+    def _handle_failed(self, now: float) -> None:
         if not self._settings.current().auto_replace_failed:
             return
         for endpoint in self._fleet.in_states(FAILED):
-            if (endpoint.reason or "").startswith(_GAVE_UP):
-                continue
             if endpoint.failures >= self._max_failures:
-                self._fleet.record(
-                    endpoint.endpoint_id, FAILED,
-                    f"{_GAVE_UP} after {endpoint.failures} failures in a row",
-                )
-                continue
-            if endpoint.failures <= 1 and not self._ops.restart(endpoint.endpoint_id):
-                self._jobs.touch(endpoint.endpoint_id)
-                self._fleet.record(endpoint.endpoint_id, STARTING, "restarting after a failure")
-                continue
-            # Restart didn't help (or failed): replace it with the same size.
-            self._ops.remove(endpoint.endpoint_id)
-            self._fleet.record(endpoint.endpoint_id, REMOVED, "replaced after failing")
-            self._launch(
-                endpoint.cpu_cores, endpoint.memory_mb, f"replacing {endpoint.endpoint_id}",
-                failures=endpoint.failures, replaces=endpoint.endpoint_id,
-            )
+                wait = retry_wait(endpoint.failures - self._max_failures)
+                if not (endpoint.reason or "").startswith(_WAITING):
+                    self._fleet.record(
+                        endpoint.endpoint_id, FAILED,
+                        f"{_WAITING} {wait / 60:g} min before trying again "
+                        f"({endpoint.failures} failures in a row)",
+                    )
+                    continue
+                if now - _epoch(endpoint.since, now) < wait:
+                    continue
+            self._retry(endpoint)
+
+    def _retry(self, endpoint: ManagedEndpoint) -> None:
+        """Restart a failed endpoint (its first failure), else replace it
+        with one of the same size."""
+        if endpoint.failures <= 1 and not self._ops.restart(endpoint.endpoint_id):
+            self._jobs.touch(endpoint.endpoint_id)
+            self._fleet.record(endpoint.endpoint_id, STARTING, "restarting after a failure")
+            return
+        self._ops.remove(endpoint.endpoint_id)
+        self._fleet.record(endpoint.endpoint_id, REMOVED, "replaced after failing")
+        self._launch(
+            endpoint.cpu_cores, endpoint.memory_mb, f"replacing {endpoint.endpoint_id}",
+            failures=endpoint.failures, replaces=endpoint.endpoint_id,
+        )
 
     def _progress_draining(self, now: float) -> None:
         for endpoint in self._fleet.in_states(DRAINING):
@@ -244,10 +284,9 @@ class Reconciler:
 
     def _scale_to_target(self) -> None:
         settings = self._settings.current()
-        # A failed endpoint keeps holding its slot -- being restarted /
-        # replaced, or given up on (the VE shows Degraded until someone
-        # removes it). Otherwise a slot that keeps failing would be
-        # recreated forever.
+        # A failed endpoint keeps holding its slot while it's restarted /
+        # replaced or waits for its next try -- otherwise a slot that keeps
+        # failing would get a new endpoint on every tick.
         failed = self._fleet.in_states(FAILED)
         present = self._fleet.in_states(*PRESENT)
         count = len(present) + len(failed)

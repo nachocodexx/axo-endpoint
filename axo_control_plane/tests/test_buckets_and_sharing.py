@@ -43,6 +43,35 @@ def test_platform_code_buckets_belong_to_their_ve(platform):
     assert not check("u", "axo/cleanup-logs", "read", "ve-a")["allowed"]
 
 
+def test_the_results_bucket_is_written_by_the_vem_and_read_by_the_ves_people(platform):
+    alice, bob = platform.user("alice"), platform.user("bob")
+    ve_id = platform.buy(alice)["ve"]["ve_id"]
+    runs = f"axo/ve-{ve_id}-results"
+    check = platform.storage_access.check
+    assert check(f"vem:{ve_id}", runs, "write", ve_id)["allowed"]
+    assert check(f"vem:{ve_id}", runs, "read", ve_id)["bucket_key"] == runs
+    assert check(alice.user_id, runs, "read", ve_id)["allowed"]                 # the VE's owner (a step of hers)
+    assert not check(alice.user_id, runs, "write", ve_id)["allowed"]            # only the VEM writes
+    assert not check(bob.user_id, runs, "read", ve_id)["allowed"]               # no role in the VE
+    other = platform.buy(bob, name="other")["ve"]["ve_id"]
+    assert not check(f"vem:{other}", runs, "read", other)["allowed"]            # another VE
+    assert not check(f"vem:{other}", runs, "write", ve_id)["allowed"]
+
+
+def test_the_objects_bucket_is_only_for_the_ves_own_endpoints(platform):
+    alice = platform.user("alice")
+    ve_id = platform.buy(alice)["ve"]["ve_id"]
+    objects = f"axo/ve-{ve_id}-objects"
+    check = platform.storage_access.check
+    for mode in ("read", "write"):
+        assert check(f"endpoint:{ve_id}", objects, mode, ve_id)["bucket_key"] == objects
+    assert not check(alice.user_id, objects, "read", ve_id)["allowed"]          # not even the owner
+    assert not check(f"vem:{ve_id}", objects, "read", ve_id)["allowed"]
+    other = platform.buy(alice, name="other")["ve"]["ve_id"]
+    assert not check(f"endpoint:{other}", objects, "read", other)["allowed"]    # another VE
+    assert not check(f"endpoint:{ve_id}", objects, "read", other)["allowed"]
+
+
 def test_aliases_and_transfer_keep_old_names_working(platform):
     alice = platform.user("alice")
     platform.teams.create(alice, "ds")
@@ -93,6 +122,7 @@ def test_ve_invitations_follow_the_role_rules(platform):
     assert platform.authz.ve_role(dev, ve_id) == R.DEVELOPER
     access = {a["principal_id"]: a["role"] for a in platform.sharing.ve_access(owner, ve_id)}
     assert access == {owner.user_id: R.OWNER, admin.user_id: R.ADMIN, dev.user_id: R.DEVELOPER}
+    assert {a["name"] for a in platform.sharing.ve_access(owner, ve_id)} == {"olga", "adam", "dina"}
     with pytest.raises(ForbiddenError):
         platform.sharing.set_ve_role(admin, ve_id, admin.user_id, "USER", R.DEVELOPER)  # admin role: Owner only
     platform.sharing.set_ve_role(dev, ve_id, dev.user_id, "USER", None)                # leaving is always ok
@@ -160,3 +190,52 @@ def test_storage_keys_are_accepted_for_the_cp_and_checked_for_people(platform):
     assert check("control-plane", key, "read", None)["allowed"]
     assert not check("control-plane", key, "read", "some-ve")["allowed"]
     assert not check(alice.user_id, "bkt-unknown", "read", None)["allowed"]
+
+
+def test_team_page_lists_what_it_owns_what_is_shared_and_its_history(platform):
+    owner, member, ana = platform.user("olga"), platform.user("mia"), platform.user("ana")
+    team = platform.teams.create(owner, "lab")
+    platform.sharing.answer(member, platform.sharing.invite_to_team(owner, team["team_id"], "mia")["id"], accept=True)
+    platform.buy(owner, name="team-ve", team_id=team["team_id"])
+    shared = platform.buy(ana, name="anas-ve")["ve"]
+    inv = platform.sharing.invite_to_ve(ana, shared["ve_id"], "lab", R.DEVELOPER)
+    platform.sharing.answer(owner, inv["id"], accept=True)
+
+    [row] = platform.teams.summaries(member.user_id)
+    assert (row["my_role"], row["member_count"], row["ve_count"], row["bucket_count"]) == (R.MEMBER, 2, 1, 0)
+    found = {(r["name"], r["owned"], r["role"], r.get("shared_by")) for r in platform.teams.resources(member, team["team_id"])}
+    assert found == {("team-ve", True, R.OWNER, None), ("anas-ve", False, R.DEVELOPER, "ana")}
+    types = [e["type"] for e in platform.teams.history(member, team["team_id"])]
+    assert types == ["InvitationAnswered", "TeamMemberAdded", "InvitationSent", "TeamCreated"]   # newest first
+    with pytest.raises(ForbiddenError):                    # not in the team
+        platform.teams.resources(ana, team["team_id"])
+
+
+def test_inbox_lists_sent_and_answered_and_a_transfer_can_be_cancelled(platform):
+    olga, mia = platform.user("olga"), platform.user("mia")
+    team = platform.teams.create(olga, "lab")
+    inv = platform.sharing.invite_to_team(olga, team["team_id"], "mia")
+    assert [i["id"] for i in platform.sharing.sent(olga)] == [inv["id"]]
+    platform.sharing.answer(mia, inv["id"], accept=False)
+    assert platform.sharing.sent(olga) == []
+    assert [i["status"] for i in platform.sharing.answered(mia)] == ["rejected"]
+
+    ve = platform.buy(olga)["ve"]
+    transfer = platform.sharing.request_transfer(olga, "ve", ve["ve_id"], "mia")
+    [waiting] = platform.sharing.pending_transfers(mia)
+    assert waiting["plan"]["monthly_fee_cents"] > 0               # accepting means paying it
+    with pytest.raises(ForbiddenError):
+        platform.sharing.cancel_transfer(mia, transfer["id"])
+    platform.sharing.cancel_transfer(olga, transfer["id"])
+    assert platform.sharing.pending_transfers(mia) == []
+    assert [t["status"] for t in platform.sharing.pending_transfers(mia, answered_days=30)] == ["cancelled"]
+
+
+def test_a_team_name_is_checked_against_people_and_teams(platform):
+    olga = platform.user("olga")
+    platform.teams.create(olga, "lab")
+    assert platform.teams.name_free("lab")["free"] is False
+    assert platform.teams.name_free("olga")["reason"] == "olga is already taken"
+    assert platform.teams.name_free("-bad-")["free"] is False
+    assert platform.teams.name_free("new-team") == {"name": "new-team", "free": True, "reason": None}
+

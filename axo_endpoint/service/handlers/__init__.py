@@ -1,3 +1,4 @@
+from axo_endpoint.service.handlers.active_objects import ActiveObjectHandler
 from axo_endpoint.service.handlers.activity_list import ActivityListHandler
 from axo_endpoint.service.handlers.concurrency_reconcile_pull import ConcurrencyReconcilePullHandler
 from axo_endpoint.service.handlers.concurrency_slot_release import ConcurrencySlotReleaseHandler
@@ -31,6 +32,7 @@ from axo_endpoint.service.handlers.state_sync_pull import StateSyncPullHandler
 from axo_endpoint.service.handlers.state_sync_push import StateSyncPushHandler
 
 __all__ = [
+    "ActiveObjectHandler",
     "EndpointDrainHandler",
     "ActivityListHandler",
     "ConcurrencyReconcilePullHandler",

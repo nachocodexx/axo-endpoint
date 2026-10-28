@@ -10,15 +10,23 @@
     "postinstall": "nuxt prepare"
   },
   "dependencies": {
-    "@guolao/vue-monaco-editor": "^1.6.0",
-    "@mdi/font": "^7.4.47",
-    "@pinia/nuxt": "^0.11.3",
-    "@vue-flow/core": "^1.48.2",
-    "nuxt": "^4.4.8",
-    "pinia": "^3.0.4",
-    "vue": "^3.5.39",
-    "vue-router": "^5.1.0",
-    "vuetify": "^4.1.4",
-    "vuetify-nuxt-module": "^1.0.0-rc.2"
+    "@mdi/font": "catalog:",
+    "@pinia/nuxt": "catalog:",
+    "@dagrejs/dagre": "catalog:",
+    "@vue-flow/background": "catalog:",
+    "@vue-flow/core": "catalog:",
+    "@vue-flow/minimap": "catalog:",
+    "nuxt": "catalog:",
+    "pinia": "catalog:",
+    "vue": "catalog:",
+    "vue-router": "catalog:",
+    "vuetify": "catalog:",
+    "vuetify-nuxt-module": "catalog:",
+    "axo-ui-kit": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "typescript": "catalog:",
+    "vue-tsc": "catalog:"
   }
 }

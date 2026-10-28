@@ -58,7 +58,7 @@ def test_register_submit_and_poll_result_end_to_end(tmp_path, clean_env, monkeyp
                 operation=wire.FUNCTION_REGISTER,
                 content_type="application/octet-stream",
                 envelope={"function_id": "add", "name": "add"},
-                payload=cloudpickle.dumps(lambda params, ctx: params["a"] + params["b"]),
+                payload=cloudpickle.dumps(lambda a, b: a + b),
             ),
         )
         assert register_result.ok is True

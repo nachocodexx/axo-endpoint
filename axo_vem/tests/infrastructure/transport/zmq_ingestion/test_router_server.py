@@ -228,3 +228,35 @@ def test_unknown_event_types_are_acked_and_dropped_without_stopping_ingestion():
     finally:
         dealer.close()
         server.stop()
+
+
+def test_router_keeps_receiving_after_a_message_it_fails_to_handle():
+    """A crash while handling one message (or a receive error) used to end
+    the receive loop silently: every endpoint's events then went unheard."""
+    ctx = zmq.Context.instance()
+
+    appender = _FakeAppender()
+    server = IngestionRouterServer(bind_address="tcp://127.0.0.1:0", appender=appender, context=ctx)
+    server.start()
+    real_handle = server._handle_frames
+    calls = {"n": 0}
+
+    def flaky(frames):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("a bug in handling")
+        real_handle(frames)
+
+    server._handle_frames = flaky
+    dealer = ctx.socket(zmq.DEALER)
+    dealer.setsockopt(zmq.RCVTIMEO, 2000)
+    dealer.connect(server.bind_address)
+    try:
+        event = models.EndpointStarted(endpoint_id="n0", router_bind="tcp://0.0.0.0:5555", pub_bind="tcp://0.0.0.0:5556")
+        _send_event(dealer, models.ENDPOINT_STARTED, "n0", event.model_dump(mode="json"))   # the one that crashes
+        _send_event(dealer, models.ENDPOINT_STARTED, "n1", event.model_dump(mode="json"))
+        assert wire.decode_command_result(dealer.recv_multipart()).unwrap().ok is True
+        assert [a[0] for a in appender.appended] == ["endpoints-n1"]
+    finally:
+        dealer.close()
+        server.stop()

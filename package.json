@@ -1,0 +1,10 @@
+{
+  "name": "axo-web",
+  "private": true,
+  "description": "pnpm workspace root for the web UIs (axo-ui, axo-admin-ui, axo-ui-kit); the Python projects ignore it.",
+  "scripts": {
+    "dev:ui": "pnpm --filter axo-ui dev",
+    "dev:admin": "pnpm --filter axo-admin-ui dev",
+    "build": "pnpm -r --filter './axo-*' build"
+  }
+}

@@ -6,18 +6,18 @@ authors = ["Ignacio Castillo <ignacio.bcastillo@gmail.com>"]
 
 [tool.poetry.dependencies]
 python = ">=3.10,<4"
-pyzmq = "^26.0.3"
+pyzmq = ">=26.0.3,<28"   # a range: the endpoint is held on 26.x by axo 0.0.4a3 (pyzmq<27)
 option = ">=2.1.0,<3.0.0"
-python-dotenv = "^1.0.1"
+python-dotenv = "^1.2.4"
 rich = "^15.0.0"
-httpx = "^0.27.0"
+httpx = "^0.28.1"
 axo_shared = {path = "../axo_shared", develop = true}
 
 [tool.poetry.scripts]
 axo-storage = "axo_storage.cli:main"
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^8.2.2"
+pytest = "^9.1.1"
 pytest-cov = "^7.1.0"
 
 [tool.pytest.ini_options]

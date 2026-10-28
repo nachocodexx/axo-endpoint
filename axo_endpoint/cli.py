@@ -49,6 +49,7 @@ _FLAG_ENV_MAP = [
     ("container-job-port",          "AXO_ENDPOINT_CONTAINER_JOB_PORT",           "Port containers bind for ZMQ job dispatch"),
     ("container-fastapi-port",      "AXO_ENDPOINT_CONTAINER_FASTAPI_PORT",       "Port containers bind for FastAPI"),
     ("container-readiness-timeout", "AXO_ENDPOINT_CONTAINER_READINESS_TIMEOUT_SECONDS", "Seconds to wait for container readiness"),
+    ("container-install-timeout", "AXO_ENDPOINT_CONTAINER_INSTALL_TIMEOUT_SECONDS", "Seconds a started runner may take to install its packages and load its code"),
     ("container-pip-cache-volume",  "AXO_ENDPOINT_CONTAINER_PIP_CACHE_VOLUME",   "Docker volume name for pip cache"),
     ("container-runner-image",      "AXO_ENDPOINT_CONTAINER_RUNNER_IMAGE",       "Base runner image name"),
     ("container-auto-build-image",  "AXO_ENDPOINT_CONTAINER_AUTO_BUILD_IMAGE",   "Auto-build runner image if missing (true/false)"),

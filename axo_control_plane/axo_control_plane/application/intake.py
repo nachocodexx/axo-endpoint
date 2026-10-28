@@ -13,13 +13,24 @@ from pymongo.database import Database
 from pymongo.errors import DuplicateKeyError
 
 from axo_control_plane.application import notifications as N
+from axo_control_plane.application.bucket_events import save_triggers
+from axo_control_plane.application.catalog import PlanCatalog
 from axo_control_plane.application.notifications import Notifications
 from axo_control_plane.application.ports import HistoryLog
+from axo_control_plane.application.storage_metering import (
+    GIB,
+    STORAGE_SIZES_REPORTED,
+    STORAGE_USAGE_REPORTED,
+    StorageMetering,
+    hours_in_month,
+)
 from axo_control_plane.domain import virtual_environment as V
+from axo_control_plane.domain.billing import attempt_cost, choreography_lines
 
 VE_HEARTBEAT = "VirtualEnvironmentHeartbeat"
 JOB_ATTEMPT_RECORDED = "JobAttemptRecorded"
 METRIC_SUMMARY_REPORTED = "MetricSummaryReported"
+OBJECT_STATE_HOUR_REPORTED = "ObjectStateHourReported"
 
 # Lifecycles the heartbeat may move between on its own (the provisioner owns
 # every other transition).
@@ -44,28 +55,44 @@ class VemIntake:
 
     - heartbeat -> only the latest is kept per VE; a history record is
       written only when lifecycle or health changes;
-    - job attempt -> the permanent billing record, one per (job, attempt);
-    - minute summary -> kept for charts and the admin dashboard.
+    - job attempt -> the permanent billing record, one per (job, attempt),
+      with its cost worked out once on arrival (price list in force at the
+      attempt's finish time; never changed afterwards);
+    - minute summary -> kept for charts and the admin dashboard;
+    - object state hour -> the VE's active-object state size for one hour,
+      priced once on arrival as GB-months (``object_state_hours``, VE bill).
+
+    And from axo_storage (source ``storage:<id>``): its per-minute request
+    totals and hourly bucket sizes, for the storage bills.
     """
 
-    def __init__(self, db: Database, history: HistoryLog, notifications: Notifications,
-                 now_fn: Callable[[], float] = time.time) -> None:
+    def __init__(self, db: Database, history: HistoryLog, notifications: Notifications, catalog: PlanCatalog,
+                 storage: Optional[StorageMetering] = None, now_fn: Callable[[], float] = time.time) -> None:
         self._ves = db["virtual_environments"]
         self._teams = db["teams"]
         self._attempts = db["job_attempts"]
+        self._attempts.create_index("choreography_lines.choreography_id", sparse=True)
         self._minutes = db["metric_minutes"]
+        self._object_hours = db["object_state_hours"]
         self._history = history
         self._notifications = notifications
+        self._catalog = catalog
         self._now_fn = now_fn
         self.handlers: Dict[str, Callable[[str, Dict[str, Any]], bool]] = {
             VE_HEARTBEAT: self.heartbeat,
             JOB_ATTEMPT_RECORDED: self.job_attempt,
             METRIC_SUMMARY_REPORTED: self.metric_summary,
+            OBJECT_STATE_HOUR_REPORTED: self.object_state_hour,
         }
+        self.storage_handlers: Dict[str, Callable[[str, Dict[str, Any]], bool]] = (
+            {STORAGE_USAGE_REPORTED: storage.usage, STORAGE_SIZES_REPORTED: storage.sizes} if storage else {})
 
     def handle(self, event_type: str, source_id: str, data: Dict[str, Any]) -> bool:
         """True = saved (or already saved / not ours to keep): ack it.
         False = couldn't save now: don't ack, the VEM resends."""
+        if source_id.startswith("storage:"):
+            storage_handler = self.storage_handlers.get(event_type)
+            return storage_handler(source_id, data) if storage_handler else True
         handler = self.handlers.get(event_type)
         if handler is None:
             return True
@@ -78,12 +105,14 @@ class VemIntake:
     # ── heartbeat ────────────────────────────────────────────────────────────
     def heartbeat(self, ve_id: str, data: Dict[str, Any]) -> bool:
         doc = self._ves.find_one({"_id": ve_id}, {"lifecycle": 1, "health": 1, "desired": 1, "name": 1,
-                                                 "owner": 1})
+                                                 "owner": 1, "lifecycle_reason": 1})
         if doc is None or doc.get("lifecycle") == V.DELETED:
             return True
         now = self._now_fn()
         changes: Dict[str, Any] = {"heartbeat": data, "heartbeat_at": now, "idle_since": _ts(data.get("idle_since")),
                                    "vem_down_since": None}
+        if doc.get("lifecycle_reason") == V.VEM_DOWN_REASON:
+            changes["lifecycle_reason"] = ""     # it answers again
         lifecycle = data.get("lifecycle")
         health = data.get("health")
         if doc.get("desired") == V.DESIRED_RUNNING and doc.get("lifecycle") in _LIVE:
@@ -91,6 +120,8 @@ class VemIntake:
                 changes["lifecycle"] = lifecycle
             changes["health"] = health
         self._ves.update_one({"_id": ve_id}, {"$set": changes})
+        if "triggers" in data:
+            save_triggers(self._ves, ve_id, data.get("triggers") or [], _ts(data.get("created_at")) or now)
         before = (doc.get("lifecycle"), doc.get("health"))
         after = (changes.get("lifecycle", before[0]), changes.get("health", before[1]))
         if after != before:
@@ -105,7 +136,15 @@ class VemIntake:
     # ── job attempts (billing) ───────────────────────────────────────────────
     def job_attempt(self, ve_id: str, data: Dict[str, Any]) -> bool:
         key = f"{data.get('job_id')}:{data.get('attempt')}"
-        record = {"_id": key, "ve_id": ve_id, "logged": False, "received_by_cp_at": self._now_fn(), **data}
+        now = self._now_fn()
+        finished_at = _ts(data.get("finished_at")) or _ts(data.get("received_at")) or now
+        prices_from, prices = self._catalog.prices_in_force(finished_at)
+        cost = attempt_cost(data, prices, prices_from)
+        record = {"_id": key, "ve_id": ve_id, "logged": False, "received_by_cp_at": now, **data,
+                  "finished_at_ts": finished_at, "cost": cost.to_dict()}
+        lines = choreography_lines(data)
+        if lines:
+            record["choreography_lines"] = lines
         try:
             self._attempts.insert_one(record)
         except DuplicateKeyError:
@@ -118,9 +157,28 @@ class VemIntake:
         self._attempts.update_one({"_id": key}, {"$set": {"logged": True}})
         return True
 
+    def backfill_choreography_lines(self, batch: int = 500) -> int:
+        """Choreography step attempts saved before calls between
+        choreographies were recorded get their lines (safe to run on every
+        start, by every copy)."""
+        done = 0
+        query = {"started_by_type": "choreography", "choreography_lines": {"$exists": False}}
+        while True:
+            docs = list(self._attempts.find(query).limit(batch))
+            if not docs:
+                return done
+            for doc in docs:
+                self._attempts.update_one({"_id": doc["_id"]},
+                                          {"$set": {"choreography_lines": choreography_lines(doc)}})
+            done += len(docs)
+
     # ── 1-minute summaries ───────────────────────────────────────────────────
     def metric_summary(self, ve_id: str, data: Dict[str, Any]) -> bool:
+        # One document per bin and sender process (``part``): readers and the
+        # tier rollups merge every document of a bin.
         key = f"{ve_id}:{data.get('component_kind')}:{data.get('component_id')}:{data.get('bin_start')}"
+        if data.get("part"):
+            key += f":{data['part']}"
         try:
             self._minutes.insert_one({"_id": key, "ve_id": ve_id, "bin_start": data.get("bin_start"),
                                       "bin_width_s": data.get("bin_width_s"), "summaries": data.get("summaries", []),
@@ -128,6 +186,23 @@ class VemIntake:
                                       "component_id": data.get("component_id")})
         except DuplicateKeyError:
             pass
+        return True
+
+    # ── active-object state (billing) ────────────────────────────────────────
+    def object_state_hour(self, ve_id: str, data: Dict[str, Any]) -> bool:
+        hour = float(data.get("hour_start") or 0.0)
+        if hour <= 0:
+            return True
+        size = max(0, int(data.get("stored_bytes") or 0))
+        gb_months = size / GIB / hours_in_month(hour)
+        prices = self._catalog.prices(hour)
+        try:
+            self._object_hours.insert_one({
+                "_id": f"{ve_id}:{int(hour)}", "ve_id": ve_id, "ts": hour, "bytes": size, "gb_months": gb_months,
+                "cost": {"total_ucents": round(gb_months * prices.object_state_per_gb_month_ucents)},
+                "bill_id": None, "received_by_cp_at": self._now_fn()})
+        except DuplicateKeyError:
+            pass                              # a resend (the hour is counted once)
         return True
 
     # ── a deleted VE's unsent messages ───────────────────────────────────────

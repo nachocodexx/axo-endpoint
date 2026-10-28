@@ -8,6 +8,9 @@ from axo_control_plane.application.ports import VemGateway
 from axo_control_plane.domain.errors import ConflictError, DomainError, InvalidError, NotFoundError, UnavailableError
 
 CP_ACTOR = "control-plane"
+# How long the CP held a job submission (ms), recorded on the job's attempt
+# as its "control_plane" wait (the VEM reads it, see its jobs controller).
+CP_WAIT_HEADER = "X-Axo-Wait-Ms"
 
 
 class HttpVemGateway(VemGateway):
@@ -28,10 +31,11 @@ class HttpVemGateway(VemGateway):
         return {"Authorization": f"Bearer {self._token_fn(ve_id)}", "X-Acting-User": acting_user}
 
     def _call(self, ve_id: str, method: str, path: str, acting_user: str = CP_ACTOR,
-              json: Any = None, params: Optional[Dict[str, Any]] = None) -> Any:
+              json: Any = None, params: Optional[Dict[str, Any]] = None,
+              extra_headers: Optional[Dict[str, str]] = None) -> Any:
         try:
             response = self._http.request(method, f"{self.base_url(ve_id)}{path}", json=json, params=params,
-                                          headers=self.headers(ve_id, acting_user))
+                                          headers={**self.headers(ve_id, acting_user), **(extra_headers or {})})
         except httpx.HTTPError as exc:
             raise UnavailableError(f"the VE manager of {ve_id} can't be reached ({exc.__class__.__name__})")
         if response.status_code < 400:
@@ -53,13 +57,18 @@ class HttpVemGateway(VemGateway):
     def set_limits(self, ve_id, limits, by):
         self._call(ve_id, "PUT", "/ve/limits", acting_user=by, json=limits)
 
+    def repair(self, ve_id, by, steps, automatic):
+        return self._call(ve_id, "POST", "/ve/repair", acting_user=by, json={"steps": steps, "automatic": automatic})
+
     def endpoint_ids(self, ve_id):
         listed = self._call(ve_id, "GET", "/endpoints", params={"include_removed": True})
         return {e.get("endpoint_id") or e.get("_id"): e.get("lifecycle") or e.get("status") or "unknown"
                 for e in listed or [] if e.get("endpoint_id") or e.get("_id")}
 
     def submit_job(self, ve_id, request):
-        return self._call(ve_id, "POST", request["path"], acting_user=request["acting_user"], json=request["body"])
+        waited = request.get("wait_ms")
+        return self._call(ve_id, "POST", request["path"], acting_user=request["acting_user"], json=request["body"],
+                          extra_headers={CP_WAIT_HEADER: f"{float(waited):.3f}"} if waited is not None else None)
 
 
 def _error(response: httpx.Response) -> DomainError:

@@ -64,5 +64,9 @@ def test_deleted_ve_volumes_go_after_the_grace_period(platform):
     assert platform.ves.record(ve_id).lifecycle == V.DELETED
     assert cleanup.remove_expired_volumes() == []
     platform.clock.advance(31 * 86400)
+    dropped = []
+    cleanup._drop_bucket = dropped.append
     assert cleanup.remove_expired_volumes() == [ve_id]
     assert not [v for v in platform.driver.volumes if ve_id in v]
+    assert dropped == [f"axo/ve-{ve_id}-objects"]           # object values go with the state's Mongo
+    assert cleanup.remove_expired_volumes() == []

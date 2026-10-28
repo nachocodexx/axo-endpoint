@@ -7,6 +7,7 @@ from axo_shared.protocol import Command
 from axo_endpoint.core.runtime import FunctionRuntime, FunctionRuntimeError, InvocationHandle
 from axo_endpoint.core.storage import InMemoryStorageBackend, StorageKey
 from axo_endpoint.service.handlers.job_submit import JobSubmitHandler, build_completion_recorder
+from axo_endpoint.core.results import FunctionResult
 
 
 class _FakeRuntime(FunctionRuntime):
@@ -115,7 +116,10 @@ def test_emits_job_submitted_event(results_store, event_bus, function_registry):
                                "received_at": 100.0, "trace_id": "job1", "attempt": 1,
                                "started_by_type": "user", "started_by_id": "unknown",
                                "upstream_waits_ms": {}, "max_wait_s": -1.0,
-                               "acting_user_id": ""}},
+                               "acting_user_id": "", "object_id": None, "object_method": None,
+                               "choreography_run_id": None, "choreography_step": None,
+                               "choreography_version": None, "choreography_calls": [],
+                               "reason": "first", "retried_by": None, "max_attempts": 1}},
             timestamp=100.0,
         )
     ]
@@ -255,7 +259,8 @@ def test_completion_recorder_writes_success_result_and_emits_job_completed(resul
         Event(
             event_type="JOB_COMPLETED",
             payload={"job_id": "job1", "function_id": "add", "function_version": None, "duration_ms": None,
-                     "outcome": "completed", "started_at": None, "finished_at": 100.0},
+                     "outcome": "completed", "started_at": None, "finished_at": 100.0,
+                     "failure": None, "attempt": 1},
             timestamp=100.0,
         )
     ]
@@ -273,7 +278,8 @@ def test_completion_recorder_computes_duration_from_started_at(results_store):
         Event(
             event_type="JOB_COMPLETED",
             payload={"job_id": "job1", "function_id": "add", "function_version": 2, "duration_ms": 500.0,
-                     "outcome": "completed", "started_at": 100.0, "finished_at": 100.5},
+                     "outcome": "completed", "started_at": 100.0, "finished_at": 100.5,
+                     "failure": None, "attempt": 1},
             timestamp=100.5,
         )
     ]
@@ -395,3 +401,57 @@ def test_a_caller_job_id_is_used_and_a_repeat_runs_once(results_store, event_bus
     bad = handler.handle(Command(operation="JOB_SUBMIT", content_type="application/json",
                                  envelope={**envelope, "job_id": "../x"}))
     assert bad.ok is False and runtime.invocations[-1][1] == "cp-job-0001"
+
+
+def test_a_choreography_event_reaches_ctx_event_and_optional_params_keep_their_code_default(results_store, event_bus):
+    from axo_shared.functions.params_schema import ParamSpec
+    from axo_endpoint.core.runtime import EVENT_PARAM, build_invocation
+
+    registry = FunctionRegistry(backend=InMemoryStorageBackend(), event_bus=event_bus)
+    registry.register(function_id="add", name="add", code=b"", now=0.0, params_schema=[
+        ParamSpec(name="a", type="json", required=True), ParamSpec(name="b", type="json", required=False)])
+    runtime = _FakeRuntime()
+    handler = JobSubmitHandler(runtime=runtime, results=results_store, event_bus=event_bus,
+                               function_registry=registry, job_id_fn=lambda: "job1")
+    event = {"run": {"run_id": "r1"}, "previous": {"a": {"output": {"x": 1}}}}
+    assert handler.handle(Command(
+        operation="JOB_SUBMIT", content_type="application/json",
+        envelope={"function_id": "add", "function_name": "add", "function_version": 1, "params": {"a": 2},
+                  "event": event},
+    )).ok
+    params = runtime.invocations[0][2]
+    assert params == {"a": 2, EVENT_PARAM: event}          # "b" left out: the code's default applies
+    ctx, call_params = build_invocation("job1", "/tmp/x", params)
+    assert ctx.event == event and call_params == {"a": 2}
+
+    # forwarded again with the event already inside the params
+    handler._job_id_fn = lambda: "job2"
+    assert handler.handle(Command(
+        operation="JOB_SUBMIT", content_type="application/json",
+        envelope={"function_id": "add", "function_name": "add", "function_version": 1, "params": params},
+    )).ok
+    assert runtime.invocations[1][2] == params
+
+
+def test_a_persons_retry_runs_a_finished_job_again_as_its_next_attempt(results_store, event_bus, function_registry):
+    runtime = _FakeRuntime()
+    handler = JobSubmitHandler(runtime=runtime, results=results_store, event_bus=event_bus,
+                               function_registry=function_registry)
+    envelope = {"function_id": "add", "function_name": "add", "function_version": 1, "params": {},
+                "job_id": "job-retry-1"}
+    handler.handle(Command(operation="JOB_SUBMIT", content_type="application/json", envelope=envelope))
+    retry = {**envelope, "retried_by": "u-7", "attempt": 2}
+    still_running = handler.handle(Command(operation="JOB_SUBMIT", content_type="application/json", envelope=retry))
+    assert still_running.metadata["status"] == "DUPLICATE"           # not finished yet: nothing to retry
+
+    results_store.put(StorageKey(id="job-retry-1"), FunctionResult(job_id="job-retry-1", ok=False, error="boom"))
+    again = handler.handle(Command(operation="JOB_SUBMIT", content_type="application/json", envelope=retry))
+    assert again.metadata == {"job_id": "job-retry-1", "status": "QUEUED"} and len(runtime.invocations) == 2
+
+
+def test_a_job_with_impossible_attempt_settings_is_refused(results_store, event_bus, function_registry):
+    handler = JobSubmitHandler(runtime=_FakeRuntime(), results=results_store, event_bus=event_bus,
+                               function_registry=function_registry)
+    answer = handler.handle(Command(operation="JOB_SUBMIT", content_type="application/json", envelope={
+        "function_id": "add", "function_name": "add", "function_version": 1, "params": {}, "max_attempts": 0}))
+    assert not answer.ok

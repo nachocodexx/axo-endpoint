@@ -177,3 +177,13 @@ def test_metric_summary_stats_rebuild_into_a_stat_summary():
                                                       event.model_dump(mode="json"))).unwrap()[2]
     rebuilt = StatSummary.from_dict(envelope.rehydrate(models.METRIC_SUMMARY_REPORTED, data).summaries[0].stats)
     assert rebuilt.mean() == 20
+
+
+def test_an_object_call_travels_the_envelope_and_rehydrates():
+    payload = models.ActiveObjectCalled(
+        object_id="o1", job_id="j1", trace_id="t1", method="run", class_version=2, outcome="completed",
+        revision=4, changed=["count"], size_bytes=10).model_dump(mode="json")
+    command = envelope.encode_event(models.ACTIVE_OBJECT_CALLED, "ep-1", payload)
+    event_type, _, decoded = envelope.decode_event(command).unwrap()
+    event = envelope.rehydrate(event_type, decoded)
+    assert isinstance(event, models.ActiveObjectCalled) and event.changed == ["count"] and event.revision == 4

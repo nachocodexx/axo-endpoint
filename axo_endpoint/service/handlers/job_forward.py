@@ -7,6 +7,7 @@ from axo_endpoint.core.errors import EndpointDrainingError, MissingFieldError
 from axo_endpoint.core.events.bus import EventBus
 from axo_endpoint.core.functions import FunctionRegistry
 from axo_shared.protocol import Command, CommandHandler, CommandResult
+from axo_endpoint.core.runtime.attempts import JobAttempts
 from axo_endpoint.core.runtime import FunctionRuntime
 from axo_endpoint.core.runtime.queue_deadlines import QueueDeadlines
 from axo_endpoint.core.storage.backend import StorageBackend
@@ -34,7 +35,9 @@ class JobForwardHandler(CommandHandler):
         logger: _Logger = None,
         queue_deadlines: Optional[QueueDeadlines] = None,
         is_draining: Optional[Callable[[], bool]] = None,
+        attempts: Optional[JobAttempts] = None,
     ) -> None:
+        self._attempts = attempts
         self._runtime = runtime
         self._is_draining = is_draining
         self._queue_deadlines = queue_deadlines
@@ -68,4 +71,5 @@ class JobForwardHandler(CommandHandler):
             self._now_fn,
             self._logger,
             self._queue_deadlines,
+            attempts=self._attempts,
         )

@@ -54,6 +54,18 @@ class FunctionCodeStore:
         if saved.is_err:
             raise ConflictError(f"saving the code of {function_id} v{version} failed: {saved.unwrap_err()}")
 
+    def save_display(self, function_id: str, version: int, text: bytes) -> None:
+        """A pickled function's readable text (shown, never run)."""
+        self._ensure_bucket()
+        saved = self._client.upload(self._principal, self._bucket, f"{function_id}.display", text, format="raw",
+                                    version=version)
+        if saved.is_err:
+            raise ConflictError(f"saving the text of {function_id} v{version} failed: {saved.unwrap_err()}")
+
+    def load_display(self, function_id: str, version: int) -> Optional[bytes]:
+        text = self._client.download(self._principal, self._bucket, f"{function_id}.display", version)
+        return text.unwrap() if text.is_ok else None
+
     def load(self, function_id: str, version: int) -> bytes:
         code = self._client.download(self._principal, self._bucket, function_id, version)
         if code.is_err:
@@ -63,3 +75,4 @@ class FunctionCodeStore:
     def delete(self, function_id: str, version: Optional[int] = None) -> None:
         """One version, or all of them. Missing code is not an error."""
         self._client.delete(self._principal, self._bucket, function_id, version)
+        self._client.delete(self._principal, self._bucket, f"{function_id}.display", version)

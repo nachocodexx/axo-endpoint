@@ -146,7 +146,7 @@ def test_an_endpoint_that_never_reports_in_fails_after_the_timeout(world):
     assert fleet.get("ep-1").state == "failed"
 
 
-def test_failed_endpoint_is_restarted_then_replaced_then_given_up(world):
+def test_failed_endpoint_is_restarted_then_replaced_then_retried_less_often(world):
     clock, settings, fleet, ops, jobs, reconciler, _ = world
     reconciler.tick()
     bring_up(clock, ops, reconciler, "ep-1")
@@ -162,11 +162,44 @@ def test_failed_endpoint_is_restarted_then_replaced_then_given_up(world):
     assert fleet.get("ep-2").replaces == "ep-1" and fleet.get("ep-2").failures == 2
     bring_up(clock, ops, reconciler, "ep-2")
 
-    ops.containers["ep-2"] = "exited"          # 3rd failure -> give up, keep it failed
+    ops.containers["ep-2"] = "exited"          # 3rd failure -> wait 1 min, keeping the slot
     reconciler.tick()
     reconciler.tick()
-    assert fleet.get("ep-2").state == "failed" and fleet.get("ep-2").reason.startswith("gave up")
+    assert fleet.get("ep-2").state == "failed" and fleet.get("ep-2").reason.startswith("waiting 1 min")
     assert "ep-3" not in states(fleet)
+    clock.advance(59)
+    reconciler.tick()
+    assert "ep-3" not in states(fleet)
+
+    clock.advance(2)                           # never given up for good: replaced after the wait
+    reconciler.tick()
+    assert fleet.get("ep-2").state == "removed"
+    assert fleet.get("ep-3").replaces == "ep-2" and fleet.get("ep-3").failures == 3
+    bring_up(clock, ops, reconciler, "ep-3")
+
+    ops.containers["ep-3"] = "exited"          # failing again -> the next wait is longer
+    reconciler.tick()
+    reconciler.tick()
+    assert fleet.get("ep-3").reason.startswith("waiting 5 min")
+
+
+def test_a_repair_tries_a_waiting_endpoint_again_at_once(world):
+    clock, settings, fleet, ops, jobs, reconciler, _ = world
+    reconciler.tick()
+    bring_up(clock, ops, reconciler, "ep-1")
+    for _ in range(3):                         # fail until it waits
+        current = [e for e in fleet.in_states("running")][0].endpoint_id
+        ops.containers[current] = "exited"
+        reconciler.tick()
+        if fleet.in_states("starting", "creating"):
+            bring_up(clock, ops, reconciler, *[e.endpoint_id for e in fleet.in_states("starting", "creating")])
+    reconciler.tick()
+    waiting = fleet.in_states("failed")[0]
+    assert waiting.reason.startswith("waiting")
+
+    assert reconciler.retry_failed_now("ana") == [waiting.endpoint_id]
+    assert fleet.get(waiting.endpoint_id).state == "starting"       # failures started over: restarted first
+    assert fleet.get(waiting.endpoint_id).failures == 0
 
 
 def test_scale_down_drains_running_endpoints_and_never_kills_a_job(world):
@@ -227,6 +260,35 @@ def test_with_nothing_running_the_first_waiting_job_wakes_one_immediately(world)
     jobs.observe(*job(models.JOB_QUEUED, "j1", "ep-1", clock))
     reconciler.tick()
     assert fleet.get("ep-1").state == "starting"
+
+
+def test_a_sleeping_endpoint_whose_container_is_gone_is_replaced(world):
+    clock, settings, fleet, ops, jobs, reconciler, _ = world
+    settings.change({"min_endpoints": 0, "endpoint_idle_seconds": 60})
+    reconciler.tick()
+    bring_up(clock, ops, reconciler, "ep-1")
+    clock.advance(61)
+    reconciler.tick()
+    assert fleet.get("ep-1").state == "sleeping"
+
+    del ops.containers["ep-1"]                 # Docker lost it while it slept
+    ops.restart = lambda endpoint_id: "No such container"
+    reconciler.tick()
+    assert fleet.get("ep-1").state in ("failed", "removed")
+    reconciler.tick()
+    assert fleet.get("ep-1").state == "removed" and fleet.get("ep-2").replaces == "ep-1"
+
+
+def test_a_wake_that_fails_marks_the_endpoint_failed_instead_of_retrying_it_forever(world):
+    clock, settings, fleet, ops, jobs, reconciler, _ = world
+    settings.change({"min_endpoints": 0, "endpoint_idle_seconds": 60})
+    reconciler.tick()
+    bring_up(clock, ops, reconciler, "ep-1")
+    clock.advance(61)
+    reconciler.tick()
+    ops.start = lambda endpoint_id: "404 Client Error: Not Found"
+    assert reconciler.wake_one("a job is waiting") is None
+    assert fleet.get("ep-1").state == "failed" and "couldn't wake" in fleet.get("ep-1").reason
 
 
 def test_create_command_raises_the_target_and_uses_the_given_size(world):

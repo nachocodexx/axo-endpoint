@@ -10,7 +10,9 @@ from typing import Dict
 # subset via LaunchEndpointNodeUseCase's env_overrides.
 #
 # AXO_ENDPOINT_ID, AXO_ENDPOINT_SUB_CONNECT, AXO_ENDPOINT_API_URI,
-# AXO_ENDPOINT_ROUTER_BIND, and AXO_ENDPOINT_VIRTUAL_ENV_ID are listed here
+# AXO_ENDPOINT_ROUTER_BIND, AXO_ENDPOINT_VIRTUAL_ENV_ID and
+# AXO_ENDPOINT_CONTAINER_NETWORK (= the node's own network, so its runners
+# can reach it back) are listed here
 # for completeness/display, but LaunchEndpointNodeUseCase always sets them
 # itself from its own explicit parameters -- values supplied for these keys
 # via env_overrides are ignored, not merged, since a stale/mistaken override
@@ -69,5 +71,5 @@ DEPLOYMENT_DEFAULTS: Dict[str, str] = {
 # env_overrides are ignored (see module docstring above).
 MESH_IDENTITY_KEYS = frozenset({
     "AXO_ENDPOINT_ID", "AXO_ENDPOINT_SUB_CONNECT", "AXO_ENDPOINT_API_URI",
-    "AXO_ENDPOINT_ROUTER_BIND", "AXO_ENDPOINT_VIRTUAL_ENV_ID",
+    "AXO_ENDPOINT_ROUTER_BIND", "AXO_ENDPOINT_VIRTUAL_ENV_ID", "AXO_ENDPOINT_CONTAINER_NETWORK",
 })

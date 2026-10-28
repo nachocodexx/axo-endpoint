@@ -20,7 +20,6 @@ from axo_shared.activity.models import (
 from axo_endpoint.core.dataio import DataIOResolver, DataIOUnavailableError
 from axo_endpoint.core.errors import (
     AxoError,
-    FunctionExecError,
     FunctionNotFoundError,
     JobCancelledError,
     JobTimeoutError,
@@ -29,6 +28,7 @@ from axo_endpoint.core.errors import (
 from axo_endpoint.core.events.bus import Event as BusEvent, EventBus
 from axo_endpoint.core.functions import FunctionRegistry
 from axo_endpoint.core.runtime import FunctionRuntime, FunctionRuntimeError, InvocationHandle
+from axo_endpoint.core.runtime.failure import exec_error
 from axo_endpoint.core.runtime.queue_deadlines import QueueDeadlines
 from axo_endpoint.core.storage.backend import StorageKey
 from axo_endpoint.log import DumbLogger, Log
@@ -313,6 +313,7 @@ class ProcessFunctionRuntime(FunctionRuntime):
             args=(
                 child_conn, record.code, record.code_format, record.name,
                 self._memory_limit_bytes, self._cpu_limit_seconds, env_vars,
+                record.runtime_spec.call_style if record.runtime_spec else "kwargs",
             ),
             daemon=True,
         )
@@ -500,7 +501,7 @@ class ProcessFunctionRuntime(FunctionRuntime):
                 if status == "ok":
                     self._on_complete(invocation_handle, Ok(payload), result_warnings)
                 else:
-                    self._on_complete(invocation_handle, Err(FunctionExecError(payload)), result_warnings)
+                    self._on_complete(invocation_handle, Err(exec_error(payload)), result_warnings)
             finally:
                 cleanup_scratch_dir(scratch_dir)
                 handle.busy = False

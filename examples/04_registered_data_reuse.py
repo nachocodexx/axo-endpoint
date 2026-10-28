@@ -32,12 +32,13 @@ storage = StorageRouterServer("tcp://127.0.0.1:0", StorageService(
 ))
 
 
-def lookup_price(params, ctx):
+def lookup_price(item: str):
+    """The price of one item, read from the shop bucket."""
     # Runs inside the forked worker, where dataio is bound to this job.
     from axo_endpoint import dataio
 
     prices = dataio.read(IORef(bucket="shop", name="prices.pkl", format="pickle"))  # latest version
-    return prices.get(params["item"])
+    return prices.get(item)
 
 
 def main():

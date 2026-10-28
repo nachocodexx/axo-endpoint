@@ -5,9 +5,9 @@ import resource
 import uuid
 from typing import Any, Dict, Optional
 
-import cloudpickle
 
-from axo_shared.functions.source import materialize_function_from_source
+from axo_endpoint.core.runtime.entry import load_entry
+from axo_endpoint.core.runtime.failure import report_exception
 
 from axo_endpoint.core.dataio import DataIOError, IORef
 from axo_endpoint.core.runtime import build_invocation
@@ -55,6 +55,7 @@ def worker_main(
     memory_limit_bytes: int,
     cpu_limit_seconds: int,
     env_vars: Optional[Dict[str, str]] = None,
+    call_style: str = "kwargs",
 ) -> None:
     """Runs inside a worker process: loads the function once, then runs it
     again for every new request that arrives, until told to stop.
@@ -67,10 +68,7 @@ def worker_main(
     if env_vars:
         os.environ.update(env_vars)
     apply_rlimits(memory_limit_bytes, cpu_limit_seconds)
-    if code_format == "source":
-        func = materialize_function_from_source(code_bytes, function_name)  # cold start: paid once per worker lifetime
-    else:
-        func = cloudpickle.loads(code_bytes)  # cold start: paid once per worker lifetime
+    func = load_entry(code_bytes, code_format, function_name, call_style)  # cold start: paid once per worker lifetime
 
     while True:
         try:
@@ -91,7 +89,7 @@ def worker_main(
             # warns but still returns cleanly doesn't lose them.
             conn.send(("result", "ok", value, ctx.warnings))
         except Exception as exc:  # noqa: BLE001 - report it, don't crash the worker for a user bug
-            conn.send(("result", "err", repr(exc), ctx.warnings))
+            conn.send(("result", "err", report_exception(exc), ctx.warnings))
         finally:
             reset_channel(token)
 

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import time
-from typing import Callable, Union
+from typing import Callable, Optional, Union
 
 from axo_endpoint.core.errors import JobNotFoundError, MissingFieldError
 from axo_endpoint.core.runtime import FunctionRuntime
+from axo_endpoint.core.runtime.attempts import JobAttempts
 from axo_shared.protocol import Command, CommandHandler, CommandResult
 from axo_endpoint.log import DumbLogger, Log
 from axo_endpoint.log.catalog import Component, Event
@@ -21,8 +22,10 @@ class JobCancelHandler(CommandHandler):
 
     def __init__(
         self, runtime: FunctionRuntime, now_fn: Callable[[], float] = time.time, logger: _Logger = None,
+        attempts: Optional[JobAttempts] = None,
     ) -> None:
         self._runtime = runtime
+        self._attempts = attempts
         self._now_fn = now_fn
         self._logger: _Logger = logger or DumbLogger()
 
@@ -40,7 +43,8 @@ class JobCancelHandler(CommandHandler):
             )
             return CommandResult.from_error(err)
 
-        cancelled = self._runtime.cancel(job_id)
+        # Waiting for its next attempt (not in any runtime right now), or running / queued.
+        cancelled = (self._attempts is not None and self._attempts.cancel(job_id)) or self._runtime.cancel(job_id)
         duration_ms = round((time.monotonic() - t0) * 1000, 2)
         if not cancelled:
             err = JobNotFoundError(

@@ -10,9 +10,10 @@ from axo_control_plane.application.buckets import Buckets
 from axo_control_plane.application.ports import ContainerInfo, HistoryLog, Leases, StackDriver, StorageGateway, VemGateway
 from axo_control_plane.domain import virtual_environment as V
 from axo_control_plane.domain.errors import UnavailableError
+from axo_control_plane.domain.names import objects_bucket_for
 
 CLEANUP_LOGS_BUCKET = "axo/cleanup-logs"
-_VE_ROLES = ("vem", "kurrent", "mongo")
+_VE_ROLES = ("vem", "kurrent", "mongo", "redis")
 
 
 class Cleanup:
@@ -36,7 +37,9 @@ class Cleanup:
     def __init__(self, db: Database, driver: StackDriver, vem: VemGateway, storage: StorageGateway,
                  buckets: Buckets, leases: Leases, history: HistoryLog, instance_id: str,
                  confirm_after_s: float = 45.0, log_lines: int = 500,
-                 now_fn: Callable[[], float] = time.time) -> None:
+                 now_fn: Callable[[], float] = time.time,
+                 drop_bucket: Callable[[str], None] = lambda name: None) -> None:
+        self._drop_bucket = drop_bucket
         self._ves = db["virtual_environments"]
         self._suspects = db["cleanup_suspects"]
         self._log = db["cleanup_log"]
@@ -159,8 +162,12 @@ class Cleanup:
         for doc in self._ves.find({"lifecycle": V.DELETED, "volumes_removed": {"$ne": True},
                                    "purge_after": {"$lte": self._now_fn()}}):
             ve_id = doc["_id"]
-            for suffix in ("kurrent-data", "mongo-data", "vem-outbox"):
+            for suffix in ("kurrent-data", "mongo-data", "redis-data", "vem-outbox"):
                 self._driver.remove_volume(f"ve-{ve_id}-{suffix}")
+            if doc.get("objects_bucket"):
+                # its object values go with the manifests (in the Mongo volume)
+                self._drop_bucket(objects_bucket_for(ve_id))
+                self._ves.update_one({"_id": ve_id}, {"$set": {"objects_bucket": False}})
             self._ves.update_one({"_id": ve_id}, {"$set": {"volumes_removed": True}})
             self._history.append(f"ve-{ve_id}", "VirtualEnvironmentVolumesRemoved", {"ve_id": ve_id,
                                                                                     "at": self._now_fn()})

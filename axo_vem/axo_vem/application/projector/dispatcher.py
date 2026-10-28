@@ -3,7 +3,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, Optional, Union
 
-from axo_vem.application.projector import choreography_handler, compute_handler, job_handler
+from axo_vem.application.projector import choreography_handler, compute_handler, job_handler, object_handler
 from axo_vem.application.projector.handlers import ProjectorHandlers
 from axo_vem.domain.events import models
 from axo_vem.infrastructure.transport.ws.broadcaster import Broadcaster
@@ -17,7 +17,7 @@ _Logger = Union[Log, DumbLogger]
 # is just "pick whichever is present" rather than a per-type mapping.
 _ENTITY_ID_FIELDS = (
     "endpoint_id", "function_id", "user_id", "virtual_environment_id",
-    "job_id", "bucket", "consumer_group", "choreography_id",
+    "job_id", "bucket", "consumer_group", "choreography_id", "run_id", "object_id", "class_name",
 )
 
 # Event types with no dedicated aggregate collection of their own -- they
@@ -26,12 +26,24 @@ _ENTITY_ID_FIELDS = (
 # are deliberately NOT in this set.
 ACTIVITY_ONLY_EVENT_TYPES = frozenset({
     models.VE_SETTINGS_CHANGED,         # who changed which setting, and why
+    models.RESULT_VISIBILITY_CHANGED,   # who sees a function's / choreography's / object's runs
     models.ENDPOINT_LIFECYCLE_CHANGED,  # every endpoint state change, with its reason
     models.VE_LIFECYCLE_CHANGED,        # stop / start / restore / delete of the whole VE
+    models.VE_REPAIRED,                 # the Control Plane's Repair: its checks and what it did
     models.POLICY_SAVED, models.POLICY_DELETED, models.POLICIES_PAUSED,
     models.POLICY_DECISION_RECORDED,    # what a scaling policy did, and why
     models.FUNCTION_DELETE_FAILED,
     models.FUNCTION_BUILD_STARTED, models.FUNCTION_BUILD_COMPLETED, models.FUNCTION_BUILD_FAILED,
+    models.JOB_CANCEL_REQUESTED, models.JOB_RETRY_REQUESTED,   # who stopped / retried a job
+})
+
+# Readings, not things that happened: never written to unified_activity.
+# Endpoints' metric readings no longer reach the event log at all (the
+# ingestion router applies them straight to the endpoint, see
+# compute_handler.apply_reading); an older log's are still applied here.
+NOT_HISTORY_EVENT_TYPES = frozenset({
+    models.ACTIVE_OBJECT_STATE_SIZES_REPORTED,   # hourly sizes
+    models.ENDPOINT_METRICS_REPORTED,            # every few seconds
 })
 
 # No longer projected by a single-VE VEM: profiles and VEs belong to the
@@ -54,6 +66,8 @@ _ALL_KNOWN_EVENT_TYPES = (
     | {models.FUNCTION_DELETED, models.FUNCTION_ENDPOINT_DETACHED}
     | ACTIVITY_ONLY_EVENT_TYPES | compute_handler.CONSENSUS_EVENT_TYPES
     | job_handler.JOB_EVENT_TYPES | choreography_handler.CHOREOGRAPHY_EVENT_TYPES
+    | choreography_handler.CHOREOGRAPHY_RUN_EVENT_TYPES
+    | object_handler.OBJECT_EVENT_TYPES
 )
 
 
@@ -91,7 +105,8 @@ def apply_event(
         raise ValueError(f"unknown event_type: {event_type!r}")
 
     t0 = time.monotonic()
-    handlers.activity_recorder.record(event_type, data)
+    if event_type not in NOT_HISTORY_EVENT_TYPES:
+        handlers.activity_recorder.record(event_type, data)
 
     if event_type in compute_handler.ENDPOINT_EVENT_TYPES or event_type in compute_handler.FUNCTION_EVENT_TYPES \
             or event_type in (models.FUNCTION_DELETED, models.FUNCTION_ENDPOINT_DETACHED) \
@@ -100,12 +115,15 @@ def apply_event(
             handlers.endpoint_repository, handlers.function_repository, handlers.consensus_recorder,
             event_type, data, broadcaster,
         )
-    elif event_type in ACTIVITY_ONLY_EVENT_TYPES:
+    elif event_type in ACTIVITY_ONLY_EVENT_TYPES or event_type in choreography_handler.CHOREOGRAPHY_RUN_EVENT_TYPES:
         pass  # already recorded above; no other aggregate handler to route to
     elif event_type in job_handler.JOB_EVENT_TYPES:
-        job_handler.apply(handlers.job_repository, event_type, data)
+        job_handler.apply(handlers.job_repository, event_type, data, broadcaster)
     elif event_type in choreography_handler.CHOREOGRAPHY_EVENT_TYPES:
         choreography_handler.apply(handlers.choreography_repository, event_type, data)
+    elif event_type in object_handler.OBJECT_EVENT_TYPES:
+        object_handler.apply(handlers.object_class_repository, handlers.active_object_repository, event_type, data,
+                             broadcaster)
 
     entity_id = next((data[field] for field in _ENTITY_ID_FIELDS if field in data), None)
     _logger.info_event(

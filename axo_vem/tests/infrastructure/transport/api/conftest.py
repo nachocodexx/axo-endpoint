@@ -13,12 +13,9 @@ from axo_vem.application.projector.handlers import ProjectorHandlers
 from axo_vem.infrastructure.database.mongo.activity_repository import MongoActivityRepository
 from axo_vem.infrastructure.database.mongo.choreography_repository import MongoChoreographyRepository
 from axo_vem.infrastructure.database.mongo.choreography_run_repository import MongoChoreographyRunRepository
-from axo_vem.application.choreography.cancel_choreography_run import CancelChoreographyRunUseCase
-from axo_vem.application.choreography.create_choreography import CreateChoreographyUseCase
-from axo_vem.application.choreography.delete_choreography import DeleteChoreographyUseCase
+from axo_vem.application.choreography.engine import ChoreographyEngine
 from axo_vem.application.choreography.purge_choreography import PurgeChoreographyUseCase
-from axo_vem.application.choreography.run_choreography import RunChoreographyUseCase
-from axo_vem.application.choreography.update_choreography import UpdateChoreographyUseCase
+from axo_vem.application.choreography.service import ChoreographyService, StepCatalog
 from axo_vem.infrastructure.database.mongo.collections import ReadCollections
 from axo_vem.infrastructure.database.mongo.consensus_repository import MongoConsensusRepository
 from axo_vem.infrastructure.database.mongo.endpoint_repository import MongoEndpointRepository
@@ -106,7 +103,7 @@ def job_repository(db):
 
 @pytest.fixture
 def choreography_repository(db):
-    return MongoChoreographyRepository(db["choreographies"])
+    return MongoChoreographyRepository(db["choreographies"], db["choreography_versions"], db["choreography_names"])
 
 
 @pytest.fixture
@@ -170,54 +167,40 @@ def purge_endpoint_use_case(db, activity_repository, function_repository, job_re
 
 
 @pytest.fixture
-def create_choreography_use_case(kurrent_appender):
-    return CreateChoreographyUseCase(kurrent_appender)
+def step_jobs():
+    """Stands in for the endpoints: see tests/application/choreography/fakes.py."""
+    from tests.application.choreography.fakes import FakeStepJobs
+    return FakeStepJobs()
 
 
 @pytest.fixture
-def update_choreography_use_case(choreography_repository, choreography_run_repository, kurrent_appender):
-    return UpdateChoreographyUseCase(choreography_repository, choreography_run_repository, kurrent_appender)
+def choreography_service(choreography_repository, choreography_run_repository, function_repository,
+                         kurrent_appender):
+    return ChoreographyService(choreography_repository, choreography_run_repository,
+                               StepCatalog(function_repository), kurrent_appender, "ve1")
 
 
 @pytest.fixture
-def delete_choreography_use_case(choreography_repository, choreography_run_repository, kurrent_appender):
-    return DeleteChoreographyUseCase(choreography_repository, choreography_run_repository, kurrent_appender)
-
-
-@pytest.fixture
-def purge_choreography_use_case(db, activity_repository):
-    return PurgeChoreographyUseCase(db["choreographies"], db["choreography_runs"], activity_repository)
-
-
-@pytest.fixture
-def run_choreography_use_case(
-    choreography_repository, choreography_run_repository, function_repository, endpoint_repository,
-    submit_function_job_use_case,
-):
-    return RunChoreographyUseCase(
-        choreography_repository=choreography_repository,
-        run_repository=choreography_run_repository,
-        function_repository=function_repository,
-        endpoint_repository=endpoint_repository,
-        submit_function_job_use_case=submit_function_job_use_case,
+def choreography_engine(choreography_service, choreography_repository, choreography_run_repository,
+                        function_repository, step_jobs, kurrent_appender, db):
+    engine = ChoreographyEngine(
+        choreography_service, choreography_repository, choreography_run_repository, StepCatalog(function_repository),
+        step_jobs, kurrent_appender, results=step_jobs,
+        poll_interval_seconds=0.01, workers=8,
     )
+    yield engine
+    engine.shutdown()
 
 
 @pytest.fixture
-def cancel_choreography_run_use_case(choreography_repository, choreography_run_repository, run_choreography_use_case):
-    return CancelChoreographyRunUseCase(
-        choreography_repository=choreography_repository,
-        run_repository=choreography_run_repository,
-        run_use_case=run_choreography_use_case,
-    )
+def purge_choreography_use_case(choreography_repository, choreography_run_repository, activity_repository):
+    return PurgeChoreographyUseCase(choreography_repository, choreography_run_repository, activity_repository)
 
 
 @pytest.fixture
 def client(
     collections, activity_repository, job_repository,
-    choreography_repository, choreography_run_repository,
-    create_choreography_use_case, update_choreography_use_case, delete_choreography_use_case,
-    purge_choreography_use_case, run_choreography_use_case, cancel_choreography_run_use_case,
+    choreography_service, choreography_engine, purge_choreography_use_case,
     register_function_use_case, delete_function_use_case, update_function_use_case,
     purge_function_version_use_case, purge_endpoint_use_case, submit_function_job_use_case,
     fake_kurrent_reader,
@@ -228,14 +211,9 @@ def client(
         collections=collections,
         activity_repository=activity_repository,
         job_repository=job_repository,
-        choreography_repository=choreography_repository,
-        choreography_run_repository=choreography_run_repository,
-        create_choreography_use_case=create_choreography_use_case,
-        update_choreography_use_case=update_choreography_use_case,
-        delete_choreography_use_case=delete_choreography_use_case,
+        choreography_service=choreography_service,
+        choreography_engine=choreography_engine,
         purge_choreography_use_case=purge_choreography_use_case,
-        run_choreography_use_case=run_choreography_use_case,
-        cancel_choreography_run_use_case=cancel_choreography_run_use_case,
         register_function_use_case=register_function_use_case,
         delete_function_use_case=delete_function_use_case,
         update_function_use_case=update_function_use_case,

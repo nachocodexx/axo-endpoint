@@ -3,7 +3,7 @@ from option import Err, Ok
 from axo_shared.container.errors import ContainerSpawnError
 from axo_shared.container.handle import SpawnedContainerHandle
 
-from axo_vem.application.nodes.launch_endpoint_node import LaunchEndpointNodeUseCase
+from axo_vem.application.nodes.launch_endpoint_node import LaunchEndpointNodeUseCase, object_backend_env
 from axo_vem.domain.compute.endpoint import Endpoint
 
 
@@ -130,6 +130,19 @@ def test_execute_ignores_mesh_identity_keys_in_env_overrides():
     assert env["AXO_ENDPOINT_LOG_LEVEL"] == "INFO"  # non-identity override still applies
 
 
+def test_execute_puts_the_endpoints_runners_on_its_own_network():
+    """Runners call the endpoint back by name, so they must share its
+    network -- never the defaults' axo-net, whatever the overrides say."""
+    spawner = _FakeSpawner()
+    use_case = LaunchEndpointNodeUseCase(spawner=spawner, image="axo-endpoint:local", network="ve-ml-prod-net")
+
+    use_case.execute(api_uri="tcp://axo-vem:6000", env_overrides={"AXO_ENDPOINT_CONTAINER_NETWORK": "axo-net"})
+
+    call = spawner.spawn_calls[0]
+    assert call["network"] == "ve-ml-prod-net"
+    assert call["env"]["AXO_ENDPOINT_CONTAINER_NETWORK"] == "ve-ml-prod-net"
+
+
 def test_execute_includes_docker_socket_mount():
     spawner = _FakeSpawner()
     use_case = LaunchEndpointNodeUseCase(spawner=spawner, image="axo-endpoint:local", network="axo-net")
@@ -189,3 +202,26 @@ def test_execute_sizes_the_container_and_the_endpoints_runner_budget():
     assert call["env"]["AXO_ENDPOINT_CPU_CORES"] == "2.0"
     assert call["env"]["AXO_ENDPOINT_MEMORY_MB"] == "4096"
     assert call["env"]["AXO_ENDPOINT_RUNNER_BUDGET_ENFORCED"] == "true"
+
+
+def test_execute_points_object_state_at_the_ves_own_mongo_redis_and_bucket():
+    spawner = _FakeSpawner()
+    use_case = LaunchEndpointNodeUseCase(
+        spawner=spawner, image="axo-endpoint:local", network="axo-net", virtual_environment_id="ml-prod",
+        object_env=object_backend_env("mongodb://ve-ml-prod-mongo:27017", "redis://ve-ml-prod-redis:6379/0",
+                                      "axo_storage"),
+    )
+
+    use_case.execute(api_uri="tcp://axo-vem:6000")
+
+    env = spawner.spawn_calls[0]["env"]
+    assert env["AXO_ENDPOINT_OBJECT_MANIFESTS"] == "mongo"
+    assert env["AXO_ENDPOINT_OBJECT_MONGO_URI"] == "mongodb://ve-ml-prod-mongo:27017"
+    assert env["AXO_ENDPOINT_OBJECT_HOT"] == "redis"
+    assert env["AXO_ENDPOINT_OBJECT_REDIS_URI"] == "redis://ve-ml-prod-redis:6379/0"
+    assert env["AXO_ENDPOINT_OBJECT_BLOBS"] == "axo_storage"
+
+
+def test_no_object_backends_leaves_the_endpoints_default():
+    assert object_backend_env() == {}
+    assert object_backend_env(mongo_uri="mongodb://m")["AXO_ENDPOINT_OBJECT_HOT"] == "mongo"   # no Redis

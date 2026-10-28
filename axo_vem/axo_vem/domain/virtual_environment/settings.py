@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, fields, replace
 from typing import Any, Dict, List, Optional
 
+from axo_shared.runtime.results import KEEP_RESULT_CHOICES, NEVER, longer as keep_longer
+
 
 def stream_name(virtual_environment_id: str) -> str:
     """The one stream holding every settings change of this VE."""
@@ -25,6 +27,35 @@ class PlanLimits:
     # fit. None = no quota (local dev without a Control Plane).
     quota_cpu_cores: Optional[float] = None
     quota_memory_mb: Optional[int] = None
+    # Active objects (per plan): the largest state of one object (None = no
+    # cap), JSON values up to this size kept in memory (hot), and the past
+    # revisions kept per object: the default and the most an object may ask.
+    object_max_state_bytes: Optional[int] = None
+    object_hot_max_bytes: int = 4096
+    object_keep_revisions: int = 10
+    object_max_keep_revisions: Optional[int] = None
+    # History past the retention is hidden at once and deleted for good this
+    # many days later (platform-wide, set by the Control Plane).
+    history_grace_days: int = 7
+    # Container functions' runners (per plan): the size a function gets when
+    # it doesn't ask for one, and the most it may ask. None = no plan rule
+    # (local dev without a Control Plane).
+    runner_cpu_cores: Optional[float] = None
+    runner_memory_mb: Optional[int] = None
+    runner_max_cpu_cores: Optional[float] = None
+    runner_max_memory_mb: Optional[int] = None
+
+    def state_limits(self) -> Dict[str, Any]:
+        """What each object operation carries to the endpoints."""
+        return {"max_state_bytes": self.object_max_state_bytes, "hot_max_bytes": self.object_hot_max_bytes,
+                "keep_revisions": self.object_keep_revisions, "max_keep_revisions": self.object_max_keep_revisions}
+
+    def keep_revisions_problem(self, keep: int) -> Optional[str]:
+        if keep < 0:
+            return "keep_revisions can't be negative"
+        if self.object_max_keep_revisions is not None and keep > self.object_max_keep_revisions:
+            return f"the plan keeps at most {self.object_max_keep_revisions} past revisions per object"
+        return None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -68,6 +99,10 @@ class VeSettings:
     runner_queue_limit: Optional[int] = None
     # How long history is shown; None = up to the plan maximum.
     retention_days: Optional[int] = None
+    # How long job results are kept (axo_shared.runtime.results choices):
+    # the longest a job may ask for, and what a job that doesn't choose gets.
+    result_keep_max: str = NEVER
+    result_keep_default: str = "7d"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -149,4 +184,12 @@ def validate_changes(current: VeSettings, changes: Dict[str, Any], limits: PlanL
             errors.append("retention_days must be a whole number ≥ 1, or null for the plan maximum")
         elif limits.max_retention_days is not None and after.retention_days > limits.max_retention_days:
             errors.append(f"retention_days is above the plan maximum ({limits.max_retention_days})")
+
+    choices = ", ".join(KEEP_RESULT_CHOICES)
+    for name in ("result_keep_max", "result_keep_default"):
+        if getattr(after, name) not in KEEP_RESULT_CHOICES:
+            errors.append(f"{name} must be one of {choices}")
+    if not errors and keep_longer(after.result_keep_default, after.result_keep_max):
+        errors.append(f"result_keep_default ({after.result_keep_default}) is longer than "
+                      f"result_keep_max ({after.result_keep_max})")
     return errors

@@ -44,6 +44,11 @@ class EndpointRepository(ABC):
     @abstractmethod
     def apply_event_data(self, endpoint_id: str, data: Dict[str, Any]) -> None: ...
 
+    def apply_reading(self, endpoint_id: str, data: Dict[str, Any]) -> None:
+        """An endpoint's latest metric reading, for an endpoint already
+        listed; one older than what's kept is ignored where the store can tell."""
+        self.apply_event_data(endpoint_id, data)
+
     @abstractmethod
     def list_all(self) -> List[Endpoint]:
         """Every endpoint of this VEM's VE (a VEM manages exactly one VE),
@@ -90,6 +95,14 @@ class FunctionRepository(ABC):
     @abstractmethod
     def list_active(self) -> List[Function]:
         """Every function version not soft-deleted (Restoring re-registers these)."""
+
+    @abstractmethod
+    def latest(self, function_id: str) -> Optional[Function]:
+        """The newest version not soft-deleted."""
+
+    @abstractmethod
+    def find_by_code_hash(self, function_id: str, code_hash: str) -> Optional[Function]:
+        """The live version of this function registered with exactly this code."""
 
     @abstractmethod
     def list_by_endpoint_id(self, endpoint_id: str) -> List[Function]:

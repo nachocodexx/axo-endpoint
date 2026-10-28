@@ -32,6 +32,15 @@ def build_router(broadcaster: Broadcaster, service_token: str) -> APIRouter:
         finally:
             broadcaster.unregister(topic, websocket)
 
+    @router.websocket("/ws/jobs")
+    async def ws_jobs(websocket: WebSocket, token: Optional[str] = None) -> None:
+        """Every job change (status, attempt, result kept) -- never a traceback."""
+        await _serve(websocket, "jobs", token)
+
+    @router.websocket("/ws/jobs/{job_id}")
+    async def ws_job(websocket: WebSocket, job_id: str, token: Optional[str] = None) -> None:
+        await _serve(websocket, f"jobs:{job_id}", token)
+
     @router.websocket("/ws/endpoints")
     async def ws_endpoints(websocket: WebSocket, token: Optional[str] = None) -> None:
         """Every endpoint's status changes and container stats."""
@@ -47,9 +56,24 @@ def build_router(broadcaster: Broadcaster, service_token: str) -> APIRouter:
         """Every function lifecycle change (registered ... deleted)."""
         await _serve(websocket, "functions", token)
 
+    @router.websocket("/ws/objects")
+    async def ws_objects(websocket: WebSocket, token: Optional[str] = None) -> None:
+        """Every class registered and object created / called / upgraded / deleted."""
+        await _serve(websocket, "objects", token)
+
+    @router.websocket("/ws/objects/{object_id}")
+    async def ws_object(websocket: WebSocket, object_id: str, token: Optional[str] = None) -> None:
+        """Same feed, for one object."""
+        await _serve(websocket, f"objects:{object_id}", token)
+
+    @router.websocket("/ws/choreographies")
+    async def ws_choreography_runs(websocket: WebSocket, token: Optional[str] = None) -> None:
+        """Every run's status changes (queued, running, ended)."""
+        await _serve(websocket, "choreographies", token)
+
     @router.websocket("/ws/choreographies/{run_id}")
     async def ws_choreography_run(websocket: WebSocket, run_id: str, token: Optional[str] = None) -> None:
-        """Live per-node/per-edge status for one choreography run."""
+        """One run, step by step (``type: step``) plus its own status (``type: run``)."""
         await _serve(websocket, f"choreographies:{run_id}", token)
 
     return router

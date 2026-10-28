@@ -6,10 +6,9 @@ import subprocess
 import sys
 from typing import Any, Callable, List
 
-import cloudpickle
 import zmq
 
-from axo_shared.functions.source import materialize_function_from_source
+from axo_endpoint.core.runtime.entry import load_entry
 from axo_shared.protocol import Command
 from axo_shared.wire import (
     CONTAINER_BOOTSTRAP,
@@ -25,10 +24,10 @@ def fetch_code(
     function_id: str,
     version: int,
     timeout_ms: int = 30_000,
-) -> tuple[bytes, str, List[str], str]:
+) -> tuple[bytes, str, List[str], str, str]:
     """Connects to the endpoint, requests function code and requirements.
 
-    Returns (code_bytes, code_format, requirements_list, name) -- does not
+    Returns (code_bytes, code_format, requirements_list, name, call_style) -- does not
     turn the code into a callable; see materialize_function(). ``name`` is
     the function's registered display name, required (not function_id) to
     materialize "source"-format code, since the uploaded module defines a
@@ -68,16 +67,16 @@ def fetch_code(
     requirements: List[str] = cr.metadata.get("requirements", [])
     code_format: str = cr.metadata.get("code_format", "cloudpickle")
     name: str = cr.metadata.get("name", function_id)
-    return cr.payload, code_format, requirements, name
+    call_style: str = cr.metadata.get("call_style", "kwargs")
+    return cr.payload, code_format, requirements, name, call_style
 
 
-def materialize_function(code_bytes: bytes, code_format: str, function_name: str) -> Callable[..., Any]:
-    """Turns fetched code into a callable -- for a source-format function,
-    this must run after install_requirements(), since its module body may
-    import them."""
-    if code_format == "source":
-        return materialize_function_from_source(code_bytes, function_name)
-    return cloudpickle.loads(code_bytes)
+def materialize_function(code_bytes: bytes, code_format: str, function_name: str,
+                         call_style: str = "kwargs") -> Callable[..., Any]:
+    """Turns fetched code into the ``(params, ctx)`` callable -- for
+    source-format code, this must run after install_requirements(), since
+    its module body may import them."""
+    return load_entry(code_bytes, code_format, function_name, call_style)
 
 
 def install_requirements(requirements: List[str]) -> None:

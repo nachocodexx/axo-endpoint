@@ -27,6 +27,7 @@ def serialize_function_record(record: FunctionRecord) -> bytes:
         "state": record.state.value,
         "runtime_spec": record.runtime_spec.to_dict() if record.runtime_spec else None,
         "code_format": record.code_format,
+        "code_hash": record.code_hash,
         "params_schema": params_schema_to_list(record.params_schema),
     }
     return json.dumps(d).encode("utf-8")
@@ -44,6 +45,7 @@ def deserialize_function_record(blob: bytes) -> FunctionRecord:
         state=FunctionState(d["state"]),
         runtime_spec=RuntimeSpec.from_dict(d["runtime_spec"]) if d.get("runtime_spec") else None,
         code_format=d.get("code_format", "cloudpickle"),
+        code_hash=d.get("code_hash"),
         params_schema=parse_params_schema(d.get("params_schema")) or None,
     )
 

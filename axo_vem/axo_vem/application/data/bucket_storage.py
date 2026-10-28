@@ -52,6 +52,9 @@ class BucketStorage:
 
     def upload(
         self, user_id: str, bucket: str, key: str, data: bytes, format: str = "raw", version: Optional[int] = None,
+        source: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Stores ``data`` as a new version (the next one when ``version`` is None)."""
-        return self._unwrap(self._client.upload(user_id, bucket, key, data, format=format, version=version))
+        """Stores ``data`` as a new version (the next one when ``version`` is
+        None); ``source`` = what wrote it (see engine.source_tag)."""
+        return self._unwrap(self._client.upload(user_id, bucket, key, data, format=format, version=version,
+                                                source=source))

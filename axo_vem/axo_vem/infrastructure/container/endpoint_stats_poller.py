@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import time
-from typing import Union
+from typing import Callable, Optional, Union
 
 from pymongo.collection import Collection
 
 from axo_shared.container.spawner import ContainerSpawner
+from axo_shared.metrics import MetricAggregator
+from axo_shared.metrics import names as m
 from axo_shared.runtime.spec import ContainerMode
 
 from axo_vem.infrastructure.transport.ws.broadcaster import Broadcaster
@@ -48,6 +50,8 @@ class EndpointStatsPoller:
         broadcaster: Broadcaster,
         interval_seconds: float = 3.0,
         logger: _Logger = None,
+        metrics: Optional[MetricAggregator] = None,
+        cpu_cores_of: Optional[Callable[[str], Optional[float]]] = None,
     ) -> None:
         self._endpoints = endpoints
         self._spawner = spawner
@@ -55,6 +59,8 @@ class EndpointStatsPoller:
         self._broadcaster = broadcaster
         self._interval_seconds = interval_seconds
         self._logger: _Logger = logger or DumbLogger()
+        self._metrics = metrics
+        self._cpu_cores_of = cpu_cores_of
         self._stopped = False
 
     def stop(self) -> None:
@@ -62,7 +68,12 @@ class EndpointStatsPoller:
 
     def run_forever(self) -> None:
         while not self._stopped:
-            self.tick()
+            try:
+                self.tick()
+            except Exception as exc:  # e.g. Mongo away for a moment: one bad tick must not end the loop
+                self._logger.error_event(
+                    Event.StatsPoller.TICK_FAILED, component=Component.STATS_POLLER, error=str(exc),
+                )
             time.sleep(self._interval_seconds)
 
     def tick(self) -> None:
@@ -79,6 +90,23 @@ class EndpointStatsPoller:
                 continue
             self._broadcaster.broadcast(WS_TOPIC_ALL, message)
             self._broadcaster.broadcast(_scoped_topic(message["endpoint_id"]), message)
+            self._record(message)
+
+    def _record(self, message: dict) -> None:
+        """Each reading also goes into the statistics as a share of the
+        endpoint's size (resource.cpu_pct / ram_pct, by endpoint): the
+        Monitoring charts and the CPU / memory scaling rules read them.
+        Docker counts 100 % per core, so CPU is divided by the endpoint's
+        cores (as the UI's endpoints list does)."""
+        if self._metrics is None or not message.get("available"):
+            return
+        endpoint_id = message["endpoint_id"]
+        dims = {"component": endpoint_id}
+        cores = (self._cpu_cores_of(endpoint_id) if self._cpu_cores_of else None) or 1.0
+        self._metrics.observe(m.RESOURCE_CPU_PCT, float(message["cpu_percent"]) / max(cores, 0.01), dims)
+        if message.get("memory_limit"):
+            self._metrics.observe(m.RESOURCE_RAM_PCT,
+                                  100.0 * float(message.get("memory_usage") or 0) / float(message["memory_limit"]), dims)
 
     def _message_for(self, endpoint_id: str) -> dict:
         handle = self._spawner.get(self._mode, endpoint_id)

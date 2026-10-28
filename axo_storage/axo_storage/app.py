@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 from typing import Optional
+
+from axo_shared.messaging import ReliableSender, SqliteJournal, ZmqDealerTransport
 
 from axo_storage.access import (
     AccessChecker,
@@ -16,6 +19,7 @@ from axo_storage.config import Config
 from axo_storage.log import Log
 from axo_storage.server import StorageRouterServer
 from axo_storage.service import StorageService
+from axo_storage.usage import STORAGE_OBJECT_WRITTEN, UsageMeter, UsageReporter, object_written
 
 
 class App:
@@ -40,6 +44,19 @@ class App:
             MemoryChunkStore() if config.AXO_STORAGE_BACKEND == "memory"
             else FilesystemChunkStore(config.AXO_STORAGE_FS_ROOT)
         )
+        self.meter = UsageMeter()
+        self.sender: Optional[ReliableSender] = None
+        self.reporter: Optional[UsageReporter] = None
+        if config.AXO_STORAGE_CP_INTAKE_URI:
+            os.makedirs(config.AXO_STORAGE_USAGE_OUTBOX_PATH, exist_ok=True)
+            journal = SqliteJournal(os.path.join(config.AXO_STORAGE_USAGE_OUTBOX_PATH,
+                                                 f"storage-{config.AXO_STORAGE_INSTANCE_ID}.db"))
+            self.sender = ReliableSender(journal, ZmqDealerTransport(config.AXO_STORAGE_CP_INTAKE_URI),
+                                         source_id=f"storage:{config.AXO_STORAGE_INSTANCE_ID}")
+            self.reporter = UsageReporter(
+                self.meter, self.catalog.all_bucket_sizes,
+                lambda event_type, data, message_id: self.sender.publish(event_type, data, message_id),
+                config.AXO_STORAGE_INSTANCE_ID)
         self.service = StorageService(
             catalog=self.catalog,
             chunks=self.chunks,
@@ -49,10 +66,16 @@ class App:
             ),
             access=CachingAccessChecker(self._access_checker(), config.AXO_STORAGE_ACCESS_CACHE_SECONDS),
             logger=self.logger,
+            meter=self.meter if self.reporter is not None else None,
+            on_written=self._report_written if self.sender is not None else None,
         )
         self.server = StorageRouterServer(
             config.AXO_STORAGE_ROUTER_BIND, self.service, workers=config.AXO_STORAGE_WORKERS, logger=self.logger,
         )
+
+    def _report_written(self, row, caller) -> None:
+        data, message_id = object_written(row, caller)
+        self.sender.publish(STORAGE_OBJECT_WRITTEN, data, message_id)
 
     def _access_checker(self) -> AccessChecker:
         if self.config.AXO_STORAGE_ACCESS_MODE == "allow_all":
@@ -70,7 +93,14 @@ class App:
 
     def start(self) -> None:
         self.server.start()
+        if self.sender is not None and self.reporter is not None:
+            self.sender.start()
+            self.reporter.start()
 
     def stop(self) -> None:
         self.server.stop()
+        if self.reporter is not None:
+            self.reporter.stop()
+        if self.sender is not None:
+            self.sender.stop()
         self.catalog.close()

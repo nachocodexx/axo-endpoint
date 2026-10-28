@@ -78,6 +78,11 @@ def build_router(
             "cpu_cores": managed.cpu_cores, "memory_mb": managed.memory_mb, "failures": managed.failures,
         }
 
+    def _forgotten(endpoint_id: str) -> bool:
+        """Forgotten endpoints are never shown again, even if their doc comes
+        back (a projector rebuild replays their EndpointStarted / Stopped)."""
+        return fleet is not None and fleet.is_forgotten(endpoint_id)
+
     def _require_reconciler() -> Reconciler:
         if reconciler is None:
             raise HTTPException(status_code=503, detail="endpoint management is not configured on this VEM")
@@ -85,7 +90,7 @@ def build_router(
 
     @router.get("/endpoints")
     def list_endpoints(include_removed: bool = False, _current_user: ActingUser = Depends(current_user_dependency)):
-        listed = [_decorate(doc) for doc in endpoints.find()]
+        listed = [_decorate(doc) for doc in endpoints.find() if not _forgotten(doc["_id"])]
         if fleet is not None:
             # Managed endpoints that haven't reported in yet (creating).
             known = {e["endpoint_id"] for e in listed if "endpoint_id" in e} | {e.get("_id") for e in listed}
@@ -128,7 +133,7 @@ def build_router(
     @router.get("/endpoints/{endpoint_id}")
     def get_endpoint(endpoint_id: str, _current_user: ActingUser = Depends(current_user_dependency)):
         doc = endpoints.find_one({"_id": endpoint_id})
-        if doc is not None:
+        if doc is not None and not _forgotten(endpoint_id):
             return _decorate(doc)
         managed = fleet.get(endpoint_id) if fleet is not None else None
         if managed is None:
@@ -136,12 +141,23 @@ def build_router(
         return {"endpoint_id": endpoint_id, **_lifecycle(managed)}
 
     @router.delete("/endpoints/{endpoint_id}/purge")
-    def purge_endpoint(endpoint_id: str, _current_user: ActingUser = Depends(current_user_dependency)):
-        """Deletes a gone endpoint's read-model doc and its activity --
-        requires it to be stopped or unreachable. Cascades to the functions
-        only it still held (see PurgeEndpointUseCase)."""
+    def purge_endpoint(endpoint_id: str, current_user: ActingUser = Depends(current_user_dependency)):
+        """"Forget": deletes a gone endpoint's read-model doc (its history
+        stays until the VE's retention deletes it) -- requires it to be
+        stopped or unreachable; it's never listed again. Cascades to the functions
+        only it still held (see PurgeEndpointUseCase). A removed / failed
+        endpoint the VEM managed also leaves the fleet (one that never
+        reported in has only that)."""
+        managed = fleet.get(endpoint_id) if fleet is not None else None
+        if managed is not None and endpoints.find_one({"_id": endpoint_id}) is None:
+            if not fleet.forget(endpoint_id, by=current_user.key):
+                raise HTTPException(status_code=409, detail="only a removed or failed endpoint can be forgotten")
+            return {"endpoint_id": endpoint_id}
         if purge_endpoint_use_case is not None:
-            return purge_endpoint_use_case.execute(endpoint_id=endpoint_id)
+            result = purge_endpoint_use_case.execute(endpoint_id=endpoint_id)
+            if managed is not None:
+                fleet.forget(endpoint_id, by=current_user.key)
+            return result
 
         doc = endpoints.find_one({"_id": endpoint_id})
         if doc is None:
@@ -150,7 +166,8 @@ def build_router(
             raise HTTPException(status_code=409, detail="endpoint must be stopped or unreachable before it can be purged")
 
         endpoints.delete_one({"_id": endpoint_id})
-        purged = activity_repository.purge(endpoint_id=endpoint_id)
-        return {"endpoint_id": endpoint_id, "purged_activity_count": purged}
+        if managed is not None:
+            fleet.forget(endpoint_id, by=current_user.key)
+        return {"endpoint_id": endpoint_id}
 
     return router

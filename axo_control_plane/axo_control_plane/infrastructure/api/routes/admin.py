@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
 from axo_control_plane.application.people import Actor
+from axo_control_plane.application.settings import UserSettings
 from axo_control_plane.domain.plans import Plan, PriceList
 from axo_control_plane.infrastructure.api.deps import Services, platform_admin, services, storage_caller
 
@@ -37,6 +38,16 @@ def build_router() -> APIRouter:
     def set_role(user_id: str, body: RoleBody, who: Actor = Depends(platform_admin), svc: Services = Depends(services)):
         svc.people.set_platform_role(user_id, body.role, by=who.user_id)
 
+    @router.get("/admin/settings/defaults", tags=["admin", "settings"])
+    def setting_defaults(_: Actor = Depends(platform_admin), svc: Services = Depends(services)):
+        return _settings(svc).describe_defaults()
+
+    @router.patch("/admin/settings/defaults", tags=["admin", "settings"])
+    def change_setting_defaults(body: Dict[str, Any], who: Actor = Depends(platform_admin),
+                                svc: Services = Depends(services)):
+        """The defaults of everyone who didn't choose a value; ``null`` = the built-in one."""
+        return _settings(svc).set_defaults(body, by=who.user_id)
+
     @router.get("/admin/ves", tags=["admin"])
     def all_ves(who: Actor = Depends(platform_admin), svc: Services = Depends(services)):
         return svc.ves.list_for(who)
@@ -65,3 +76,7 @@ def build_router() -> APIRouter:
         return svc.storage_access.check(body.user_id, body.bucket, body.mode, body.virtual_environment_id)
 
     return router
+
+
+def _settings(svc: Services) -> UserSettings:
+    return svc.settings or UserSettings(svc.db)

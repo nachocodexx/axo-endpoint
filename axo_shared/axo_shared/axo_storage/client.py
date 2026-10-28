@@ -167,6 +167,11 @@ class AxoStorageClient:
     def bucket_info(self, user_id: str, name: str) -> Result[Dict[str, Any], AxoError]:
         return self._meta(wire.BUCKET_INFO, user_id, {"name": name})
 
+    def bucket_stats(self, user_id: str, names: List[str]) -> Result[Dict[str, Dict[str, Any]], AxoError]:
+        """Platform services only: {key: {used_bytes, files, last_change}}."""
+        result = self._meta(wire.BUCKET_STATS, user_id, {"names": list(names)})
+        return Ok(result.unwrap().get("buckets", {})) if result.is_ok else Err(result.unwrap_err())
+
     def delete_bucket(self, user_id: str, name: str) -> Result[Dict[str, Any], AxoError]:
         """Platform services only: every object of the bucket, then the bucket."""
         return self._meta(wire.BUCKET_DELETE, user_id, {"name": name})
@@ -182,12 +187,16 @@ class AxoStorageClient:
         total_size: Optional[int] = None,
         chunk_bytes: int = DEFAULT_CHUNK_BYTES,
         content_hash: Optional[str] = None,
+        source: Optional[str] = None,
     ) -> Result[Dict[str, Any], AxoError]:
         """Starts a new object version (next one when ``version`` is None).
-        ``total_size`` None = streamed: put chunks in order, then finalize()."""
+        ``total_size`` None = streamed: put chunks in order, then finalize().
+        ``source`` = what is writing (e.g. "choreography:<id>"), passed on
+        with the "object written" report."""
         return self._meta(wire.OBJECT_REGISTER, user_id, {
             "bucket": bucket, "name": name, "version": version, "format": format,
             "total_size": total_size, "chunk_bytes": chunk_bytes, "content_hash": content_hash,
+            "source": source,
         })
 
     def put_chunk(
@@ -219,6 +228,13 @@ class AxoStorageClient:
         result = self._meta(wire.OBJECT_LIST, user_id, {"bucket": bucket, "name": name})
         return Ok(result.unwrap().get("objects", [])) if result.is_ok else Err(result.unwrap_err())
 
+    def list_files(self, user_id: str, bucket: str, prefix: str = "", after: Optional[str] = None,
+                   limit: int = 200, delimiter: Optional[str] = "/") -> Result[Dict[str, Any], AxoError]:
+        """A page of files under ``prefix``, one row each (newest version,
+        version count), folders first: ``{"entries": [...], "next"}``."""
+        return self._meta(wire.OBJECT_LIST, user_id, {"bucket": bucket, "files": True, "prefix": prefix,
+                                                      "after": after, "limit": limit, "delimiter": delimiter})
+
     def delete(self, user_id: str, bucket: str, name: str, version: Optional[int] = None) -> Result[Dict[str, Any], AxoError]:
         """Deletes one version, or every version when ``version`` is None."""
         return self._meta(wire.OBJECT_DELETE, user_id, {"bucket": bucket, "name": name, "version": version})
@@ -233,11 +249,12 @@ class AxoStorageClient:
         format: str = "raw",
         version: Optional[int] = None,
         chunk_bytes: int = DEFAULT_CHUNK_BYTES,
+        source: Optional[str] = None,
     ) -> Result[Dict[str, Any], AxoError]:
         """Registers and uploads ``data`` in one go; returns the final record."""
         registered = self.register(
             user_id, bucket, name, version=version, format=format, total_size=len(data),
-            chunk_bytes=chunk_bytes, content_hash=hashlib.sha256(data).hexdigest(),
+            chunk_bytes=chunk_bytes, content_hash=hashlib.sha256(data).hexdigest(), source=source,
         )
         if registered.is_err:
             return registered

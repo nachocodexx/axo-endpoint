@@ -14,12 +14,13 @@ USER_ID = "local"
 VIRTUAL_ENVIRONMENT_ID = "dev-ve"
 
 
-def lookup_price(params, ctx):
+def lookup_price(item: str):
+    """The price of one item, read from the shop bucket."""
     from axo_endpoint import dataio
     from axo_endpoint.core.dataio import IORef
 
     prices = dataio.read(IORef(bucket="shop", name="prices.pkl", format="pickle"))
-    return prices.get(params["item"])
+    return prices.get(item)
 
 
 def main():

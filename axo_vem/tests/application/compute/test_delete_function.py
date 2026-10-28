@@ -88,7 +88,7 @@ def test_execute_raises_conflict_when_function_has_a_live_container():
         use_case.execute(function_id="add", version=1, current_user_id="user-1")
 
 
-@pytest.mark.parametrize("status", [JobStatus.QUEUED, JobStatus.STARTED])
+@pytest.mark.parametrize("status", [JobStatus.QUEUED, JobStatus.RUNNING])
 def test_execute_raises_conflict_when_function_has_an_active_job(status):
     function = Function(function_id="add", version=1, endpoint_id=["n0"])
     job = Job(job_id="j1", function_id="add", function_version=1, status=status)

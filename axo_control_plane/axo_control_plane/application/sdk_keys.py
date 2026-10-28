@@ -46,7 +46,7 @@ class SdkKeys:
     def create(self, actor: Actor, name: str, ve_id: Optional[str], max_role: str,
                expires_in_days: Optional[float] = None) -> Dict[str, Any]:
         if actor.key_id is not None:
-            raise ForbiddenError("an SDK key can't create keys")
+            raise ForbiddenError("an API key can't create keys")
         if actor.is_guest:
             raise ForbiddenError("guest accounts can't create keys")
         R.check_ve_role(max_role)
@@ -69,7 +69,8 @@ class SdkKeys:
         return {**_public(doc), "key": f"{KEY_PREFIX}{key_id}_{secret}"}
 
     def list(self, actor: Actor) -> List[Dict[str, Any]]:
-        return [_public(d) for d in self._col.find({"user_id": actor.user_id, "revoked": False})]
+        docs = self._col.find({"user_id": actor.user_id, "revoked": False}).sort("created_at", -1)
+        return [_public(d) for d in docs]
 
     def revoke(self, actor: Actor, key_id: str) -> None:
         doc = self._col.find_one({"_id": key_id})
@@ -82,7 +83,7 @@ class SdkKeys:
     def authenticate(self, presented: str) -> Actor:
         """The Actor a key acts as, or UnauthorizedError (same message for
         every failure, so a guesser learns nothing)."""
-        invalid = UnauthorizedError("invalid SDK key")
+        invalid = UnauthorizedError("invalid API key")
         if not presented or not presented.startswith(KEY_PREFIX):
             raise invalid
         key_id, sep, secret = presented[len(KEY_PREFIX):].partition("_")
@@ -101,7 +102,7 @@ class SdkKeys:
             self._col.update_one({"_id": key_id}, {"$set": {"last_used_at": now}})
         return Actor(user_id=doc["user_id"], username=user["username"],
                      platform_role=user.get("platform_role"), key_id=key_id,
-                     key_ve_id=doc.get("ve_id"), key_max_role=doc["max_role"])
+                     key_ve_id=doc.get("ve_id"), key_max_role=doc["max_role"], extra={"key_name": doc.get("name")})
 
 
 def _public(doc: Dict[str, Any]) -> Dict[str, Any]:

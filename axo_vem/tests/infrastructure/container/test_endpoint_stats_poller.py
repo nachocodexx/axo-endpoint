@@ -126,3 +126,27 @@ def test_stop_ends_run_forever_after_one_tick(monkeypatch):
     poller.run_forever()
 
     assert sleep_calls == [0.0]
+
+
+def test_each_reading_goes_into_the_statistics_as_a_share_of_the_endpoint_size():
+    from axo_shared.metrics import MetricAggregator
+    from axo_shared.metrics import names as m
+
+    endpoints = _endpoints_collection()
+    endpoints.insert_many([{"_id": "n0"}, {"_id": "compose-node"}])
+    handle = SpawnedContainerHandle(name="n0", mode="docker", container_id="c0")
+    # Docker counts 100 % per core: 150 % on a 2-core endpoint is 75 % of it.
+    stats = ContainerStats(cpu_percent=150.0, memory_usage=256, memory_limit=1024, network_rx=0, network_tx=0)
+    metrics = MetricAggregator(width_s=10, clock=lambda: 1000.0)
+    poller = EndpointStatsPoller(endpoints=endpoints, spawner=_FakeSpawner({"n0": handle}, {"c0": stats}),
+                                 mode="docker", broadcaster=_FakeBroadcaster(), metrics=metrics,
+                                 cpu_cores_of=lambda endpoint_id: 2.0)
+    poller.tick()
+    poller.tick()
+
+    records = {r.metric: r for r in metrics.drain_closed(now=2000.0)}
+    assert set(records) == {m.RESOURCE_CPU_PCT, m.RESOURCE_RAM_PCT}   # nothing for the unmanaged one
+    assert records[m.RESOURCE_CPU_PCT].stats.count == 2
+    assert records[m.RESOURCE_CPU_PCT].stats.mean() == 75.0
+    assert records[m.RESOURCE_RAM_PCT].stats.mean() == 25.0
+    assert dict(records[m.RESOURCE_CPU_PCT].dims) == {"component": "n0"}

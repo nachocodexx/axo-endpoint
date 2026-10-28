@@ -53,7 +53,7 @@ def test_register_stores_source_code_format_when_provided(registry):
         operation="FUNCTION_REGISTER",
         content_type="application/octet-stream",
         envelope={"function_id": "add", "name": "add", "code_format": "source"},
-        payload=b"def add(params, ctx): ...",
+        payload=b"def add(a: int, b: int, ctx=None): ...",
     )
 
     handler.handle(command)

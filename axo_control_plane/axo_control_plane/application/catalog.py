@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from pymongo import DESCENDING
 from pymongo.database import Database
@@ -28,6 +28,12 @@ class PlanCatalog:
     def seed(self) -> None:
         for plan in DEFAULT_PLANS:
             self._plans.update_one({"_id": plan.plan_id}, {"$setOnInsert": plan.to_dict()}, upsert=True)
+            # A field added to plans later: saved plans get its default,
+            # nothing the Platform Admin changed is touched.
+            stored = self._plans.find_one({"_id": plan.plan_id}) or {}
+            missing = {k: v for k, v in plan.to_dict().items() if k not in stored and k != "base"}
+            if missing:
+                self._plans.update_one({"_id": plan.plan_id}, {"$set": missing})
         if self._prices.count_documents({}) == 0:
             self._prices.insert_one({"effective_from": 0.0, **PriceList().to_dict()})
 
@@ -47,15 +53,29 @@ class PlanCatalog:
             raise InvalidError(f"base size must be one of {sorted(BASE_SIZES)}")
         if plan.max_endpoints < 1 or plan.max_retention_days < 1 or plan.monthly_fee_cents < 0:
             raise InvalidError("a plan needs max_endpoints >= 1, max_retention_days >= 1 and a fee >= 0")
+        if plan.object_max_state_bytes < 1 or plan.object_hot_max_bytes < 1:
+            raise InvalidError("a plan needs object_max_state_bytes >= 1 and object_hot_max_bytes >= 1")
+        if not 0 <= plan.object_keep_revisions <= plan.object_max_keep_revisions:
+            raise InvalidError("a plan needs 0 <= object_keep_revisions <= object_max_keep_revisions")
+        if not (0 < plan.runner_cpu_cores <= plan.runner_max_cpu_cores
+                and 64 <= plan.runner_memory_mb <= plan.runner_max_memory_mb):
+            raise InvalidError("a plan needs 0 < runner_cpu_cores <= runner_max_cpu_cores and "
+                               "64 <= runner_memory_mb <= runner_max_memory_mb")
         self._plans.replace_one({"_id": plan.plan_id}, plan.to_dict(), upsert=True)
         self._history.append("platform-catalog", "PlanSaved", {"plan": plan.to_dict(), "by": by, "at": self._now_fn()})
         return plan
 
     # ── prices ───────────────────────────────────────────────────────────────
     def prices(self, at: Optional[float] = None) -> PriceList:
+        return self.prices_in_force(at)[1]
+
+    def prices_in_force(self, at: Optional[float] = None) -> Tuple[float, PriceList]:
+        """(when it took effect, the price list) in force at ``at`` (now if None)."""
         query = {} if at is None else {"effective_from": {"$lte": at}}
         doc = next(iter(self._prices.find(query).sort("effective_from", DESCENDING).limit(1)), None)
-        return PriceList.from_dict(doc) if doc else PriceList()
+        if doc is None:
+            return 0.0, PriceList()
+        return float(doc.get("effective_from", 0.0)), PriceList.from_dict(doc)
 
     def set_prices(self, prices: PriceList, by: str) -> PriceList:
         if any(v < 0 for v in prices.to_dict().values()):

@@ -36,6 +36,16 @@ def _pickle_decode(data: bytes) -> Any:
     return cloudpickle.loads(data)
 
 
+def _json_encode(obj: Any) -> bytes:
+    import json
+    return json.dumps(obj).encode("utf-8")
+
+
+def _json_decode(data: bytes) -> Any:
+    import json
+    return json.loads(data.decode("utf-8"))
+
+
 def _csv_encode(obj: Any) -> bytes:
     return obj.to_csv(index=False).encode("utf-8")
 
@@ -70,6 +80,7 @@ def _npy_decode(data: bytes) -> Any:
 FORMATS: Dict[str, Format] = {
     "raw":    Format(_raw_encode, _raw_decode),
     "pickle": Format(_pickle_encode, _pickle_decode),
+    "json":   Format(_json_encode, _json_decode),   # what choreography steps write
     "csv":    Format(_csv_encode, _csv_decode),
     "npy":    Format(_npy_encode, _npy_decode),
 }

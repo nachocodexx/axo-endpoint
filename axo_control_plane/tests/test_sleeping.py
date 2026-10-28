@@ -65,6 +65,7 @@ def test_a_job_for_a_sleeping_ve_is_kept_answered_and_delivered_after_the_wake(p
     assert manager.deliver() == 1                         # max_wait=0 still runs after a wake
     (delivered_ve, request), = platform.vem.jobs
     assert delivered_ve == ve_id and request["body"]["job_id"] == answer["job_id"]
+    assert request["wait_ms"] == 20_000                  # held here while the VE woke: the CP wait
     doc = platform.db["pending_requests"].find_one({"_id": answer["job_id"]})
     assert doc["status"] == DELIVERED and doc["wake_ms"] == 20_000
     assert manager.status(answer["job_id"]) is None       # now the VEM knows it
@@ -82,3 +83,21 @@ def test_waiting_longer_than_max_wait_fails_and_a_failed_wake_fails_all(platform
     for answer in (short, longer):
         assert manager.status(answer["job_id"])["status"] == FAILED
     assert any("could not wake" in n["text"] for n in platform.notifications.list(alice.user_id))
+
+
+def test_a_saved_job_cancelled_before_the_wake_is_dropped_and_never_delivered(platform):
+    manager = _manager(platform)
+    alice, ve_id = _free_running_ve(platform)
+    platform.db["virtual_environments"].update_one({"_id": ve_id}, {"$set": {"idle_since": platform.clock() - 4000}})
+    manager.put_idle_to_sleep()
+    platform.provisioner.tick(); platform.provisioner.tick()
+    job_id = manager.accept(ve_id, KIND_JOB, "/functions/f/1/jobs", {"params": {}}, alice.user_id)["job_id"]
+    assert manager.cancel(job_id, alice.user_id) == {"job_id": job_id, "cancelled": True, "status": "cancelled"}
+    assert manager.cancel(job_id, alice.user_id) is None          # only once
+    platform.provisioner.tick()
+    platform.clock.advance(20)
+    _beat(platform, ve_id, lifecycle="Stopped")
+    platform.provisioner.tick()
+    _beat(platform, ve_id)
+    platform.provisioner.tick()
+    assert manager.deliver() == 0 and platform.vem.jobs == []

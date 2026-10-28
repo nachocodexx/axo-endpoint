@@ -5,9 +5,11 @@ union of grants, sessions that stop working after logout)."""
 
 from __future__ import annotations
 
+import hashlib
 import threading
+import time
 import uuid
-from typing import Any, Dict, List, Set, Tuple
+from typing import Any, Callable, Dict, List, Set, Tuple
 
 from axo_control_plane.application.ports import (
     ContainerInfo,
@@ -190,15 +192,22 @@ class InMemoryStackDriver(StackDriver):
         self.volumes: Set[str] = set()
         self.removed: List[str] = []
         self.files: Dict[Tuple[str, str], bytes] = {}
+        # image tag -> the build it points at now (tests "rebuild" by changing it)
+        self.image_ids: Dict[str, str] = {}
 
     def ensure_network(self, name, labels):
+        created = name not in self.networks
         self.networks.setdefault(name, set())
+        return created
 
     def remove_network(self, name):
         self.networks.pop(name, None)
 
     def connect(self, network, container):
-        self.networks.setdefault(network, set()).add(container)
+        members = self.networks.setdefault(network, set())
+        attached = container not in members
+        members.add(container)
+        return attached
 
     def disconnect(self, network, container):
         self.networks.get(network, set()).discard(container)
@@ -210,10 +219,15 @@ class InMemoryStackDriver(StackDriver):
     def run(self, spec: ContainerRun):
         if spec.name in self.containers:
             raise ConflictError(f"container {spec.name} exists")
-        self.containers[spec.name] = {"spec": spec, "state": "running", "labels": dict(spec.labels)}
+        self.containers[spec.name] = {"spec": spec, "state": "running", "labels": dict(spec.labels),
+                                      "image_id": self.image_ids.get(spec.image, spec.image)}
         self.volumes.update(spec.volumes)
         for network in spec.networks:
             self.networks.setdefault(network, set()).add(spec.name)
+
+    def image_outdated(self, name, image):
+        c = self.containers.get(name)
+        return bool(c and c.get("image_id")) and c["image_id"] != self.image_ids.get(image, image)
 
     def start(self, name):
         self.containers[name]["state"] = "running"
@@ -255,6 +269,7 @@ class FakeVem(VemGateway):
         self.unreachable: Set[str] = set()
         self.jobs: List[Tuple[str, Dict[str, Any]]] = []
         self.endpoints: Dict[str, Dict[str, str]] = {}
+        self.repairs: List[Dict[str, Any]] = []
 
     def _s(self, ve_id: str) -> Dict[str, Any]:
         if ve_id in self.unreachable:
@@ -282,6 +297,18 @@ class FakeVem(VemGateway):
         self.calls.append(("set_limits", ve_id))
         self._s(ve_id)["limits"] = dict(limits)
 
+    def repair(self, ve_id, by, steps, automatic):
+        self._s(ve_id)
+        self.calls.append(("repair", ve_id))
+        self.repairs.append({"ve_id": ve_id, "by": by, "steps": list(steps), "automatic": automatic})
+        states = self.endpoints.get(ve_id, {})
+        failed = [e for e, state in states.items() if state == "failed"]
+        counts: Dict[str, int] = {}
+        for state in states.values():
+            counts[state] = counts.get(state, 0) + 1
+        return {"lifecycle": self._s(ve_id)["lifecycle"], "retried": failed, "started": False,
+                "endpoints": counts, "target_endpoints": len(states) or None}
+
     def endpoint_ids(self, ve_id):
         self._s(ve_id)
         return dict(self.endpoints.get(ve_id, {}))
@@ -293,10 +320,18 @@ class FakeVem(VemGateway):
 
 
 class FakeStorage(StorageGateway):
-    def __init__(self) -> None:
+    """axo_storage in memory: buckets, plus the files the bucket pages read
+    and write (versions, uploads in pieces, folders from "/"), as the real
+    gateway answers them."""
+
+    def __init__(self, now_fn: Callable[[], float] = time.time) -> None:
         self.buckets: Dict[str, Dict[str, Any]] = {}
         self.purged: List[str] = []
         self.objects: Dict[Tuple[str, str], bytes] = {}
+        # (bucket, name) -> {version: record}; a record's "pieces" holds an
+        # upload's pieces until the last one arrives.
+        self.files: Dict[Tuple[str, str], Dict[int, Dict[str, Any]]] = {}
+        self._now_fn = now_fn
 
     def create_bucket(self, full_name, acting_user, quota_bytes):
         if full_name in self.buckets:
@@ -306,9 +341,119 @@ class FakeStorage(StorageGateway):
     def purge_bucket(self, full_name):
         self.buckets.pop(full_name, None)
         self.purged.append(full_name)
+        for key in [k for k in self.files if k[0] == full_name]:
+            self.files.pop(key)
 
     def usage_bytes(self, full_name):
         return int(self.buckets.get(full_name, {}).get("bytes", 0))
 
     def put_object(self, bucket_key, name, data):
         self.objects[(bucket_key, name)] = bytes(data)
+
+    def bucket_stats(self, keys):
+        out = {}
+        for key in keys:
+            rows = [r for (b, _n), vs in self.files.items() if b == key for r in vs.values()]
+            done = {r["name"] for r in rows if r["state"] == "complete"}
+            out[key] = {"used_bytes": sum(r["total_size"] for r in rows) + self.usage_bytes(key), "files": len(done),
+                        "last_change": max((r["created_at"] for r in rows), default=None)}
+        return out
+
+    # ── the bucket pages ─────────────────────────────────────────────────────
+    def _record(self, bucket, name, version, size, user, piece_bytes):
+        return {"bucket": bucket, "name": name, "version": version, "total_size": size, "chunk_bytes": piece_bytes,
+                "total_chunks": -(-size // piece_bytes) if size else 0, "state": "uploading", "format": "raw",
+                "created_at": self._now_fn(), "created_by": user, "completed_at": None, "source": None,
+                "content_hash": None, "pieces": {}}
+
+    def _public(self, record):
+        return {k: v for k, v in record.items() if k != "pieces"}
+
+    def _complete(self, record):
+        record["state"] = "complete"
+        record["completed_at"] = self._now_fn()
+        data = b"".join(record["pieces"][i] for i in range(record["total_chunks"]))
+        record["content_hash"] = hashlib.sha256(data).hexdigest()
+        record["data"] = data
+
+    def _check_room(self, bucket, size):
+        quota = self.buckets.get(bucket, {}).get("quota_bytes")
+        used = self.bucket_stats([bucket])[bucket]["used_bytes"]
+        if quota is not None and used + size > quota:
+            raise ConflictError(f"{bucket} has no room for {size} more bytes")
+
+    def start_upload(self, user, bucket, name, size, piece_bytes):
+        self._check_room(bucket, size)
+        versions = self.files.setdefault((bucket, name), {})
+        record = self._record(bucket, name, max(versions, default=0) + 1, size, user, piece_bytes)
+        versions[record["version"]] = record
+        if size == 0:
+            self._complete(record)
+        return self._public(record)
+
+    def put_piece(self, user, bucket, name, version, index, data):
+        record = self.files.get((bucket, name), {}).get(version)
+        if record is None:
+            raise NotFoundError(f"no upload {name} v{version}")
+        if record["state"] != "uploading" or not 0 <= index < record["total_chunks"]:
+            raise ConflictError(f"piece {index} doesn't fit {name} v{version}")
+        record["pieces"][index] = bytes(data)
+        if len(record["pieces"]) == record["total_chunks"]:
+            self._complete(record)
+        return {**self._public(record), "received": len(record["pieces"])}
+
+    def upload(self, user, bucket, name, data):
+        record = self.start_upload(user, bucket, name, len(data), max(len(data), 1))
+        if data:
+            return self.put_piece(user, bucket, name, record["version"], 0, data)
+        return record
+
+    def list_files(self, user, bucket, prefix="", after=None, limit=200, folders=True):
+        entries: Dict[str, Dict[str, Any]] = {}
+        for (b, name), versions in sorted(self.files.items()):
+            if b != bucket or not name.startswith(prefix) or not versions:
+                continue
+            rest = name[len(prefix):]
+            if folders and "/" in rest:
+                folder = prefix + rest.split("/", 1)[0] + "/"
+                entries.setdefault(folder, {"kind": "folder", "name": folder, "files": 0})["files"] += 1
+                continue
+            newest = versions[max(versions)]
+            complete = [v for v, r in versions.items() if r["state"] == "complete"]
+            entries[name] = {**self._public(newest), "kind": "file", "versions": len(versions),
+                             "latest": newest["version"], "latest_complete": max(complete, default=None)}
+        order = sorted(entries, key=lambda n: (not n.endswith("/") or not folders, n))
+        if after is not None:
+            key = (not after.endswith("/") or not folders, after)
+            order = [n for n in order if (not n.endswith("/") or not folders, n) > key]
+        page = order[:limit]
+        return {"entries": [entries[n] for n in page], "next": page[-1] if len(order) > limit else None}
+
+    def versions(self, user, bucket, name):
+        return [self._public(r) for _v, r in sorted(self.files.get((bucket, name), {}).items())]
+
+    def object_info(self, user, bucket, name, version):
+        versions = self.files.get((bucket, name), {})
+        if version is None:
+            done = [v for v, r in versions.items() if r["state"] == "complete"]
+            version = max(done, default=None)
+        if version not in versions:
+            raise NotFoundError(f"no {name} in {bucket}")
+        return self._public(versions[version])
+
+    def download(self, user, bucket, name, version):
+        record = self.files[(bucket, name)][self.object_info(user, bucket, name, version)["version"]]
+        data = record.get("data", b"")
+        for start in range(0, len(data), 4):     # several chunks, like the real one
+            yield data[start:start + 4]
+
+    def delete_object(self, user, bucket, name, version):
+        versions = self.files.get((bucket, name), {})
+        gone = sorted(versions) if version is None else [version] if version in versions else []
+        if not gone:
+            raise NotFoundError(f"no {name} in {bucket}")
+        for v in gone:
+            versions.pop(v)
+        if not versions:
+            self.files.pop((bucket, name), None)
+        return {"bucket": bucket, "name": name, "versions": gone}

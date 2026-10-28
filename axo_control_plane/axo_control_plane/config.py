@@ -100,7 +100,7 @@ class Config:
         # change the password at first login.
         self.AXO_CP_ADMIN_USERNAME: str = os.environ.get("AXO_CP_ADMIN_USERNAME", "admin")
         self.AXO_CP_ADMIN_PASSWORD: str = os.environ.get("AXO_CP_ADMIN_PASSWORD", "admin")
-        self.AXO_CP_ADMIN_EMAIL: str = os.environ.get("AXO_CP_ADMIN_EMAIL", "admin@axo.local")
+        self.AXO_CP_ADMIN_EMAIL: str = os.environ.get("AXO_CP_ADMIN_EMAIL", "admin@example.com")
 
         # ── platform capacity (what can be handed out to VEs) ────────────────
         self.AXO_CP_CAPACITY_CPU_CORES: float = _float("AXO_CP_CAPACITY_CPU_CORES", 16.0)
@@ -110,6 +110,11 @@ class Config:
             _int("AXO_CP_PLATFORM_MAX_QUEUE_LIMIT", 0) or None)
         self.AXO_CP_PLATFORM_MAX_WAIT_SECONDS: Optional[float] = (
             _float("AXO_CP_PLATFORM_MAX_WAIT_SECONDS", 0.0) or None)
+        # A VE's history past its retention is hidden at once and deleted
+        # for good this many days later (every VEM gets it).
+        self.AXO_CP_HISTORY_GRACE_DAYS: int = _int("AXO_CP_HISTORY_GRACE_DAYS", 7)
+        # Notifications older than this are deleted for good (renewals loop).
+        self.AXO_CP_NOTIFICATION_KEEP_DAYS: int = _int("AXO_CP_NOTIFICATION_KEEP_DAYS", 90)
         self.AXO_CP_CUSTOM_SIZE_MAX_CPU_CORES: float = _float("AXO_CP_CUSTOM_SIZE_MAX_CPU_CORES", 8.0)
         self.AXO_CP_CUSTOM_SIZE_MAX_MEMORY_MB: int = _int("AXO_CP_CUSTOM_SIZE_MAX_MEMORY_MB", 16384)
 
@@ -120,6 +125,7 @@ class Config:
         self.AXO_CP_ENDPOINT_IMAGE: str = os.environ.get("AXO_CP_ENDPOINT_IMAGE", "axo-endpoint:local")
         self.AXO_CP_KURRENT_IMAGE: str = os.environ.get("AXO_CP_KURRENT_IMAGE", "eventstore/eventstore:24.10.0-jammy")
         self.AXO_CP_MONGO_IMAGE: str = os.environ.get("AXO_CP_MONGO_IMAGE", "mongo:7")
+        self.AXO_CP_REDIS_IMAGE: str = os.environ.get("AXO_CP_REDIS_IMAGE", "redis:8-alpine")
         self.AXO_CP_VEM_HTTP_PORT: int = _int("AXO_CP_VEM_HTTP_PORT", 8080)
         self.AXO_CP_VEM_REQUEST_TIMEOUT_SECONDS: float = _float("AXO_CP_VEM_REQUEST_TIMEOUT_SECONDS", 30.0)
         # Desired-state loop + per-VE lease.
@@ -127,6 +133,11 @@ class Config:
         self.AXO_CP_LEASE_SECONDS: float = _float("AXO_CP_LEASE_SECONDS", 30.0)
         self.AXO_CP_VEM_HEARTBEAT_TIMEOUT_SECONDS: float = _float("AXO_CP_VEM_HEARTBEAT_TIMEOUT_SECONDS", 30.0)
         self.AXO_CP_VEM_DOWN_RECREATE_SECONDS: float = _float("AXO_CP_VEM_DOWN_RECREATE_SECONDS", 300.0)
+        # Repair: people (Admin+) once per this per VE; the CP on its own once a
+        # VE has been Unavailable this long, at most once per the last one.
+        self.AXO_CP_REPAIR_EVERY_SECONDS: float = _float("AXO_CP_REPAIR_EVERY_SECONDS", 300.0)
+        self.AXO_CP_AUTO_REPAIR_AFTER_SECONDS: float = _float("AXO_CP_AUTO_REPAIR_AFTER_SECONDS", 600.0)
+        self.AXO_CP_AUTO_REPAIR_EVERY_SECONDS: float = _float("AXO_CP_AUTO_REPAIR_EVERY_SECONDS", 3600.0)
         # Deleting: wait for the VEM's unsent messages, then copy its outbox.
         self.AXO_CP_DELETE_FLUSH_TIMEOUT_SECONDS: float = _float("AXO_CP_DELETE_FLUSH_TIMEOUT_SECONDS", 600.0)
         self.AXO_CP_GRACE_DAYS: float = _float("AXO_CP_GRACE_DAYS", 30.0)
@@ -137,6 +148,15 @@ class Config:
 
         # ── cleanup of leftover containers ────────────────────────────────────
         self.AXO_CP_CLEANUP_INTERVAL_SECONDS: float = _float("AXO_CP_CLEANUP_INTERVAL_SECONDS", 60.0)
+        # How often rental periods are checked (renewals, cancelled VEs ending).
+        self.AXO_CP_RENEWAL_INTERVAL_SECONDS: float = _float("AXO_CP_RENEWAL_INTERVAL_SECONDS", 60.0)
+        # A VE bill closes this long after its period ends (later usage goes
+        # on the next bill).
+        self.AXO_CP_BILL_CLOSE_AFTER_SECONDS: float = _float("AXO_CP_BILL_CLOSE_AFTER_SECONDS", 3600.0)
+        # Statistics tiers kept by the CP, finest first ("width:keep"; the 10 s
+        # live tier stays in each VEM), and how often finer bins are merged up.
+        self.AXO_CP_METRIC_TIERS: str = os.environ.get("AXO_CP_METRIC_TIERS", "1m:7d,15m:90d,1d:forever")
+        self.AXO_CP_METRIC_ROLLUP_INTERVAL_SECONDS: float = _float("AXO_CP_METRIC_ROLLUP_INTERVAL_SECONDS", 300.0)
         self.AXO_CP_CLEANUP_LOG_LINES: int = _int("AXO_CP_CLEANUP_LOG_LINES", 500)
 
         # ── logging ───────────────────────────────────────────────────────────

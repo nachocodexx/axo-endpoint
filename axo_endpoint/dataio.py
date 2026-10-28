@@ -72,6 +72,16 @@ def write(obj: Any, ref: IORef) -> IORef:
     return dataclasses.replace(ref, version=record["version"], chunk_index=None)
 
 
+def write_async(obj: Any, ref: IORef) -> None:
+    """Like ``write`` but returns at once: the endpoint uploads it while the
+    function goes on, and the job finishes only after the upload has. A
+    failed upload doesn't fail the job; it shows as a warning on it."""
+    from axo_endpoint.core.dataio.protocol import WRITE_ASYNC
+
+    channel = _require_channel()
+    channel.request(WRITE_ASYNC, ref, get_format(ref.format).unwrap().encode(obj))
+
+
 def iter_chunks(ref: IORef) -> Iterator[bytes]:
     """Reads an object chunk by chunk -- bounded memory throughout, since
     neither the endpoint nor this generator ever holds the whole thing.

@@ -141,6 +141,59 @@ def test_a_restarted_vem_remembers_it_was_stopped(ve):
     assert again.lifecycle() == "Stopped"
 
 
+def test_a_vem_restarted_while_stopped_creates_no_endpoints_and_start_brings_back_the_old_ones(ve):
+    # A fresh fleet + reconciler, like a VEM container started again: before
+    # this, the stopped endpoints didn't count toward the target and the
+    # first tick created new ones; start then brought the old ones back too.
+    clock, settings, fleet, ops, jobs, _reconciler, service, _r, log = ve
+    service.stop(by="luis")
+    service.wait(5)
+    fleet = FleetService("ve", log, now_fn=clock)
+    fleet.load(log)
+    reconciler = Reconciler(settings, fleet, ops, jobs, now_fn=clock)
+    again = VeLifecycleService(settings, fleet, reconciler, ops, jobs, log, restorer=_Restorer(),
+                               start_timeout_s=60, poll_s=1, now_fn=clock, sleep_fn=service._sleep_fn)
+    again.load(log)
+
+    reconciler.tick()
+    assert sorted(ops.containers) == ["ep-1", "ep-2"]                # nothing new while stopped
+
+    again.start(by="luis")
+    again.wait(5)
+    assert again.lifecycle() == "Running"
+    assert sorted(ops.containers) == ["ep-1", "ep-2"]                # the same two, started again
+    assert {e.state for e in fleet.all()} == {"running"}
+
+
+def test_a_vem_that_went_down_mid_start_finishes_the_start_when_it_comes_back(ve):
+    clock, settings, fleet, ops, jobs, reconciler, service, _r, log = ve
+    service.stop(by="luis")
+    service.wait(5)
+    service._record("Starting", "start requested by luis")         # ... and the VEM went down here
+
+    fleet = FleetService("ve", log, now_fn=clock)
+    fleet.load(log)
+    reconciler = Reconciler(settings, fleet, ops, jobs, now_fn=clock)
+    restorer = _Restorer()
+    again = VeLifecycleService(settings, fleet, reconciler, ops, jobs, log, restorer=restorer,
+                               start_timeout_s=60, poll_s=1, now_fn=clock, sleep_fn=service._sleep_fn)
+    again.load(log)
+    again.resume_unfinished()
+    again.wait(5)
+
+    assert again.lifecycle() == "Running"
+    assert restorer.calls == 1
+    assert sorted(ops.containers) == ["ep-1", "ep-2"]
+    assert {e.state for e in fleet.all()} == {"running"}
+
+
+def test_resume_unfinished_leaves_a_running_or_stopped_ve_alone(ve):
+    *_, service, restorer, _log = ve
+    service.resume_unfinished()
+    service.wait(5)
+    assert service.lifecycle() == "Running" and restorer.calls == 0
+
+
 def test_health_degraded_on_failure_and_scaling_while_moving(ve):
     clock, settings, fleet, ops, jobs, reconciler, service, _r, _log = ve
     settings.change({"auto_replace_failed": False})
@@ -158,3 +211,24 @@ def test_idle_since_is_reported_for_the_free_plan_sleep(ve):
     jobs.observe(*_job(models.JOB_STARTED, "j", "ep-1", clock))
     service.after_tick()
     assert service.status()["idle_since"] is None
+
+
+def test_a_repair_retries_failed_endpoints_and_is_recorded(ve):
+    clock, settings, fleet, ops, jobs, reconciler, service, _r, log = ve
+    settings.change({"auto_replace_failed": False})
+    ops.containers["ep-2"] = "exited"
+    reconciler.tick()
+    assert fleet.get("ep-2").state == "failed"
+
+    answer = service.repair("cp", steps=[{"check": "vem", "status": "ok", "text": "answers"}], automatic=True)
+
+    assert answer["retried"] == ["ep-2"] and fleet.get("ep-2").state == "starting"
+    repaired = [r for records in log.streams.values() for r in records if r.type == models.VE_REPAIRED]
+    assert len(repaired) == 1
+
+
+def test_a_repair_of_a_stopped_ve_retries_nothing(ve):
+    *_, service, _restorer, _log = ve
+    service.stop("ana")
+    service.wait(5)
+    assert service.repair("cp")["retried"] == []

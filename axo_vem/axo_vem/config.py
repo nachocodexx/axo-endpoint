@@ -67,6 +67,18 @@ class Config:
         self.AXO_VEM_PLAN_MAX_ENDPOINTS: int = _int("AXO_VEM_PLAN_MAX_ENDPOINTS", 1)
         self.AXO_VEM_PLAN_POLICIES_ALLOWED: bool = _bool("AXO_VEM_PLAN_POLICIES_ALLOWED", "false")
         self.AXO_VEM_PLAN_MAX_RETENTION_DAYS: Optional[int] = _optional_int("AXO_VEM_PLAN_MAX_RETENTION_DAYS")
+        # Active objects: largest state of one object (empty = no cap), the
+        # largest value kept in memory, past revisions (default / most; empty = no ceiling).
+        self.AXO_VEM_PLAN_OBJECT_MAX_STATE_BYTES: Optional[int] = _optional_int("AXO_VEM_PLAN_OBJECT_MAX_STATE_BYTES")
+        self.AXO_VEM_PLAN_OBJECT_HOT_MAX_BYTES: int = _int("AXO_VEM_PLAN_OBJECT_HOT_MAX_BYTES", 4096)
+        self.AXO_VEM_PLAN_OBJECT_KEEP_REVISIONS: int = _int("AXO_VEM_PLAN_OBJECT_KEEP_REVISIONS", 10)
+        self.AXO_VEM_PLAN_OBJECT_MAX_KEEP_REVISIONS: Optional[int] = _optional_int(
+            "AXO_VEM_PLAN_OBJECT_MAX_KEEP_REVISIONS")
+        # Container functions' runners: default size and the most one may ask (empty = no rule).
+        self.AXO_VEM_PLAN_RUNNER_CPU_CORES: Optional[float] = _optional_float("AXO_VEM_PLAN_RUNNER_CPU_CORES")
+        self.AXO_VEM_PLAN_RUNNER_MEMORY_MB: Optional[int] = _optional_int("AXO_VEM_PLAN_RUNNER_MEMORY_MB")
+        self.AXO_VEM_PLAN_RUNNER_MAX_CPU_CORES: Optional[float] = _optional_float("AXO_VEM_PLAN_RUNNER_MAX_CPU_CORES")
+        self.AXO_VEM_PLAN_RUNNER_MAX_MEMORY_MB: Optional[int] = _optional_int("AXO_VEM_PLAN_RUNNER_MAX_MEMORY_MB")
         # The VE quota: every endpoint's size together must fit. Empty = none.
         self.AXO_VEM_QUOTA_CPU_CORES: Optional[float] = _optional_float("AXO_VEM_QUOTA_CPU_CORES")
         self.AXO_VEM_QUOTA_MEMORY_MB: Optional[int] = _optional_int("AXO_VEM_QUOTA_MEMORY_MB")
@@ -95,6 +107,28 @@ class Config:
         self.AXO_VEM_POLICY_PAUSE_AFTER_MANUAL_SECONDS: float = float(
             os.environ.get("AXO_VEM_POLICY_PAUSE_AFTER_MANUAL_SECONDS", "1800")
         )
+        # Choreography runs: a step's time limit when the step sets none, how
+        # often a running step's job is checked, and how many steps (or
+        # files of a step) may be in progress at once across all runs.
+        self.AXO_VEM_CHOREOGRAPHY_STEP_TIMEOUT_SECONDS: float = float(
+            os.environ.get("AXO_VEM_CHOREOGRAPHY_STEP_TIMEOUT_SECONDS", "3600")
+        )
+        self.AXO_VEM_CHOREOGRAPHY_POLL_INTERVAL_SECONDS: float = float(
+            os.environ.get("AXO_VEM_CHOREOGRAPHY_POLL_INTERVAL_SECONDS", "0.5")
+        )
+        self.AXO_VEM_CHOREOGRAPHY_WORKERS: int = _int("AXO_VEM_CHOREOGRAPHY_WORKERS", 64)
+        # History past the VE's retention is hidden at once and deleted for
+        # good this many days later (a mistaken lower setting, or an upgrade
+        # soon after, loses nothing). Set by the Control Plane for every VE.
+        self.AXO_VEM_HISTORY_GRACE_DAYS: int = _int("AXO_VEM_HISTORY_GRACE_DAYS", 7)
+        # How often history past retention + grace is deleted (also once at start).
+        self.AXO_VEM_HISTORY_PURGE_INTERVAL_SECONDS: float = float(
+            os.environ.get("AXO_VEM_HISTORY_PURGE_INTERVAL_SECONDS", "86400")
+        )
+        # How often job results past their keep time are deleted.
+        self.AXO_VEM_RESULT_SWEEP_INTERVAL_SECONDS: float = float(
+            os.environ.get("AXO_VEM_RESULT_SWEEP_INTERVAL_SECONDS", "300")
+        )
         # The Control Plane link: heartbeats, job attempts (billing) and
         # 1-minute summaries, through a journal resent until the CP acks.
         # Empty = no CP (job attempts then go to this VEM's own event log).
@@ -121,6 +155,12 @@ class Config:
         # Control Plane -- the VEM never holds the secret tokens come from).
         self.AXO_VEM_NODE_STORAGE_URI: str = os.environ.get("AXO_VEM_NODE_STORAGE_URI", "")
         self.AXO_VEM_VE_STORAGE_TOKEN: str = os.environ.get("AXO_VEM_VE_STORAGE_TOKEN", "")
+        # Where every launched endpoint keeps active-object state (set by the
+        # Control Plane: the VE's own Mongo + Redis + objects bucket). Empty =
+        # the endpoint's default (memory: state is lost when the leader changes).
+        self.AXO_VEM_NODE_OBJECT_MONGO_URI: str = os.environ.get("AXO_VEM_NODE_OBJECT_MONGO_URI", "")
+        self.AXO_VEM_NODE_OBJECT_REDIS_URI: str = os.environ.get("AXO_VEM_NODE_OBJECT_REDIS_URI", "")
+        self.AXO_VEM_NODE_OBJECT_BLOBS: str = os.environ.get("AXO_VEM_NODE_OBJECT_BLOBS", "")
 
         # Outbound commands (VEM -> endpoint)
         self.AXO_VEM_ENDPOINT_COMMAND_TIMEOUT_SECONDS: float = float(

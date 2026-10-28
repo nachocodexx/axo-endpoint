@@ -1,38 +1,22 @@
-from axo_vem.domain.execution.job import Job, JobStatus
+from axo_vem.domain.execution.job import FAULTS, Job, JobStatus, status_for_outcome
 
 
-def test_start_transitions_to_started():
-    job = Job(job_id="j1", function_id="add", status=JobStatus.QUEUED)
-    job.start()
-    assert job.status == JobStatus.STARTED
+def test_a_job_round_trips_through_its_dict():
+    job = Job(job_id="j1", function_id="add", status=JobStatus.WAITING_RETRY, function_version=2, attempt=2,
+              max_attempts=3, next_attempt_at="2026-01-01T00:00:05+00:00", params={"a": 1})
+    data = job.to_dict()
+    assert data["status"] == "WAITING_RETRY" and data["attempt"] == 2
+    assert Job.from_dict({**data, "_id": "j1", "phase": 2}) == job
 
 
-def test_complete_transitions_to_completed_and_sets_duration():
-    job = Job(job_id="j1", function_id="add", status=JobStatus.STARTED)
-    job.complete(duration_ms=42.5)
-    assert job.status == JobStatus.COMPLETED
-    assert job.duration_ms == 42.5
+def test_only_queued_running_and_waiting_jobs_are_active():
+    assert [s.value for s in JobStatus if Job(job_id="j", function_id="f", status=s).active] == [
+        "QUEUED", "RUNNING", "WAITING_RETRY"]
 
 
-def test_fail_transitions_to_failed():
-    job = Job(job_id="j1", function_id="add", status=JobStatus.STARTED)
-    job.fail()
-    assert job.status == JobStatus.FAILED
-
-
-def test_to_dict_reflects_all_fields():
-    job = Job(
-        job_id="j1", function_id="add", status=JobStatus.COMPLETED,
-        function_version=2, duration_ms=100.0, params={"a": 1},
-        endpoint_id="n0", created_at="2026-01-01T00:00:00+00:00",
-    )
-    assert job.to_dict() == {
-        "job_id": "j1",
-        "function_id": "add",
-        "status": "COMPLETED",
-        "function_version": 2,
-        "duration_ms": 100.0,
-        "params": {"a": 1},
-        "endpoint_id": "n0",
-        "created_at": "2026-01-01T00:00:00+00:00",
-    }
+def test_outcomes_map_to_statuses_and_plain_fault_labels():
+    assert status_for_outcome("completed") == JobStatus.COMPLETED
+    assert status_for_outcome("cancelled") == JobStatus.CANCELLED
+    assert status_for_outcome("failed_user") == JobStatus.FAILED
+    assert FAULTS == {"failed_user": "code", "failed_platform": "platform", "timed_out_in_queue": "queue",
+                      "cancelled": "cancelled"}

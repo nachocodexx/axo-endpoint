@@ -187,6 +187,8 @@ class People:
         if len(new_password or "") < 8:
             raise InvalidError("the password needs at least 8 characters")
         self._identity.change_password(actor.username, access_token, temporal_secret, new_password)
+        # Xolo ends the session with the password change: log in again.
+        self._sessions.drop(lambda k: k == _session_key(access_token, temporal_secret))
         self._users.update_one({"_id": actor.user_id}, {"$set": {"password_change_required": False}})
         self._history.append(f"user-{actor.user_id}", "PasswordChanged", {"user_id": actor.user_id,
                                                                           "at": self._now_fn()})

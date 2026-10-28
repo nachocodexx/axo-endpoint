@@ -9,14 +9,15 @@ from axo_vem.domain.errors import ConflictError, NotFoundError
 from axo_vem.domain.events import models
 from axo_vem.domain.events.publisher import EventPublisher
 from axo_vem.domain.events.stream_naming import stream_name_for
-from axo_vem.domain.execution.job import JobStatus
+from axo_vem.domain.execution.job import ACTIVE_STATUSES, JobStatus
 from axo_vem.domain.execution.repository import JobRepository
 from axo_vem.infrastructure.database.mongo.activity_repository import MongoActivityRepository
 
 
 class PurgeEndpointUseCase:
-    """Hard-deletes this endpoint's read-model doc and its unified_activity
-    history -- same as the former inline route body -- but first cascades
+    """Hard-deletes this endpoint's read-model doc ("Forget") -- its
+    history stays in unified_activity (who started / removed it is the VE's
+    record) until the VE's retention deletes it -- but first cascades
     to every function this endpoint was a holder of: the endpoint is
     confirmed gone (same stopped/unreachable precondition as before), so any
     of its own jobs still reading QUEUED/STARTED were never going to finish
@@ -65,7 +66,7 @@ class PurgeEndpointUseCase:
         jobs_force_failed = 0
         for function in self._function_repository.list_by_endpoint_id(endpoint_id):
             for job in self._job_repository.list_by_function(function.function_id, function.version):
-                if job.status not in (JobStatus.QUEUED, JobStatus.STARTED) or job.endpoint_id != endpoint_id:
+                if job.status not in ACTIVE_STATUSES or job.endpoint_id != endpoint_id:
                     continue
                 self._append(
                     endpoint_id, models.JOB_FAILED,
@@ -106,10 +107,8 @@ class PurgeEndpointUseCase:
                 functions_marked_deleted += 1
 
         self._endpoints.delete_one({"_id": endpoint_id})
-        purged_activity_count = self._activity_repository.purge(endpoint_id=endpoint_id)
         return {
             "endpoint_id": endpoint_id,
-            "purged_activity_count": purged_activity_count,
             "functions_marked_deleted": functions_marked_deleted,
             "functions_detached": functions_detached,
             "jobs_force_failed": jobs_force_failed,

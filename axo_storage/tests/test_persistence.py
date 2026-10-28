@@ -34,3 +34,19 @@ def test_disk_backend_and_catalog_survive_a_restart(tmp_path):
               for i in range(2)]
     assert b"".join(chunks) == b"hello"
     assert (tmp_path / "data" / "keep" / "a" / "b.txt" / "v1" / "chunk_00000000").exists()
+
+
+def test_a_catalog_from_before_the_source_column_gets_it(tmp_path):
+    import sqlite3
+    path = str(tmp_path / "old.db")
+    old = sqlite3.connect(path)
+    old.execute("CREATE TABLE objects (bucket TEXT NOT NULL, name TEXT NOT NULL, version INTEGER NOT NULL, "
+                "format TEXT NOT NULL, total_size INTEGER, chunk_bytes INTEGER NOT NULL, total_chunks INTEGER, "
+                "declared_hash TEXT, content_hash TEXT, hash_algo TEXT NOT NULL, state TEXT NOT NULL, "
+                "created_at REAL NOT NULL, created_by TEXT NOT NULL, completed_at REAL, "
+                "PRIMARY KEY (bucket, name, version))")
+    old.execute("INSERT INTO objects VALUES ('b', 'n', 1, 'raw', 1, 4, 1, NULL, 'h', 'sha256', 'complete', 1, 'u', 2)")
+    old.commit()
+    old.close()
+    row = StorageCatalog(path).get_object("b", "n", 1).unwrap()
+    assert row.source is None and row.version == 1

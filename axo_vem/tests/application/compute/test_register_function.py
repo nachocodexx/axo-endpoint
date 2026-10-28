@@ -99,3 +99,30 @@ def test_picker_skips_sleeping_endpoints_and_wakes_one_when_nothing_runs():
     picker = EndpointPicker(_FakeEndpointRepository([_endpoint("n0")]), fleet=fleet, waker=waker, sleep_fn=lambda s: None)
     assert picker.pick().endpoint_id == "n0"
     assert len(woken) == 1
+
+
+class _RecordingFunctions:
+    def __init__(self):
+        self.applied = []
+
+    def find_by_code_hash(self, function_id, code_hash):
+        return None
+
+    def apply_event_data(self, data):
+        self.applied.append(data)
+
+
+def test_a_registered_function_is_in_the_read_model_before_the_answer(monkeypatch):
+    # A job submitted right after registering must find it, before the
+    # endpoint's FunctionRegistered event reaches the projector.
+    functions = _RecordingFunctions()
+    use_case = RegisterFunctionUseCase("ve1", EndpointPicker(_FakeEndpointRepository([_endpoint()])), 0.3,
+                                       function_repository=functions)
+    monkeypatch.setattr(register_function_module, "send_command", lambda rpc_uri, command, timeout: Ok(
+        CommandResult(ok=True, metadata={"function_id": "fid", "version": 3})))
+    use_case.execute(current_user_id="user-1", name="add", code=b"...", code_hash="h1", call_style="kwargs")
+
+    [saved] = functions.applied
+    assert saved["function_id"] == compute_function_id("user-1", "ve1", "add")
+    assert (saved["version"], saved["name"], saved["code_hash"], saved["endpoint_id"]) == (3, "add", "h1", "n0")
+    assert saved["runtime_spec"] == {"call_style": "kwargs"}

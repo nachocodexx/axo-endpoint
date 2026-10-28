@@ -10,11 +10,11 @@ from axo_endpoint.core.storage import InMemoryStorageBackend
 from axo_endpoint.service.runtime.process_runtime import ProcessFunctionRuntime
 
 
-def _sleep_then_pid(params, ctx):
+def _sleep_then_pid(sleep_seconds):
     import os
     import time
 
-    time.sleep(params["sleep_seconds"])
+    time.sleep(sleep_seconds)
     return os.getpid()
 
 

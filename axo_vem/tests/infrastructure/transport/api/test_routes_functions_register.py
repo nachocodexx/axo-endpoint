@@ -1,3 +1,4 @@
+import json
 import threading
 
 import zmq
@@ -33,8 +34,9 @@ def _run_fake_endpoint(bind_address, reply_ok, error_message="", metadata=None):
 
 def _source_for(function_name: str) -> bytes:
     return (
-        f"def {function_name}(params, ctx):\n"
-        f"    return {{'sum': params['a'] + params['b']}}\n"
+        f"def {function_name}(a: int, b: int = 2, ctx=None):\n"
+        f"    \"\"\"Adds two numbers.\"\"\"\n"
+        f"    return {{'sum': a + b}}\n"
     ).encode()
 
 
@@ -78,8 +80,13 @@ def test_register_function_validates_source_and_forwards_it_untouched(client, co
     assert command.operation == wire.FUNCTION_REGISTER
     assert command.envelope["name"] == "add"
     assert command.envelope["function_id"] == compute_function_id(FAKE_USER.key, ve_id, "add")
-    assert command.envelope["runtime_spec"] == {"type": "process"}
+    assert command.envelope["runtime_spec"] == {"type": "process", "call_style": "kwargs"}
     assert command.envelope["code_format"] == "source"
+    # The run form's fields come from the code itself.
+    assert command.envelope["params_schema"] == [
+        {"name": "a", "type": "number", "required": True, "default": None},
+        {"name": "b", "type": "number", "required": False, "default": 2},
+    ]
 
     # This service never executes or pickles the upload -- the forwarded
     # payload must be the exact raw source bytes, verbatim.
@@ -155,7 +162,7 @@ def test_register_function_returns_422_for_syntax_error(client):
     response = client.post(
         "/functions",
         data={"name": "add"},
-        files={"code": ("add.py", b"def add(params, ctx:\n    pass\n", "text/x-python")},
+        files={"code": ("add.py", b"def add(a, b:\n    pass\n", "text/x-python")},
     )
 
     assert response.status_code == 422
@@ -265,3 +272,47 @@ def test_delete_function_routes_via_recorded_endpoint_despite_ve_mismatched_endp
 
     assert response.status_code == 200
     assert captured["command"].operation == wire.FUNCTION_DELETE
+
+
+def test_an_old_style_function_is_refused_with_a_clear_message(client):
+    response = client.post(
+        "/functions",
+        data={"name": "add"},
+        files={"code": ("add.py", b"def add(params, ctx):\n    return params['a']\n", "text/x-python")},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"] == "FUNCTION_STYLE_UNSUPPORTED"
+    assert "named parameters" in response.json()["message"]
+
+
+def test_the_live_check_answers_problems_and_the_run_form_without_an_endpoint(client):
+    bad = client.post("/functions/check", json={"name": "add", "source": "def add(a, b:\n    pass\n"}).json()
+    assert not bad["ok"] and bad["problems"][0]["line"] == 1
+    good = client.post("/functions/check", json={"name": "add", "source": _source_for("add").decode()}).json()
+    assert good["ok"] and [p["name"] for p in good["params_schema"]] == ["a", "b"]
+    assert good["description"] == "Adds two numbers." and good["existing_version"] is None
+
+
+def test_save_as_a_new_version_needs_an_existing_function_of_that_name(client, collections):
+    missing = client.post("/functions", data={"name": "add", "function_id": "nope"},
+                          files={"code": ("add.py", _source_for("add"), "text/x-python")})
+    assert missing.status_code == 404
+    collections.functions.insert_one({"_id": "f1:1", "function_id": "f1", "version": 1, "name": "sum"})
+    renamed = client.post("/functions", data={"name": "add", "function_id": "f1"},
+                          files={"code": ("add.py", _source_for("add"), "text/x-python")})
+    assert renamed.status_code == 422
+
+
+def test_a_container_runner_too_big_for_the_plan_is_refused_before_any_endpoint(client, register_function_use_case):
+    from axo_vem.domain.compute.runner_size import with_runner_size
+    from axo_vem.domain.virtual_environment.settings import PlanLimits
+
+    free = PlanLimits(runner_cpu_cores=0.5, runner_memory_mb=512, runner_max_cpu_cores=0.5, runner_max_memory_mb=512)
+    register_function_use_case._runner_size = lambda spec: with_runner_size(spec, free, 1.0, 1024)
+    response = client.post(
+        "/functions",
+        data={"name": "add", "runtime_spec": json.dumps({"type": "container", "python_version": "3.11", "cpu_limit": 2})},
+        files={"code": ("add.py", _source_for("add"), "text/x-python")},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"] == "RUNNER_SIZE_INVALID" and response.json()["error_code"] == 9630

@@ -7,7 +7,7 @@ from axo_shared.events import models
 from axo_shared.protocol import CommandResult
 
 
-def _run_fake_endpoint(reply_ok, error_message="", metadata=None):
+def _run_fake_endpoint(reply_ok, error_message="", metadata=None, error_name="", error_code=0):
     """Binds its own ephemeral port directly (no separate probe-then-rebind
     step -- that pattern races under rapid successive binds) and returns the
     resolved address alongside the serving thread/captured command."""
@@ -24,7 +24,8 @@ def _run_fake_endpoint(reply_ok, error_message="", metadata=None):
         identity, body = frames[0], frames[1:]
         command = wire.decode_command(body).unwrap()
         captured["command"] = command
-        result = CommandResult(ok=reply_ok, error=error_message, metadata=metadata or {})
+        result = CommandResult(ok=reply_ok, error=error_message, metadata=metadata or {},
+                               error_name=error_name, error_code=error_code)
         router.send_multipart([identity, *wire.encode_command_result(result)])
         router.close()
 
@@ -157,12 +158,16 @@ def test_submit_function_job_skips_endpoints_that_are_not_running(client, collec
         models.EndpointStopped(endpoint_id="n1", uptime_ms=1.0).model_dump(mode="json"),
     )
 
-    response = client.post("/functions/add-hash/1/jobs", json={"params": {"a": 1}})
+    response = client.post("/functions/add-hash/1/jobs", json={"params": {"a": 1}},
+                           headers={"X-Axo-Wait-Ms": "12.5"})
     thread.join(timeout=2.0)
 
     assert response.status_code == 200
     assert response.json()["endpoint_id"] == "127.0.0.1"
     assert captured["command"].operation == wire.JOB_SUBMIT
+    # The CP's wait (header) and the VEM's own both reach the endpoint.
+    waits = captured["command"].envelope["layer_waits_ms"]
+    assert waits["control_plane"] == 12.5 and waits["vem"] >= 0
 
 
 def test_submit_function_job_falls_back_to_most_recently_seen_endpoint(client, collections, kurrent_appender):
@@ -194,6 +199,52 @@ def test_submit_function_job_falls_back_to_most_recently_seen_endpoint(client, c
 def test_submit_function_job_returns_404_for_unknown_function(client):
     response = client.post("/functions/missing/1/jobs", json={"params": {}})
     assert response.status_code == 404
+    body = response.json()
+    assert (body["error"], body["error_code"]) == ("VEM_NOT_FOUND", 9601) and body["detail"] == body["message"]
+
+
+def test_an_endpoint_refusal_keeps_the_endpoints_error_name_and_number(client, kurrent_appender):
+    address, thread, _ = _run_fake_endpoint(reply_ok=False, error_message="no such function here",
+                                            error_name="FUNCTION_NOT_FOUND", error_code=2001)
+    kurrent_appender.append_to_stream(
+        "functions-add:1", models.FUNCTION_REGISTERED,
+        models.FunctionRegistered(endpoint_id="127.0.0.1", function_id="add-hash", version=1, name="add")
+        .model_dump(mode="json"),
+    )
+    kurrent_appender.append_to_stream(
+        "endpoints-127.0.0.1", models.ENDPOINT_STARTED,
+        models.EndpointStarted(endpoint_id="127.0.0.1", router_bind=address, pub_bind="tcp://127.0.0.1:2")
+        .model_dump(mode="json"),
+    )
+    response = client.post("/functions/add-hash/1/jobs", json={"params": {}})
+    thread.join(timeout=2.0)
+    assert response.status_code == 409
+    assert (response.json()["error"], response.json()["error_code"]) == ("FUNCTION_NOT_FOUND", 2001)
+
+
+def test_bad_request_bodies_get_a_named_error():
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from pydantic import BaseModel
+    from axo_shared import error_catalog
+    from axo_vem.infrastructure.transport.api import errors as api_errors
+
+    class Body(BaseModel):
+        n: int
+
+    app = FastAPI()
+    api_errors.register_exception_handlers(app)
+
+    @app.post("/x")
+    def x(body: Body):
+        return body
+
+    bad = TestClient(app).post("/x", json={}).json()
+    assert (bad["error"], bad["error_code"]) == ("VEM_REQUEST_INVALID", 9610)
+    assert bad["details"]["fields"][0]["field"] == "n"
+    # Every name the handlers can answer with is a VEM entry of the catalog.
+    for name in set(api_errors._BY_STATUS.values()) | {"VEM_ERROR", "VEM_REQUEST_INVALID"}:
+        assert error_catalog.BY_NAME[name].component == "vem"
 
 
 def test_poll_job_result_relays_node_response(client, collections):

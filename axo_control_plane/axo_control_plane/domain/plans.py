@@ -70,10 +70,15 @@ def endpoint_size(name: Optional[str], cpu_cores: Optional[float] = None, memory
     return size
 
 
+KB = 1024
+MB = 1024 * KB
+GB = 1024 * MB
+
+
 @dataclass(frozen=True)
 class Plan:
     """What a VE is bought with. Prices are in cents (integers, no float
-    money). ``request_limit`` is per month (Free only); ``sleeps`` = the whole
+    money). ``request_limit`` is per rental period (Free only); ``sleeps`` = the whole
     VE sleeps after the idle time (Free only, not configurable)."""
 
     plan_id: str
@@ -88,6 +93,19 @@ class Plan:
     personal_only: bool = False
     one_per_user: bool = False
     fixed_endpoint_size: Optional[str] = None
+    # Active objects: the largest state of one object, JSON values up to
+    # this size kept in memory (Redis; bigger ones are files), and the past
+    # revisions kept per object (the default / the most an object may ask).
+    object_max_state_bytes: int = 100 * MB
+    object_hot_max_bytes: int = 16 * KB
+    object_keep_revisions: int = 10
+    object_max_keep_revisions: int = 10
+    # Container functions' runners: the size one gets when it asks for none,
+    # and the most it may ask (it must also fit in an endpoint).
+    runner_cpu_cores: float = 0.5
+    runner_memory_mb: int = 512
+    runner_max_cpu_cores: float = 4.0
+    runner_max_memory_mb: int = 8192
     active: bool = True
     order: int = 0
 
@@ -115,16 +133,25 @@ class Plan:
 
 DEFAULT_PLANS: List[Plan] = [
     Plan("free", "Free", max_endpoints=1, base_size="small", max_retention_days=7,
-         monthly_fee_cents=0, policies_allowed=False, sleeps=True, request_limit=10_000,
-         personal_only=True, one_per_user=True, fixed_endpoint_size="small", order=0),
+         monthly_fee_cents=0, policies_allowed=False, sleeps=True, request_limit=100,
+         personal_only=True, one_per_user=True, fixed_endpoint_size="small",
+         object_max_state_bytes=10 * MB, object_hot_max_bytes=4 * KB,
+         object_keep_revisions=3, object_max_keep_revisions=3,
+         runner_max_cpu_cores=0.5, runner_max_memory_mb=512, order=0),
     Plan("basic", "Basic", max_endpoints=3, base_size="small", max_retention_days=30,
-         monthly_fee_cents=500, order=1),
+         monthly_fee_cents=500, runner_max_cpu_cores=2.0, runner_max_memory_mb=4096, order=1),
     Plan("standard", "Standard", max_endpoints=10, base_size="medium", max_retention_days=90,
-         monthly_fee_cents=2500, order=2),
+         monthly_fee_cents=2500, object_max_state_bytes=1 * GB, object_hot_max_bytes=64 * KB,
+         object_max_keep_revisions=30, runner_cpu_cores=1.0, runner_memory_mb=1024,
+         order=2),
     Plan("pro", "Pro", max_endpoints=50, base_size="large", max_retention_days=180,
-         monthly_fee_cents=9900, order=3),
+         monthly_fee_cents=9900, object_max_state_bytes=5 * GB, object_hot_max_bytes=256 * KB,
+         object_max_keep_revisions=50, runner_cpu_cores=1.0, runner_memory_mb=1024,
+         order=3),
     Plan("adaptive", "Adaptive", max_endpoints=100, base_size="large", max_retention_days=365,
-         monthly_fee_cents=19900, order=4),
+         monthly_fee_cents=19900, object_max_state_bytes=20 * GB, object_hot_max_bytes=256 * KB,
+         object_max_keep_revisions=100, runner_cpu_cores=1.0, runner_memory_mb=1024,
+         order=4),
 ]
 
 
@@ -137,7 +164,9 @@ class PriceList:
     per_core_second_ucents: int = 1_000     # $0.00001
     per_gb_second_ucents: int = 150         # $0.0000015
     storage_per_gb_month_ucents: int = 2_300_000   # $0.023
-    transfer_per_gb_ucents: int = 9_000_000        # $0.09
+    transfer_per_gb_ucents: int = 9_000_000        # $0.09 (data read only; uploads are free)
+    storage_per_request_ucents: int = 40           # $0.0000004, reads and writes alike
+    object_state_per_gb_month_ucents: int = 2_300_000   # $0.023, active objects' state (VE bill)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

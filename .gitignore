@@ -21,3 +21,6 @@ upgrade.md
 .axo_storage/
 axo_storage/.axo_storage/
 xolo*.md
+
+# pnpm workspace of the web UIs (axo-ui, axo-ui-kit, axo-admin-ui)
+/node_modules

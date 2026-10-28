@@ -66,14 +66,14 @@ def _handle(function_id="fn1", version=1, pool_index=0):
     return h
 
 
-def _runtime(tmp_path, summoner, max_retries=3):
+def _runtime(tmp_path, summoner):
     completions = []
 
     def on_complete(inv_handle, result, warnings=None):
         completions.append((inv_handle, result))
 
     runtime = ContainerFunctionRuntime(
-        function_registry=_FakeRegistry(RuntimeSpec(type="container", max_concurrency=2, max_retries=max_retries)),
+        function_registry=_FakeRegistry(RuntimeSpec(type="container", max_concurrency=2)),
         summoner=summoner,
         on_complete=on_complete,
         config=_FakeConfig(str(tmp_path)),
@@ -152,33 +152,19 @@ def test_cancel_unknown_job_id_returns_false_and_touches_no_handle(tmp_path):
     assert summoner.dismiss_calls == []
 
 
-def test_cancel_clears_any_pending_attempts_counter_for_that_job(tmp_path):
+def test_cancelled_job_bypasses_retry_and_is_never_reinvoked(tmp_path, monkeypatch):
+    """Regression test for a real race: cancel() dismisses the container,
+    but the pump thread waiting on that same container's socket can
+    independently wake up (its connection just got torn down) and call
+    _handle_crash for the very same job_id. Without a guard in
+    _handle_crash/_handle_timeout recognizing the handle was already
+    cancelled, the job would end a second time as a crash -- which
+    JobAttempts would then try again."""
     handle = _handle()
     handle.status = ContainerStatus.BUSY
     handle.current_job_id = "job1"
     summoner = _FakeSummoner([handle])
     runtime, completions = _runtime(tmp_path, summoner)
-    runtime._attempts["job1"] = 2
-
-    runtime.cancel("job1")
-
-    assert "job1" not in runtime._attempts
-
-
-def test_cancelled_job_bypasses_retry_and_is_never_reinvoked(tmp_path, monkeypatch):
-    """Regression test for a real race: cancel() dismisses the container and
-    clears _attempts, but the pump thread waiting on that same container's
-    socket can independently wake up (its connection just got torn down)
-    and call _handle_crash for the very same job_id. Without a guard in
-    _handle_crash/_handle_timeout recognizing the handle was already
-    cancelled, _retry_or_finalize would see a fresh (cleared) attempts
-    counter and silently re-invoke the job the caller explicitly cancelled
-    -- directly contradicting cancel()'s own docstring."""
-    handle = _handle()
-    handle.status = ContainerStatus.BUSY
-    handle.current_job_id = "job1"
-    summoner = _FakeSummoner([handle])
-    runtime, completions = _runtime(tmp_path, summoner, max_retries=3)
     invoked = []
     monkeypatch.setattr(
         runtime, "invoke",

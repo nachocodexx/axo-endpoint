@@ -1,0 +1,14 @@
+# Every image builds from the repo root (the projects share axo_shared/,
+# axo/, ...): keep the context to source only.
+.git
+**/node_modules
+**/.nuxt
+**/.output
+**/.venv
+**/__pycache__
+**/.pytest_cache
+**/*.pyc
+experiments
+axo-ui/legacy
+.axo_endpoint
+*.pdf

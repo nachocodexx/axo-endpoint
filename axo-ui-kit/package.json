@@ -1,0 +1,43 @@
+{
+  "name": "axo-ui-kit",
+  "type": "module",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Shared Nuxt layer of the axo UIs: theme, components, Control Plane client, snackbars, charts.",
+  "main": "./nuxt.config.ts",
+  "scripts": {
+    "dev": "nuxt dev .playground",
+    "prepare": "nuxt prepare"
+  },
+  "dependencies": {
+    "@mdi/font": "catalog:",
+    "@pinia/nuxt": "catalog:",
+    "echarts": "catalog:",
+    "pinia": "catalog:",
+    "vue-echarts": "catalog:",
+    "vue-router": "catalog:",
+    "vuetify": "catalog:",
+    "vuetify-nuxt-module": "catalog:",
+    "codemirror": "catalog:",
+    "@codemirror/state": "catalog:",
+    "@codemirror/view": "catalog:",
+    "@codemirror/language": "catalog:",
+    "@codemirror/lang-python": "catalog:",
+    "@codemirror/lang-json": "catalog:",
+    "@codemirror/lint": "catalog:",
+    "@codemirror/merge": "catalog:",
+    "@codemirror/theme-one-dark": "catalog:",
+    "@lezer/highlight": "catalog:"
+  },
+  "peerDependencies": {
+    "nuxt": "^4.6.2",
+    "vue": "^3.5.44"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "nuxt": "catalog:",
+    "typescript": "catalog:",
+    "vue": "catalog:",
+    "vue-tsc": "catalog:"
+  }
+}

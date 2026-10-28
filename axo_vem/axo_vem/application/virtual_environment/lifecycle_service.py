@@ -4,7 +4,7 @@ import json
 import threading
 import time
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from axo_shared.virtual_environment.states import compute_health
 
@@ -108,10 +108,21 @@ class VeLifecycleService:
         for record in records or []:
             if record.type == models.VE_LIFECYCLE_CHANGED:
                 self._lifecycle = json.loads(record.data.decode("utf-8"))["lifecycle"]
-        if self._lifecycle in (STOPPING_VE, DELETING_VE):
-            # The VEM restarted mid-operation: hold the endpoints still; the
-            # CP repeats the operation, which is safe to repeat.
+        if self._lifecycle in (STOPPING_VE, STOPPED_VE, DELETING_VE):
+            # The VEM restarted mid-operation, or while the VE is stopped:
+            # hold the endpoints still (a stopped VE's endpoints don't count
+            # toward the target, so the reconciler would create new ones);
+            # the CP repeats the operation, or sends start, which unpauses.
             self._reconciler.pause(True)
+
+    def resume_unfinished(self) -> None:
+        """Called once the VEM's loops run: a VE left Starting / Restoring
+        (the VEM went down mid-start) is brought up again -- nobody else
+        would, the CP only sends start to a Stopped / Failed VE. Safe to
+        repeat: stopped endpoints are started, the rest left as they are,
+        and restoring names each function's exact version."""
+        if self.lifecycle() in (STARTING_VE, RESTORING_VE):
+            self._run(self._bring_up)
 
     def lifecycle(self) -> str:
         with self._lock:
@@ -198,6 +209,29 @@ class VeLifecycleService:
             raise ConflictError(f"the VE is {self.lifecycle()}, not stopped")
         self._record(STARTING_VE, f"start requested by {by}")
         self._run(self._bring_up)
+
+    def repair(self, by: Optional[str], steps: Optional[List[Dict[str, Any]]] = None,
+               automatic: bool = False) -> Dict[str, Any]:
+        """The Control Plane's Repair: failed endpoints are tried again now
+        (whatever wait they were in); a VE that failed to start is started
+        again. Nothing while it's stopping, stopped or being deleted. The
+        CP's own checks (``steps``) and this go into the VE's history."""
+        lifecycle = self.lifecycle()
+        answer: Dict[str, Any] = {"lifecycle": lifecycle, "retried": [], "started": False}
+        if lifecycle == FAILED_VE:
+            self.start(by)
+            answer.update(lifecycle=STARTING_VE, started=True)
+        elif lifecycle not in (STOPPING_VE, STOPPED_VE, DELETING_VE):
+            answer["retried"] = self._reconciler.retry_failed_now(by)
+        answer["target_endpoints"] = self._settings.current().target_endpoints
+        answer["endpoints"] = self._reconciler.endpoints_by_state()
+        ve_id = self._settings.virtual_environment_id
+        event = models.VirtualEnvironmentRepaired(
+            virtual_environment_id=ve_id, user_id=by, by=by, automatic=automatic, steps=list(steps or []),
+            retried_endpoints=answer["retried"], created_at=datetime.fromtimestamp(self._now_fn(), tz=timezone.utc),
+        )
+        self._events.append_to_stream(stream_name(ve_id), models.VE_REPAIRED, event.model_dump(mode="json"))
+        return answer
 
     def wait(self, timeout: Optional[float] = None) -> None:
         """For tests and orderly shutdown: wait for the current operation."""

@@ -166,6 +166,7 @@ class _FakePoolSummoner:
 class _FakeConfig:
     def __init__(self, readiness_timeout, scratch_root):
         self.AXO_ENDPOINT_CONTAINER_READINESS_TIMEOUT_SECONDS = readiness_timeout
+        self.AXO_ENDPOINT_CONTAINER_INSTALL_TIMEOUT_SECONDS = 0.0
         self.AXO_ENDPOINT_SCRATCH_ROOT = scratch_root
 
 

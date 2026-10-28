@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from option import Err, Ok, Result
 
@@ -11,7 +11,7 @@ from axo_shared.activity.models import FUNCTION_DELETED_EVENT, FUNCTION_UPDATED_
 from axo_shared.functions.lifecycle import FunctionState, is_valid_transition
 from axo_shared.functions.models import FunctionRecord
 from axo_shared.functions.params_schema import ParamSpec
-from axo_shared.runtime.spec import RuntimeSpec
+from axo_shared.runtime.spec import SETTABLE_FIELDS, RuntimeSpec, RuntimeSpecError
 from axo_endpoint.core.storage.backend import StorageBackend, StorageError, StorageKey
 
 
@@ -39,6 +39,7 @@ class FunctionRegistry:
         code_format: str = "cloudpickle",
         params_schema: Optional[List[ParamSpec]] = None,
         restore_version: Optional[int] = None,
+        code_hash: Optional[str] = None,
     ) -> Result[StorageKey, StorageError]:
         """Saves a new function's code under function_id, auto-assigning the
         next version (max(existing versions for this function_id, default=0)
@@ -75,6 +76,7 @@ class FunctionRegistry:
             runtime_spec=runtime_spec,
             code_format=code_format,
             params_schema=params_schema,
+            code_hash=code_hash,
         )
         put_result = self._backend.put(key, record)
         if put_result.is_err:
@@ -126,6 +128,10 @@ class FunctionRegistry:
         params_schema: Optional[List[ParamSpec]] = None,
         env_vars: Optional[Dict[str, str]] = None,
         max_concurrency: Optional[int] = None,
+        runtime: Optional[Dict[str, Any]] = None,
+        replace_env: bool = False,
+        secret_env: Optional[List[str]] = None,
+        replace_params: bool = False,
     ) -> Result[FunctionRecord, RegistryError]:
         """In-place mutation of an existing version's params_schema/env_vars/
         max_concurrency (a runner policy raising or lowering how many copies
@@ -136,7 +142,13 @@ class FunctionRegistry:
         left untouched. env_vars are merged into the existing RuntimeSpec's
         dict. Takes effect lazily -- a currently warm worker/container keeps
         running with its old config until it next naturally redeploys; this
-        never forces a recycle."""
+        never forces a recycle.
+
+        The function's settings page replaces instead: ``replace_params``
+        (the whole params_schema), ``replace_env`` (the whole env_vars; a
+        secret left out of ``env_vars`` but still named in ``secret_env``
+        keeps its saved value) and ``runtime`` (SETTABLE_FIELDS: attempts,
+        keep time, idle time, max concurrency)."""
         get_result = self._backend.get(key)
         if get_result.is_err:
             return Err(RegistryError(str(get_result.unwrap_err())))
@@ -145,18 +157,39 @@ class FunctionRegistry:
             return Err(RegistryError(f"no FunctionRecord found for key {key}"))
 
         merged_params_schema = current.params_schema
-        if params_schema:
+        if replace_params and params_schema is not None:
+            merged_params_schema = list(params_schema)
+        elif params_schema:
             existing_names = {p.name for p in (current.params_schema or [])}
             additions = [p for p in params_schema if p.name not in existing_names]
             merged_params_schema = (current.params_schema or []) + additions
 
         merged_runtime_spec = current.runtime_spec
-        if env_vars:
+        if replace_env or secret_env is not None:
+            base_spec = current.runtime_spec or RuntimeSpec()
+            secrets = list(secret_env) if secret_env is not None else list(base_spec.secret_env)
+            new_env = dict(env_vars or {}) if replace_env else {**base_spec.env_vars, **(env_vars or {})}
+            for name in secrets:                  # a secret not sent again keeps its value
+                if new_env.get(name) is None and name in base_spec.env_vars:
+                    new_env[name] = base_spec.env_vars[name]
+            new_env = {k: v for k, v in new_env.items() if v is not None}
+            merged_runtime_spec = dataclasses.replace(
+                base_spec, env_vars=new_env, secret_env=[n for n in secrets if n in new_env])
+        elif env_vars:
             base_spec = current.runtime_spec or RuntimeSpec()
             merged_runtime_spec = dataclasses.replace(base_spec, env_vars={**base_spec.env_vars, **env_vars})
         if max_concurrency is not None:
             base_spec = merged_runtime_spec or RuntimeSpec()
             merged_runtime_spec = dataclasses.replace(base_spec, max_concurrency=max(1, int(max_concurrency)))
+        if runtime:
+            unknown = sorted(set(runtime) - set(SETTABLE_FIELDS))
+            if unknown:
+                return Err(RegistryError(f"these settings can't be changed in place: {', '.join(unknown)}"))
+            base = (merged_runtime_spec or RuntimeSpec()).to_dict()
+            try:
+                merged_runtime_spec = RuntimeSpec.from_dict({**base, **runtime})
+            except (RuntimeSpecError, TypeError, ValueError) as exc:
+                return Err(RegistryError(str(exc)))
 
         updated = dataclasses.replace(
             current, params_schema=merged_params_schema, runtime_spec=merged_runtime_spec,

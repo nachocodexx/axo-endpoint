@@ -79,17 +79,16 @@ def test_get_timeline_filters_by_function_id_nested_under_meta():
 
 def test_get_timeline_filters_by_active_object_id_nested_under_meta():
     repo = _repo()
-    _insert(repo, "a", meta={"active_object_id": "ao1"})
-    _insert(repo, "b", meta={"active_object_id": "ao2"})
+    _insert(repo, "a", meta={"object_id": "ao1"})
+    _insert(repo, "b", meta={"object_id": "ao2"})
 
     timeline = repo.get_timeline(active_object_id="ao1")
     assert [e["event_id"] for e in timeline] == ["a"]
 
 
 def test_get_timeline_with_no_matching_active_object_id_returns_empty():
-    """No event in the taxonomy carries active_object_id today -- this
-    documents that /active-objects/{id}/history returning [] is expected,
-    not a silent gap, until Active Object mesh-side instrumentation exists."""
+    """Active object events carry object_id (meta.object_id); events of
+    other kinds never match."""
     repo = _repo()
     _insert(repo, "a", meta={"function_id": "add"})
 

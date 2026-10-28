@@ -25,6 +25,13 @@ REQUESTS_RETRIED = "requests.retried"
 RESOURCE_CPU_PCT = "resource.cpu_pct"
 RESOURCE_RAM_PCT = "resource.ram_pct"
 
+# ── Choreographies (the VEM; runs / steps are counters, the rest milliseconds) ─
+CHOREOGRAPHY_RUNS = "choreography.runs"            # one per finished run, dims outcome
+CHOREOGRAPHY_RUN_MS = "choreography.run_ms"
+CHOREOGRAPHY_QUEUE_MS = "choreography.queue_ms"    # waiting for a free run slot
+CHOREOGRAPHY_STEPS = "choreography.steps"          # one per finished step, dims step + outcome
+CHOREOGRAPHY_STEP_MS = "choreography.step_ms"
+
 # ── Dimension keys ────────────────────────────────────────────────────────────
 DIM_VE = "ve"
 DIM_ENDPOINT = "endpoint"
@@ -33,6 +40,9 @@ DIM_FUNCTION_VERSION = "function_version"
 DIM_PRINCIPAL = "principal"            # user id or API key id
 DIM_OUTCOME = "outcome"
 DIM_LAYER = "layer"                    # control_plane | vem | endpoint | runner
+DIM_CHOREOGRAPHY = "choreography"
+DIM_CHOREOGRAPHY_VERSION = "choreography_version"
+DIM_STEP = "step"
 DIM_QUEUE = "queue"                    # which queue inside a component, e.g. dispatcher, outbox
 
 # Layer values for DIM_LAYER and MetricSummaryReported.component_kind.

@@ -19,6 +19,7 @@ class ParamSpec:
     type: ParamType = "string"
     required: bool = True
     default: Optional[Any] = None
+    description: Optional[str] = None
 
     @staticmethod
     def from_dict(d: Dict[str, Any]) -> "ParamSpec":
@@ -27,10 +28,14 @@ class ParamSpec:
             type=d.get("type", "string"),
             required=bool(d.get("required", True)),
             default=d.get("default"),
+            description=d.get("description") or None,
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"name": self.name, "type": self.type, "required": self.required, "default": self.default}
+        out = {"name": self.name, "type": self.type, "required": self.required, "default": self.default}
+        if self.description:
+            out["description"] = self.description
+        return out
 
 
 def parse_params_schema(raw: Optional[List[Dict[str, Any]]]) -> List[ParamSpec]:

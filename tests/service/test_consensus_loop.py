@@ -143,11 +143,34 @@ def test_no_events_emitted_on_second_tick_with_unchanged_view():
         idle_seconds=0.0,
         event_bus=bus,
     )
-    run_consensus_tick(now=200.0, **common_kwargs)
+    # Threaded between ticks like App does.
+    _, member_ids = run_consensus_tick(now=200.0, **common_kwargs)
     received.clear()
-    run_consensus_tick(now=205.0, **common_kwargs)
+    run_consensus_tick(now=205.0, previous_member_ids=member_ids, **common_kwargs)
 
     assert received == []
+
+
+class _NoPeers:
+    def list_peers(self):
+        return []
+
+    def get_peer(self, peer_id):
+        return None
+
+
+def test_a_lone_endpoint_announces_itself_as_leader_on_the_first_tick():
+    # Its term never changes (it's leader from the start), but the VEM must
+    # still hear there's a leader, or the VE shows Unavailable for good.
+    bus = InMemoryEventBus()
+    received = []
+    bus.subscribe(LEADER_ELECTED_EVENT, lambda e: received.append(e))
+    run_consensus_tick(
+        elector=BullyLeaderElector(self_id="solo"), heartbeat_subscriber=_NoPeers(),
+        dirty_tracker=DirtyTracker(max_dirty_count=1), state_machine=InMemoryReplicatedStateMachine(),
+        self_id="solo", push_to_peer_fn=lambda *a: None, idle_seconds=0.0, event_bus=bus, now=1.0,
+    )
+    assert [e.payload for e in received] == [{"leader_ids": ["solo"], "term": 0}]
 
 
 def test_does_not_require_event_bus():

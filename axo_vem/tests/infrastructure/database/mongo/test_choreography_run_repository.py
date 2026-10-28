@@ -1,71 +1,50 @@
 import mongomock
-import pytest
 
-from axo_vem.domain.choreography.run import ChoreographyRun, NodeRunState
+from axo_vem.domain.choreography.run import ChoreographyRun, ItemState, StepState
 from axo_vem.infrastructure.database.mongo.choreography_run_repository import MongoChoreographyRunRepository
 
 
-def _repository():
-    db = mongomock.MongoClient()["test"]
-    return MongoChoreographyRunRepository(db["choreography_runs"]), db["choreography_runs"]
+def _run(run_id, status="completed", queued_at="2026-01-01T00:00:00+00:00", user="u1", duration=10.0):
+    return ChoreographyRun(run_id=run_id, choreography_id="c1", choreography_name="etl", version=1, status=status,
+                           acting_user_id=user, queued_at=queued_at, duration_ms=duration,
+                           steps={"a": StepState(node_id="a", kind="function",
+                                                 items=[ItemState(index=0, file={"name": "x"})])})
 
 
-def test_get_returns_none_for_missing_run():
-    repository, _collection = _repository()
-    assert repository.get("no-such-run") is None
+def test_round_trip_insert_once_and_listing():
+    repository = MongoChoreographyRunRepository(mongomock.MongoClient()["t"]["runs"])
+    assert repository.insert(_run("r1"))
+    assert not repository.insert(_run("r1"))
+    repository.save(_run("r2", status="queued", queued_at="2026-01-02T00:00:00+00:00"))
+    back = repository.get("r1")
+    assert back.steps["a"].items[0].file == {"name": "x"}
+    assert [r.run_id for r in repository.list("c1")] == ["r2", "r1"]
+    assert [r.run_id for r in repository.list("c1", status="queued")] == ["r2"]
+    assert [r.run_id for r in repository.list("c1", since="2026-01-01T12:00:00+00:00")] == ["r2"]
+    assert [r.run_id for r in repository.active()] == ["r2"]
+    assert repository.count("c1", "queued") == 1
 
 
-def test_list_by_choreography_sorted_by_started_at_descending():
-    repository, _collection = _repository()
-    repository.save(ChoreographyRun(run_id="run1", choreography_id="c1", started_at="2026-01-01T00:00:00Z"))
-    repository.save(ChoreographyRun(run_id="run2", choreography_id="c1", started_at="2026-01-03T00:00:00Z"))
-    repository.save(ChoreographyRun(run_id="run3", choreography_id="c1", started_at="2026-01-02T00:00:00Z"))
-    repository.save(ChoreographyRun(run_id="run4", choreography_id="other", started_at="2026-01-04T00:00:00Z"))
-
-    runs = repository.list_by_choreography("c1")
-
-    assert [r.run_id for r in runs] == ["run2", "run3", "run1"]
+def test_usage_and_delete():
+    repository = MongoChoreographyRunRepository(mongomock.MongoClient()["t"]["runs"])
+    for i, (status, user) in enumerate([("completed", "u1"), ("failed", "u2"), ("completed", "u1")]):
+        repository.insert(_run(f"r{i}", status=status, user=user, duration=10.0 * (i + 1)))
+    usage = repository.usage("c1")
+    assert usage["runs"] == 3 and usage["by_status"] == {"completed": 2, "failed": 1}
+    assert abs(usage["success_rate"] - 2 / 3) < 1e-9 and usage["duration_ms"]["max"] == 30.0
+    assert repository.delete_for("c1") == 3 and repository.list("c1") == []
 
 
-@pytest.mark.parametrize("status,expected", [
-    ("pending", True), ("running", True),
-    ("completed", False), ("failed", False), ("cancelled", False),
-])
-def test_has_active_run_true_only_for_pending_or_running_statuses(status, expected):
-    repository, _collection = _repository()
-    repository.save(ChoreographyRun(run_id="run1", choreography_id="c1", status=status))
-
-    assert repository.has_active_run("c1") is expected
-
-
-def test_has_active_run_false_for_choreography_with_no_runs():
-    repository, _collection = _repository()
-    assert repository.has_active_run("no-such-choreography") is False
-
-
-def test_save_upserts_by_run_id_and_round_trips_node_states():
-    repository, collection = _repository()
-    node_state = NodeRunState(
-        node_id="n1", status="completed", job_id="job1", endpoint_id="ep1",
-        attempt=2, error=None, warnings=["slow"], duration_ms=12.5,
-    )
-    run = ChoreographyRun(
-        run_id="run1", choreography_id="c1", status="running",
-        node_states={"n1": node_state}, started_at="2026-01-01T00:00:00Z",
-    )
-
-    repository.save(run)
-    assert collection.count_documents({"_id": "run1"}) == 1
-
-    loaded = repository.get("run1")
-    assert loaded.run_id == "run1"
-    assert loaded.node_states["n1"] == node_state
-
-    run.status = "completed"
-    run.finished_at = "2026-01-01T00:05:00Z"
-    repository.save(run)
-
-    assert collection.count_documents({"_id": "run1"}) == 1  # still one doc, not a duplicate
-    reloaded = repository.get("run1")
-    assert reloaded.status == "completed"
-    assert reloaded.finished_at == "2026-01-01T00:05:00Z"
+def test_overview_gives_last_run_day_counts_and_active_in_one_pass():
+    repository = MongoChoreographyRunRepository(mongomock.MongoClient()["t"]["runs"])
+    rows = [("r0", "completed", "2026-01-01T00:00:00+00:00"), ("r1", "failed", "2026-01-02T10:00:00+00:00"),
+            ("r2", "completed_with_errors", "2026-01-02T11:00:00+00:00"), ("r3", "running", "2026-01-02T12:00:00+00:00")]
+    for run_id, status, at in rows:
+        repository.insert(_run(run_id, status=status, queued_at=at))
+    other = _run("x", queued_at="2026-01-02T09:00:00+00:00")
+    other.choreography_id = "c2"
+    repository.insert(other)
+    view = repository.overview("2026-01-02T00:00:00+00:00")
+    assert view["c1"]["last_run"]["run_id"] == "r3" and view["c1"]["last_run"]["status"] == "running"
+    assert (view["c1"]["runs_24h"], view["c1"]["errors_24h"], view["c1"]["active_runs"]) == (3, 2, 1)
+    assert view["c2"]["runs_24h"] == 1 and view["c2"]["active_runs"] == 0

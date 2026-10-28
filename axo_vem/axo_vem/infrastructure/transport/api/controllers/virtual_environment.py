@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -17,6 +17,11 @@ class _SettingsChange(BaseModel):
     reason: Optional[str] = None
 
 
+class _RepairReport(BaseModel):
+    steps: List[Dict[str, Any]] = []
+    automatic: bool = False
+
+
 def build_router(
     settings_service: VeSettingsService,
     current_user_dependency: Callable[..., ActingUser],
@@ -24,7 +29,8 @@ def build_router(
 ) -> APIRouter:
     """This VEM's own VE: who it is, its limits, its settings, what it's
     doing (lifecycle, health, endpoint counts, restore progress), and the
-    VE-wide operations the Control Plane drives: stop, start, prepare-delete.
+    VE-wide operations the Control Plane drives: stop, start, prepare-delete,
+    repair.
     Those return at once; the CP polls GET /ve until they finish."""
     router = APIRouter(tags=["virtual environment"])
 
@@ -82,6 +88,13 @@ def build_router(
         """Endpoints back up, then Restoring re-registers every function."""
         _lifecycle().start(by=current_user.key)
         return _view()
+
+    @router.post("/ve/repair")
+    def repair(body: _RepairReport, current_user: ActingUser = Depends(current_user_dependency)):
+        """The Control Plane only (its Repair): failed endpoints tried again
+        now, a VE that failed to start started again; the CP's checks and
+        this are recorded in the VE's history. What was done."""
+        return _lifecycle().repair(by=current_user.key, steps=body.steps, automatic=body.automatic)
 
     @router.post("/ve/prepare-delete", status_code=202)
     def prepare_delete(current_user: ActingUser = Depends(current_user_dependency)):

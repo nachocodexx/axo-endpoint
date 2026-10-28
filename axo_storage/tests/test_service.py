@@ -168,3 +168,65 @@ def test_ve_tokens_can_be_derived_from_a_shared_secret(catalog):
     bad = {"ve_id": "new-ve", "token": derive_ve_token("s3cret", "other-ve")}
     assert call(service, wire.OBJECT_LIST, auth=good, bucket="b").ok
     assert call(service, wire.OBJECT_LIST, auth=bad, bucket="b").error_name == "STORAGE_UNAUTHENTICATED"
+
+
+def test_each_complete_version_is_reported_once_with_its_writer_and_source(catalog, clock):
+    from axo_storage.access import AllowAllAccessChecker
+    from axo_storage.auth import Authenticator
+    from axo_storage.chunk_store import MemoryChunkStore
+    from axo_storage.service import StorageService
+    from axo_storage.usage import object_written
+
+    reports = []
+    service = StorageService(
+        catalog=catalog, chunks=MemoryChunkStore(), authenticator=Authenticator(VE_TOKENS, [SERVICE_TOKEN]),
+        access=AllowAllAccessChecker(), now_fn=clock,
+        on_written=lambda row, caller: reports.append(object_written(row, caller)),
+    )
+    assert call(service, wire.BUCKET_CREATE, user="boss", name="sales").ok
+    upload(service, b"hello world!", auth=PROD, source="choreography:ch-1")
+    reg = call(service, wire.OBJECT_REGISTER, bucket="sales", name="report.csv", total_size=3, chunk_bytes=4,
+               content_hash="not-the-hash")
+    bad = call(service, wire.OBJECT_CHUNK_PUT, bucket="sales", name="report.csv", version=reg.metadata["version"],
+               chunk_index=0, payload=b"bad")
+    assert bad.error_name == "OBJECT_HASH_MISMATCH"                   # failed version: not reported
+
+    [(data, message_id)] = reports
+    assert message_id == "written:sales:report.csv:1"
+    assert (data["bucket_key"], data["name"], data["version"], data["size"]) == ("sales", "report.csv", 1, 12)
+    assert (data["user_id"], data["writer_ve_id"], data["source"]) == ("luis", "ml-prod", "choreography:ch-1")
+
+
+def test_file_pages_show_one_row_per_file_with_folders_first(sales):
+    for name in ["b.csv", "a.csv", "2024/march/x.csv", "2024/april.csv", "2023/y.csv"]:
+        upload(sales, b"data", name=name)
+    upload(sales, b"again", name="a.csv")
+    top = call(sales, wire.OBJECT_LIST, bucket="sales", files=True).metadata
+    assert [(e["kind"], e["name"]) for e in top["entries"]] == [
+        ("folder", "2023/"), ("folder", "2024/"), ("file", "a.csv"), ("file", "b.csv")]
+    a = top["entries"][2]
+    assert (a["versions"], a["version"], a["total_size"], a["state"]) == (2, 2, 5, "complete")
+    assert top["entries"][1]["files"] == 2 and top["next"] is None
+    inside = call(sales, wire.OBJECT_LIST, bucket="sales", files=True, prefix="2024/").metadata["entries"]
+    assert [e["name"] for e in inside] == ["2024/march/", "2024/april.csv"]
+
+
+def test_file_pages_continue_after_the_last_entry_shown(sales):
+    for name in ["d/1", "a", "b", "c"]:
+        upload(sales, b"x", name=name)
+    first = call(sales, wire.OBJECT_LIST, bucket="sales", files=True, limit=2).metadata
+    assert [e["name"] for e in first["entries"]] == ["d/", "a"] and first["next"] == "a"
+    second = call(sales, wire.OBJECT_LIST, bucket="sales", files=True, limit=2, after="a").metadata
+    assert [e["name"] for e in second["entries"]] == ["b", "c"] and second["next"] is None
+
+
+def test_bucket_figures_come_for_every_bucket_in_one_call(sales):
+    assert call(sales, wire.BUCKET_CREATE, user="boss", name="empty").ok
+    upload(sales, b"1234", name="a")
+    upload(sales, b"12", name="a")
+    upload(sales, b"1", name="b")
+    stats = call(sales, wire.BUCKET_STATS, names=["sales", "empty"]).metadata["buckets"]
+    assert (stats["sales"]["used_bytes"], stats["sales"]["files"]) == (7, 2)
+    assert stats["sales"]["last_change"] is not None
+    assert stats["empty"] == {"used_bytes": 0, "files": 0, "last_change": None}
+    assert call(sales, wire.BUCKET_STATS, auth=PROD, names=["sales"]).error_name == "STORAGE_UNAUTHENTICATED"

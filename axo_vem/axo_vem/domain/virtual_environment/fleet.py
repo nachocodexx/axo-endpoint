@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Set
 
 CREATING = "creating"    # container launched, endpoint not reporting yet
 STARTING = "starting"    # restarted / woken, endpoint not reporting yet
@@ -12,6 +12,7 @@ REMOVING = "removing"
 REMOVED = "removed"
 STOPPED = "stopped"      # the VE is stopped: container kept for Start
 FAILED = "failed"        # died unexpectedly
+FORGOTTEN = "forgotten"  # a removed / failed one the user cleared from the list: dropped from the fleet
 
 # Count toward target_endpoints: they exist, or will in a moment.
 PRESENT = frozenset({CREATING, STARTING, RUNNING, SLEEPING})
@@ -43,8 +44,10 @@ class Fleet:
 
     def __init__(self) -> None:
         self._endpoints: Dict[str, ManagedEndpoint] = {}
+        self._forgotten: Set[str] = set()   # never listed again
 
     def apply(self, data: Dict) -> ManagedEndpoint:
+        """The endpoint after this event (a ``forgotten`` one leaves the fleet)."""
         current = self._endpoints.get(data["endpoint_id"])
         endpoint = ManagedEndpoint(
             endpoint_id=data["endpoint_id"], state=data["state"],
@@ -53,11 +56,18 @@ class Fleet:
             since=str(data.get("created_at", "")), failures=int(data.get("failures", 0)),
             replaces=data.get("replaces"), reason=data.get("reason"),
         )
-        self._endpoints[endpoint.endpoint_id] = endpoint
+        if endpoint.state == FORGOTTEN:
+            self._endpoints.pop(endpoint.endpoint_id, None)
+            self._forgotten.add(endpoint.endpoint_id)
+        else:
+            self._endpoints[endpoint.endpoint_id] = endpoint
         return endpoint
 
     def get(self, endpoint_id: str) -> Optional[ManagedEndpoint]:
         return self._endpoints.get(endpoint_id)
+
+    def is_forgotten(self, endpoint_id: str) -> bool:
+        return endpoint_id in self._forgotten
 
     def all(self) -> List[ManagedEndpoint]:
         return sorted(self._endpoints.values(), key=lambda e: (e.since, e.endpoint_id))

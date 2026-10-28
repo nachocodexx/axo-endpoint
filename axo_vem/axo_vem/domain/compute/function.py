@@ -54,3 +54,7 @@ class Function:
     # From FunctionRegistered -- what Restoring needs to re-register it.
     name: Optional[str] = None
     params_schema: Optional[List[Dict[str, Any]]] = None
+    # "source" or "cloudpickle" (Restoring sends it back as it came), and the
+    # client's hash of the code: the same code again answers with this version.
+    code_format: Optional[str] = None
+    code_hash: Optional[str] = None

@@ -13,6 +13,9 @@ ENV POETRY_NO_INTERACTION=1 \
 COPY poetry.lock  .
 COPY pyproject.toml  .
 COPY axo_shared/ /app/axo_shared/
+# path dependency: the endpoint's workers run Axo classes through it
+COPY axo/pyproject.toml axo/README.md /app/axo/
+COPY axo/axo/ /app/axo/axo/
 # path dev-dependency (endpoint tests run against a real axo_storage)
 COPY axo_storage/ /app/axo_storage/
 RUN touch README.md

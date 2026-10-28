@@ -91,6 +91,16 @@ def test_retention_cutoff_follows_the_setting_or_plan():
     assert unlimited.retention_cutoff() is None
 
 
+def test_history_is_deleted_only_after_the_retention_plus_the_grace_days():
+    now = datetime(2026, 10, 11, tzinfo=timezone.utc)
+    service = VeSettingsService("ml-prod", LIMITS, _Log(), now_fn=lambda: now)
+    assert service.deletion_cutoff() == now - timedelta(days=30 + 7)
+    service.set_limits(PlanLimits(max_endpoints=3, max_retention_days=30, history_grace_days=0), by="cp")
+    assert service.deletion_cutoff() == service.retention_cutoff()
+    unlimited = VeSettingsService("x", PlanLimits(max_endpoints=1), _Log(), now_fn=lambda: now)
+    assert unlimited.deletion_cutoff() is None
+
+
 def test_the_quota_holds_target_times_endpoint_size():
     limits = PlanLimits(max_endpoints=10, quota_cpu_cores=4.0, quota_memory_mb=8192)
     service = VeSettingsService("ml-prod", limits, _Log())

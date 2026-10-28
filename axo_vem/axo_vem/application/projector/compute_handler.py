@@ -13,6 +13,17 @@ ENDPOINT_EVENT_TYPES = frozenset({
 })
 
 _WS_TOPIC = "endpoints"
+
+
+def apply_reading(endpoint_repository: EndpointRepository, data: Dict[str, Any]) -> bool:
+    """An endpoint's metric reading (EndpointMetricsReported, every few
+    seconds), straight from the ingestion router: only the endpoint's
+    current figures change -- it's never appended to the event log nor kept
+    as history (the figures over time come from the minute statistics). A
+    reading for an endpoint not listed (not started yet, or forgotten) or
+    older than the one kept (a resend) changes nothing."""
+    endpoint_repository.apply_reading(data["endpoint_id"], data)
+    return True
 _WS_FUNCTIONS_TOPIC = "functions"
 
 # Function-lifecycle events that carry the full function_id/version/

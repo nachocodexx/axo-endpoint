@@ -1,4 +1,4 @@
-# Built with build context = repo root (see platform.compose.yml) so
+# Built with build context = repo root (see docker-compose.yml) so
 # axo_shared/ -- a sibling path dependency -- is reachable, mirroring the
 # on-disk repo layout (axo_shared/ next to axo_control_plane/).
 ARG PYTHON_VERSION=3.11

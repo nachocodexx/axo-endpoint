@@ -165,6 +165,20 @@ class Sharing:
         query = {"status": PENDING, "$or": [{"invitee.id": actor.user_id}, {"invitee.id": {"$in": team_ids}}]}
         return [_public(d) for d in self._invites.find(query).sort("created_at", -1)]
 
+    def sent(self, actor: Actor) -> List[Dict[str, Any]]:
+        """Invitations this person sent that wait for an answer (the inbox's "Sent")."""
+        return [_public(d) for d in self._invites.find({"invited_by": actor.user_id, "status": PENDING})
+                .sort("created_at", -1)]
+
+    def answered(self, actor: Actor, days: int = 30) -> List[Dict[str, Any]]:
+        """Invitations answered or cancelled in the last ``days`` that this
+        person sent, received, or answered for one of their teams."""
+        team_ids = [t["team_id"] for t in self._teams.of_user(actor.user_id)]
+        query = {"status": {"$ne": PENDING}, "answered_at": {"$gte": self._now_fn() - days * 86400},
+                 "$or": [{"invited_by": actor.user_id}, {"invitee.id": actor.user_id},
+                         {"invitee.id": {"$in": team_ids}}]}
+        return [_public(d) for d in self._invites.find(query).sort("answered_at", -1).limit(200)]
+
     def outgoing(self, kind: str, target_id: str) -> List[Dict[str, Any]]:
         return [_public(d) for d in self._invites.find({"kind": kind, "target_id": target_id, "status": PENDING})]
 
@@ -248,8 +262,53 @@ class Sharing:
         out = []
         for grant in self._access.grants(R.ve_resource(ve_id)):
             out.append({"principal_id": grant.principal_id, "principal_type": grant.principal_type,
+                        "name": self._principal_name(grant.principal_id),
                         "role": R.ve_role_from_permissions(grant.permissions, grant.is_owner)})
         return out
+
+    def bucket_access(self, actor: Actor, full_name: str) -> List[Dict[str, Any]]:
+        """Who has access and with which role: anyone with access sees it,
+        only the Owner changes it."""
+        doc = self._buckets.resolve(full_name)
+        self._authz.require_bucket(actor, doc["_id"], R.READER)
+        out = []
+        for grant in self._access.grants(R.bucket_resource(doc["_id"])):
+            out.append({"principal_id": grant.principal_id, "principal_type": grant.principal_type,
+                        "name": self._principal_name(grant.principal_id),
+                        "role": R.bucket_role_from_permissions(grant.permissions, grant.is_owner)})
+        return out
+
+    def set_bucket_role(self, actor: Actor, full_name: str, principal_id: str, principal_type: str, role: str) -> None:
+        """Reader <-> Writer for someone who already has access (they accepted
+        once; no new invitation). The Owner changes only by transfer."""
+        R.check_bucket_role(role)
+        if role == R.OWNER:
+            raise InvalidError("ownership moves only by a transfer")
+        doc = self._buckets.resolve(full_name)
+        self._authz.require_bucket(actor, doc["_id"], R.OWNER)
+        resource = R.bucket_resource(doc["_id"])
+        current = next((g for g in self._access.grants(resource) if g.principal_id == principal_id), None)
+        if current is None:
+            raise NotFoundError("they have no access to this bucket")
+        if current.is_owner:
+            raise ForbiddenError("the Owner changes only by transfer")
+        self._identity.revoke(resource, principal_id, principal_type, R.ALL_GRANTABLE)
+        self._identity.grant(resource, principal_id, principal_type, R.XOLO_BUCKET_PERMISSIONS[role])
+        self._access.changed_resource(resource)
+        self._history.append(f"bucket-{doc['_id']}", "BucketRoleChanged",
+                             {"bucket_id": doc["_id"], "principal_id": principal_id, "role": role,
+                              "by": actor.user_id, "at": self._now_fn()})
+
+    def _principal_name(self, principal_id: str) -> Optional[str]:
+        """A person's username, or "<team> (owner | admins | members)" for a team's groups."""
+        try:
+            return self._people.get(principal_id)["username"]
+        except NotFoundError:
+            team = self._teams.of_group(principal_id)
+            if team is None:
+                return None
+            kind = next(k for k, g in team["groups"].items() if g == principal_id)
+            return f"{team['name']} ({'owner' if kind == 'owner' else kind})"
 
     def set_ve_role(self, actor: Actor, ve_id: str, principal_id: str, principal_type: str,
                     role: Optional[str]) -> None:
@@ -357,11 +416,43 @@ class Sharing:
         self._history.append(f"ve-{ve_id}", "VirtualEnvironmentTransferred",
                              {"ve_id": ve_id, "from": previous, "to": new_owner, "at": self._now_fn()})
 
-    def pending_transfers(self, actor: Actor) -> List[Dict[str, Any]]:
+    def pending_transfers(self, actor: Actor, answered_days: int = 0) -> List[Dict[str, Any]]:
+        """Transfers waiting for this person (or a team they own), and the ones
+        they asked for; with ``answered_days``, also those answered since. A
+        VE's carries its plan and monthly fee: accepting means paying it."""
         team_ids = [t["team_id"] for t in self._teams.of_user(actor.user_id) if t["owner_id"] == actor.user_id]
-        query = {"status": PENDING, "$or": [{"to.id": actor.user_id}, {"to.id": {"$in": team_ids}},
-                                            {"from": actor.user_id}]}
-        return [_public(d) for d in self._transfers.find(query)]
+        status: Any = PENDING
+        if answered_days:
+            status = {"$in": [PENDING, ACCEPTED, REJECTED, CANCELLED]}
+        query = {"$or": [{"to.id": actor.user_id}, {"to.id": {"$in": team_ids}}, {"from": actor.user_id}],
+                 "status": status}
+        out = []
+        for doc in self._transfers.find(query).sort("created_at", -1):
+            if doc["status"] != PENDING and (doc.get("answered_at") or 0) < self._now_fn() - answered_days * 86400:
+                continue
+            row = _public(doc)
+            if doc["kind"] == KIND_VE:
+                ve = self._ves.find_one({"_id": doc["target_id"]}) or {}
+                plan = self._plans.find_one({"_id": ve.get("plan_id")}) or {}
+                row["plan"] = {"plan_id": ve.get("plan_id"), "name": plan.get("name"),
+                               "monthly_fee_cents": plan.get("monthly_fee_cents")}
+            out.append(row)
+        return out
+
+    def cancel_transfer(self, actor: Actor, transfer_id: str) -> None:
+        """The owner who asked changes their mind (before it's answered)."""
+        doc = self._transfers.find_one({"_id": transfer_id, "status": PENDING})
+        if doc is None:
+            raise NotFoundError("no such pending transfer")
+        if doc["from"] != actor.user_id:
+            raise ForbiddenError("only who asked for the transfer cancels it")
+        self._transfers.update_one({"_id": transfer_id}, {"$set": {"status": CANCELLED, "answered_by": actor.user_id,
+                                                                  "answered_at": self._now_fn()}})
+        to = doc["to"]
+        receivers = [to["id"]] if to["type"] == "user" else [self._teams.get(to["id"])["owner_id"]]
+        self._notifications.notify(receivers, N.TRANSFER_COMPLETED,
+                                   f"{actor.username} cancelled giving you {doc['kind']} {doc['target_name']}",
+                                   {"transfer_id": transfer_id})
 
 
 def _hash(code: str) -> str:

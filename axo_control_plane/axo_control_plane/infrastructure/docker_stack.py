@@ -32,9 +32,11 @@ class DockerStackDriver(StackDriver):
         return self._client
 
     # ── networks ─────────────────────────────────────────────────────────────
-    def ensure_network(self, name: str, labels: Dict[str, str]) -> None:
-        if not self._docker.networks.list(names=[name]):
-            self._docker.networks.create(name, driver="bridge", labels=labels, check_duplicate=True)
+    def ensure_network(self, name: str, labels: Dict[str, str]) -> bool:
+        if self._docker.networks.list(names=[name]):
+            return False
+        self._docker.networks.create(name, driver="bridge", labels=labels, check_duplicate=True)
+        return True
 
     def remove_network(self, name: str) -> None:
         for network in self._docker.networks.list(names=[name]):
@@ -43,18 +45,20 @@ class DockerStackDriver(StackDriver):
             except docker.errors.NotFound:
                 pass
 
-    def connect(self, network: str, container: str) -> None:
+    def connect(self, network: str, container: str) -> bool:
         try:
             net = self._docker.networks.get(network)
             net.reload()
             attached = {c.name for c in net.containers}
             if container not in attached:
                 net.connect(container)
+                return True
         except docker.errors.NotFound:
             pass                       # the container (e.g. axo-storage in local dev) isn't here
         except docker.errors.APIError as exc:
             if "already exists" not in str(exc):
                 raise
+        return False
 
     def disconnect(self, network: str, container: str) -> None:
         try:
@@ -69,11 +73,22 @@ class DockerStackDriver(StackDriver):
         except docker.errors.NotFound:
             return None
 
+    def image_outdated(self, name: str, image: str) -> bool:
+        try:
+            running = self._docker.containers.get(name).attrs.get("Image")
+            current = self._docker.images.get(image).id
+        except docker.errors.NotFound:
+            return False
+        except docker.errors.ImageNotFound:
+            return False
+        return bool(running) and running != current
+
     def run(self, spec: ContainerRun) -> None:
         volumes = {volume: {"bind": path, "mode": "rw"} for volume, path in spec.volumes.items()}
         if spec.mount_docker_socket:
             volumes[DOCKER_SOCKET] = {"bind": DOCKER_SOCKET, "mode": "rw"}
         first, *others = spec.networks or [None]
+        self._ensure_image(spec.image)
         container = self._docker.containers.create(
             image=spec.image, name=spec.name, environment=spec.env, labels=spec.labels, network=first,
             volumes=volumes or None, command=spec.command,
@@ -84,6 +99,18 @@ class DockerStackDriver(StackDriver):
         for network in others:
             self._docker.networks.get(network).connect(container)
         container.start()
+
+    def _ensure_image(self, image: str) -> None:
+        """Pulls an image this host doesn't have yet (Kurrent / Mongo / Redis
+        on a fresh machine); a local-only image (``axo-vem:local``) must have
+        been built first."""
+        try:
+            self._docker.images.get(image)
+        except docker.errors.ImageNotFound:
+            try:
+                self._docker.images.pull(image)
+            except docker.errors.APIError as exc:
+                raise UnavailableError(f"image {image} is not on this host and can't be pulled: {exc}")
 
     def start(self, name: str) -> None:
         self._docker.containers.get(name).start()

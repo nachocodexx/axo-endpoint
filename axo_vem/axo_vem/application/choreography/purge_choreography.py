@@ -1,36 +1,28 @@
 from __future__ import annotations
 
-from pymongo.collection import Collection
-
-from axo_vem.domain.errors import ConflictError, NotFoundError, NotOwnerError
+from axo_vem.domain.choreography.run_repository import ChoreographyRunRepository
+from axo_vem.domain.errors import ConflictError, NotFoundError
 from axo_vem.infrastructure.database.mongo.activity_repository import MongoActivityRepository
+from axo_vem.infrastructure.database.mongo.choreography_repository import MongoChoreographyRepository
 
 
 class PurgeChoreographyUseCase:
-    """Hard-deletes a choreography's read-model doc, its run history, and
-    its unified_activity rows -- mirrors PurgeVirtualEnvironmentUseCase.
-    Requires the choreography to already be soft-deleted; never touches the
-    underlying Kurrent event log."""
+    """Removes a deleted choreography for good: its versions, its runs and its
+    activity rows (never the Kurrent event log). Its steps' jobs stay in the
+    jobs list until their results' keep time is over."""
 
-    def __init__(
-        self,
-        choreographies: Collection,
-        choreography_runs: Collection,
-        activity_repository: MongoActivityRepository,
-    ) -> None:
-        self._choreographies = choreographies
-        self._choreography_runs = choreography_runs
+    def __init__(self, repository: MongoChoreographyRepository, runs: ChoreographyRunRepository,
+                 activity_repository: MongoActivityRepository) -> None:
+        self._repository = repository
+        self._runs = runs
         self._activity_repository = activity_repository
 
-    def execute(self, *, choreography_id: str, current_user_id: str) -> None:
-        doc = self._choreographies.find_one({"_id": choreography_id})
+    def execute(self, *, choreography_id: str) -> None:
+        doc = self._repository.raw(choreography_id)
         if doc is None:
-            raise NotFoundError("choreography not found")
-        if doc.get("owner_user_id") != current_user_id:
-            raise NotOwnerError("caller does not own this choreography")
+            raise NotFoundError("No such choreography", error_name="CHOREOGRAPHY_NOT_FOUND")
         if doc.get("deleted_at") is None:
-            raise ConflictError("choreography must be deleted first")
-
-        self._choreographies.delete_one({"_id": choreography_id})
-        self._choreography_runs.delete_many({"choreography_id": choreography_id})
+            raise ConflictError("Delete the choreography first", error_name="VEM_CONFLICT")
+        self._runs.delete_for(choreography_id)
+        self._repository.remove(choreography_id)
         self._activity_repository.purge(choreography_id=choreography_id)

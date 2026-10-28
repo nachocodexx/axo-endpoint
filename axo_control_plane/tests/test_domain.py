@@ -2,7 +2,9 @@ import pytest
 
 from axo_control_plane.domain import roles as R
 from axo_control_plane.domain.errors import InvalidError
-from axo_control_plane.domain.names import check_owner_name, code_bucket_for, new_ve_id, split_bucket_name
+from axo_control_plane.domain.names import (
+    check_owner_name, code_bucket_for, new_ve_id, results_bucket_for, split_bucket_name, ve_of_results_bucket,
+)
 from axo_control_plane.domain.plans import DEFAULT_PLANS, ENDPOINT_SIZES, Resources, VeShape, check_shape, endpoint_size
 
 PLANS = {p.plan_id: p for p in DEFAULT_PLANS}
@@ -49,6 +51,9 @@ def test_names_ids_and_bucket_names():
         with pytest.raises(InvalidError):
             split_bucket_name(bad)
     assert code_bucket_for("ml-prod-7f3k") == "axo/ve-ml-prod-7f3k-functions"
+    assert results_bucket_for("ml-prod-7f3k") == "axo/ve-ml-prod-7f3k-results"
+    assert ve_of_results_bucket("axo/ve-ml-prod-7f3k-results") == "ml-prod-7f3k"
+    assert ve_of_results_bucket("axo/ve-ml-prod-7f3k-functions") is None and ve_of_results_bucket("bkt-1") is None
 
 
 def test_roles_from_cumulative_permissions():

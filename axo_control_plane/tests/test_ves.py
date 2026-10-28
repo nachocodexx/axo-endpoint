@@ -102,12 +102,20 @@ def test_provisioner_brings_a_new_ve_up_step_by_step(platform):
     platform.provisioner.tick()
     d = platform.driver
     assert f"ve-{ve_id}-net" in d.networks and "axo-storage" in d.networks[f"ve-{ve_id}-net"]
-    for role in ("kurrent", "mongo", "vem"):
+    for role in ("kurrent", "mongo", "redis", "vem"):
         assert d.state(f"ve-{ve_id}-{role}") == "running"
     vem = d.containers[f"ve-{ve_id}-vem"]["spec"]
+    # Every endpoint keeps object state in the VE's own Mongo, Redis and objects bucket.
+    assert vem.env["AXO_VEM_NODE_OBJECT_MONGO_URI"] == f"mongodb://ve-{ve_id}-mongo:27017"
+    assert vem.env["AXO_VEM_NODE_OBJECT_REDIS_URI"] == f"redis://ve-{ve_id}-redis:6379/0"
+    assert vem.env["AXO_VEM_NODE_OBJECT_BLOBS"] == "axo_storage"
+    redis = d.containers[f"ve-{ve_id}-redis"]["spec"]
+    assert redis.volumes == {f"ve-{ve_id}-redis-data": "/data"} and "--appendonly" in redis.command
     assert vem.env["AXO_VEM_SERVICE_TOKEN"] == f"vem-token-{ve_id}"
     assert vem.env["AXO_VEM_VE_STORAGE_TOKEN"] == f"st-{ve_id}"
     assert '"target_endpoints":2' in vem.env["AXO_VEM_INITIAL_SETTINGS"]
+    # History is deleted the platform's grace days after the VE's retention.
+    assert vem.env["AXO_VEM_HISTORY_GRACE_DAYS"] == "7"
     assert set(vem.networks) == {f"ve-{ve_id}-net", "axo-control-net"}
     assert vem.labels["axo.ve"] == ve_id and vem.labels["axo.role"] == "vem"
     # The VEM reports Running -> the VE is Running and its owner hears about it.
@@ -167,6 +175,26 @@ def test_delete_waits_for_unsent_messages_then_removes_everything(platform):
     assert record.purge_after == pytest.approx(platform.clock() + 30 * 86400)
 
 
+def test_the_results_bucket_comes_with_the_ve_and_goes_with_it(platform):
+    calls = []
+    platform.provisioner._s.ensure_results_bucket = lambda ve_id: calls.append(("create", ve_id))
+    platform.provisioner._s.drop_results_bucket = lambda ve_id: calls.append(("drop", ve_id))
+    platform.provisioner._s.ensure_objects_bucket = lambda ve_id: calls.append(("objects", ve_id))
+    alice = platform.user("alice")
+    ve = platform.buy(alice)["ve"]
+    ve_id = ve["ve_id"]
+    platform.provisioner.tick()
+    _heartbeat(platform, ve_id)
+    platform.provisioner.tick()
+    assert calls == [("create", ve_id), ("objects", ve_id)]   # once, not every tick
+    platform.ves.delete(alice, ve_id, confirm_name=ve["name"])
+    _heartbeat(platform, ve_id, outbox_pending=0)
+    for _ in range(3):
+        platform.provisioner.tick()
+    assert platform.ves.record(ve_id).lifecycle == V.DELETED
+    assert calls == [("create", ve_id), ("objects", ve_id), ("drop", ve_id)]   # objects stay for the grace
+
+
 def test_vem_without_heartbeats_is_unavailable_then_recreated(platform):
     alice = platform.user("alice")
     ve_id = platform.buy(alice)["ve"]["ve_id"]
@@ -189,3 +217,51 @@ def test_only_the_lease_holder_works_on_a_ve(platform):
     platform.leases.acquire(f"ve:{ve_id}", "cp-2", 30)
     assert platform.provisioner.tick() == 0
     assert platform.driver.containers == {}
+
+
+def test_object_limits_come_from_the_plan_and_follow_a_plan_change(platform):
+    from axo_control_plane.domain.plans import GB, KB, MB
+
+    alice = platform.user("alice")
+    ve_id = platform.buy(alice, plan_id="free")["ve"]["ve_id"]
+    platform.provisioner.tick()
+    env = platform.driver.containers[f"ve-{ve_id}-vem"]["spec"].env
+    assert env["AXO_VEM_PLAN_OBJECT_MAX_STATE_BYTES"] == str(10 * MB)
+    assert env["AXO_VEM_PLAN_OBJECT_HOT_MAX_BYTES"] == str(4 * KB)
+    assert env["AXO_VEM_PLAN_OBJECT_KEEP_REVISIONS"] == "3" and env["AXO_VEM_PLAN_OBJECT_MAX_KEEP_REVISIONS"] == "3"
+    # An upgrade applies at once: the next limits pushed to the VEM carry the new plan's.
+    basic_ve = platform.buy(alice, name="ml-2", cpu=2.0, mem=4096)["ve"]["ve_id"]
+    platform.ves.change_plan(alice, basic_ve, plan_id="standard", quota_cpu_cores=6, quota_memory_mb=12288)
+    limits = platform.provisioner.vem_limits(platform.ves.record(basic_ve))
+    assert (limits["object_max_state_bytes"], limits["object_hot_max_bytes"], limits["object_keep_revisions"],
+            limits["object_max_keep_revisions"]) == (1 * GB, 64 * KB, 10, 30)
+
+
+def test_a_plan_keeps_its_object_limits_consistent(platform):
+    free = platform.catalog.get("free")
+    with pytest.raises(InvalidError):
+        platform.catalog.save_plan(free.with_changes(object_keep_revisions=5), by="admin")   # above its most (3)
+    with pytest.raises(InvalidError):
+        platform.catalog.save_plan(free.with_changes(object_hot_max_bytes=0), by="admin")
+    saved = platform.catalog.save_plan(free.with_changes(object_max_state_bytes=20 * 1024 * 1024), by="admin")
+    assert platform.catalog.get("free").object_max_state_bytes == saved.object_max_state_bytes
+
+
+def test_runner_sizes_come_from_the_plan(platform):
+    alice = platform.user("alice")
+    ve_id = platform.buy(alice, plan_id="free")["ve"]["ve_id"]
+    platform.provisioner.tick()
+    env = platform.driver.containers[f"ve-{ve_id}-vem"]["spec"].env
+    assert (env["AXO_VEM_PLAN_RUNNER_CPU_CORES"], env["AXO_VEM_PLAN_RUNNER_MEMORY_MB"]) == ("0.5", "512")
+    assert (env["AXO_VEM_PLAN_RUNNER_MAX_CPU_CORES"], env["AXO_VEM_PLAN_RUNNER_MAX_MEMORY_MB"]) == ("0.5", "512")
+    with pytest.raises(InvalidError):     # the default above the most
+        platform.catalog.save_plan(platform.catalog.get("free").with_changes(runner_cpu_cores=1.0), by="admin")
+
+
+def test_a_plan_saved_before_a_new_field_gets_its_default(platform):
+    platform.db["plans"].update_one({"_id": "free"}, {"$unset": {"runner_max_cpu_cores": "", "runner_max_memory_mb": ""},
+                                                      "$set": {"monthly_fee_cents": 0, "max_retention_days": 9}})
+    platform.catalog.seed()
+    free = platform.catalog.get("free")
+    assert (free.runner_max_cpu_cores, free.runner_max_memory_mb) == (0.5, 512)
+    assert free.max_retention_days == 9                   # an admin's change stays

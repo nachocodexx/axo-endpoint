@@ -106,7 +106,7 @@ def test_purge_endpoint_accepts_unreachable_status_directly(client, collections)
     assert client.get("/endpoints/n0").status_code == 404
 
 
-def test_purge_endpoint_removes_activity(client, collections, activity_repository):
+def test_purge_endpoint_keeps_its_history(client, collections, activity_repository):
     collections.endpoints.insert_one({"_id": "n0", "endpoint_id": "n0", "status": "stopped"})
     activity_repository.record("EndpointStopped", {
         "event_id": "e1", "created_at": "2026-01-01T00:00:00+00:00", "endpoint_id": "n0",
@@ -114,9 +114,9 @@ def test_purge_endpoint_removes_activity(client, collections, activity_repositor
 
     response = client.delete("/endpoints/n0/purge")
     assert response.status_code == 200
-    assert response.json()["purged_activity_count"] == 1
+    assert "purged_activity_count" not in response.json()
 
-    assert activity_repository.get_timeline(endpoint_id="n0") == []
+    assert [e["event_id"] for e in activity_repository.get_timeline(endpoint_id="n0")] == ["e1"]
 
 
 def test_purge_endpoint_unknown_returns_404(client):

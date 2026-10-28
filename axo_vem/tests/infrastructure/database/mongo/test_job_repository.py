@@ -31,8 +31,8 @@ def test_save_then_get_round_trips():
 def test_save_is_idempotent_upsert():
     repository = _repository()
     repository.save(Job(job_id="j1", function_id="add", status=JobStatus.QUEUED))
-    repository.save(Job(job_id="j1", function_id="add", status=JobStatus.STARTED, function_version=1))
+    repository.save(Job(job_id="j1", function_id="add", status=JobStatus.RUNNING, function_version=1))
 
     job = repository.get("j1")
-    assert job.status == JobStatus.STARTED
+    assert job.status == JobStatus.RUNNING
     assert job.function_version == 1

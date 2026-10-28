@@ -160,3 +160,12 @@ def test_serialize_then_deserialize_round_trips_code_format():
     round_tripped = deserialize_function_record(blob)
     assert round_tripped.code_format == "source"
     assert round_tripped == record
+
+
+def test_serialize_then_deserialize_round_trips_code_hash():
+    """Followers keep the hash too, so a client's dedup works on any endpoint."""
+    record = FunctionRecord(
+        code=b"pickle-bytes", function_id="qux", name="qux", version=2, created_at=3.0,
+        state=FunctionState.REGISTERED, code_format="cloudpickle", code_hash="h-1",
+    )
+    assert deserialize_function_record(serialize_function_record(record)).code_hash == "h-1"

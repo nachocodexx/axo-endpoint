@@ -6,7 +6,7 @@ from typing import Callable, Union
 
 import zmq
 
-from axo_endpoint.core.errors import FunctionExecError
+from axo_endpoint.core.runtime.failure import exec_error
 from axo_endpoint.core.runtime.base import InvocationHandle
 from axo_endpoint.log import DumbLogger, Log
 from axo_endpoint.log.catalog import Component, Event
@@ -89,7 +89,7 @@ class ContainerResultReceiver:
             else:
                 error_msg = payload_b.decode("utf-8", errors="replace")
                 from option import Err
-                self._on_result(handle, Err(FunctionExecError(error_msg)))
+                self._on_result(handle, Err(exec_error(error_msg)))
 
             self._logger.debug_event(
                 Event.Container.RESULT_PUSHED,

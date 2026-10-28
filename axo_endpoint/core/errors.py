@@ -155,7 +155,7 @@ class StorageFailureError(AxoError):
     """
 
     code = 4003
-    name = "STORAGE_ERROR"
+    name = "STORAGE_FAILURE"
 
 
 # ── 5xxx: transport / wire ────────────────────────────────────────────────────
@@ -163,11 +163,11 @@ class StorageFailureError(AxoError):
 # to axo_shared.errors — they're used by axo_shared.wire, which must not
 # depend back on axo_endpoint.)
 
-# ── 8xxx: job result replication ──────────────────────────────────────────────
+# ── 81xx: job result replication (80xx is axo_shared.storage) ───────────────
 
 class ResultHashMismatchError(AxoError):
     """A JOB_RESULT_SYNC/JOB_RESULT_REPLICATE payload's hash didn't match the
     hash declared alongside it -- the copy is discarded, never stored."""
 
-    code = 8001
+    code = 8101
     name = "RESULT_HASH_MISMATCH"

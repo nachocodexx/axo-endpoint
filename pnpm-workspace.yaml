@@ -1,0 +1,58 @@
+# The web UIs: axo-ui (people) and axo-admin-ui (Platform Admins) both
+# extend the shared Nuxt layer axo-ui-kit (theme, components, CP client).
+packages:
+  - axo-ui
+  - axo-ui-kit
+  - axo-admin-ui
+
+# One version of each package for every UI project: they say "catalog:"
+# in their package.json and the version lives only here. Keep these at the
+# latest release; `pnpm outdated -r` lists what moved.
+catalog:
+  nuxt: ^4.6.2
+  vue: ^3.5.44
+  vue-router: ^5.4.0
+  vuetify: ^4.2.6
+  vuetify-nuxt-module: ^1.0.0-rc.6
+  pinia: ^4.1.0
+  '@pinia/nuxt': ^1.0.3
+  '@mdi/font': ^7.4.47
+  echarts: ^6.1.0
+  vue-echarts: ^8.3.2
+  # The choreography designer: Vue Flow draws, dagre only works out where
+  # the steps go (Arrange, and choreographies saved from Python).
+  '@vue-flow/core': ^1.48.2
+  '@vue-flow/background': ^1.3.2
+  '@vue-flow/minimap': ^1.5.4
+  '@dagrejs/dagre': ^3.1.3
+  # The code views / editors (functions, later object classes): CodeMirror 6.
+  codemirror: ^6.0.2
+  '@codemirror/state': ^6.7.6
+  '@codemirror/view': ^6.43.15
+  '@codemirror/language': ^6.13.1
+  '@codemirror/lang-python': ^6.2.1
+  '@codemirror/lang-json': ^6.0.2
+  '@codemirror/lint': ^6.9.7
+  '@codemirror/merge': ^6.12.3
+  '@codemirror/theme-one-dark': ^6.1.3
+  '@lezer/highlight': ^1.2.5
+  '@types/node': ^26.6.5
+  vue-tsc: ^3.3.13
+  # 6.x, not 7.x: TypeScript 7 is the native (Go) compiler and has no
+  # `typescript/lib/tsc`, which vue-tsc (and so `nuxt typecheck`) loads.
+  # Move to 7 once a vue-tsc release supports it.
+  typescript: ^6.0.3
+
+allowBuilds:
+  '@parcel/watcher': true
+  esbuild: true
+  vue-demi: true
+
+minimumReleaseAgeExclude:
+  - '@nuxt/kit@4.6.2'
+  - '@nuxt/nitro-server@4.6.2'
+  - '@nuxt/schema@4.6.2'
+  - '@nuxt/vite-builder@4.6.2'
+  - '@nuxt/vite-server@4.6.2'
+  - nuxt@4.6.2
+  - '@dagrejs/dagre@3.1.3'

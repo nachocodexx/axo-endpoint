@@ -39,14 +39,15 @@ runtime = ProcessFunctionRuntime(
     scratch_root      = "/tmp/scratch"
 )
 
-def function_to_register(params, ctx):
+def function_to_register(a: int, b: int, ctx=None):
+    """Adds two numbers after a short pause, and says which process ran it."""
     import os
     import time
 
-    print(f"Function started with params: {params}")
+    print(f"Function started with a={a}, b={b}")
     time.sleep(2)  # Simulate some work
-    result = {"pid": os.getpid(), "params": params}
-    print("Context scratch directory:", ctx)
+    result = {"pid": os.getpid(), "sum": a + b}
+    print("Context scratch directory:", ctx.scratch_dir if ctx else None)
     return result
 
 

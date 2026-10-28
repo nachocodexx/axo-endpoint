@@ -106,10 +106,11 @@ def platform() -> Platform:
         mongo_image="mongo:test", control_network="axo-control-net", storage_container="axo-storage",
         storage_uri="tcp://axo-storage:7000", cp_intake_uri="tcp://cp:9100",
         vem_token_fn=lambda ve_id: f"vem-token-{ve_id}", storage_token_fn=lambda ve_id: f"st-{ve_id}",
+        platform_limits={"history_grace_days": 7},
     )
     provisioner = Provisioner(db, driver, vem, leases, capacity, catalog, identity, notifications, history,
                               settings, instance_id="cp-1", now_fn=clock)
-    storage = FakeStorage()
+    storage = FakeStorage(now_fn=clock)
     buckets = Buckets(db, storage, identity, access, authz, names, teams, history,
                       default_quota_bytes=10 * 1024 ** 3, max_quota_bytes=1024 ** 4, now_fn=clock)
     sharing = Sharing(db, people, names, teams, buckets, identity, access, authz, notifications, history,

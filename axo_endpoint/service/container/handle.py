@@ -49,6 +49,9 @@ class ContainerHandle:
     cpu_cores: float = 0.0
     memory_bytes: int = 0
     ready_event: threading.Event = field(default_factory=threading.Event)
+    # Why its start failed (pip's error, the code's import error, a time
+    # limit), for the job's error message; None while it hasn't failed.
+    start_error: Optional[str] = None
     _lock: threading.Lock = field(default_factory=threading.Lock)
     # The job_id currently dispatched to this container, if any -- set right
     # before dispatch, cleared once its result arrives. Lets cancel(job_id)

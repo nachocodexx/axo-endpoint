@@ -56,6 +56,8 @@ def test_team_owned_ve_gives_each_team_role_its_own_rights(platform):
     ve = platform.buy(owner, name="shared", team_id=team["team_id"])["ve"]
     roles = {a.username: platform.authz.ve_role(a, ve["ve_id"]) for a in (owner, admin, member, outsider)}
     assert roles == {"olga": R.OWNER, "adam": R.ADMIN, "mia": R.VIEWER, "otto": None}
+    names = {a["name"] for a in platform.sharing.ve_access(owner, ve["ve_id"]) if a["principal_type"] == "GROUP"}
+    assert names == {"ds (owner)", "ds (admins)", "ds (members)"}     # a team's groups by name
     # Leaving the team removes the access it gave.
     platform.teams.remove_member(member, team["team_id"], member.user_id)
     assert platform.authz.ve_role(member, ve["ve_id"]) is None

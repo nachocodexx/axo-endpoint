@@ -36,10 +36,10 @@ def test_fetch_code_returns_pickle_format_and_requirements(tmp_path):
     address = probe.getsockopt(zmq.LAST_ENDPOINT).decode("utf-8")
     probe.close()
 
-    payload = cloudpickle.dumps(lambda params, ctx: params["a"] + params["b"])
+    payload = cloudpickle.dumps(lambda a, b: a + b)
     thread = _run_fake_endpoint(address, payload, {"requirements": ["numpy"], "code_format": "cloudpickle", "name": "add"})
 
-    code_bytes, code_format, requirements, name = fetch_code(address, "add", 1)
+    code_bytes, code_format, requirements, name, call_style = fetch_code(address, "add", 1)
     thread.join(timeout=2.0)
 
     assert code_bytes == payload
@@ -60,7 +60,7 @@ def test_fetch_code_defaults_name_to_function_id_when_absent():
 
     thread = _run_fake_endpoint(address, b"pickled-bytes", {})
 
-    _, _, _, name = fetch_code(address, "add", 1)
+    _, _, _, name, _ = fetch_code(address, "add", 1)
     thread.join(timeout=2.0)
 
     assert name == "add"
@@ -75,19 +75,19 @@ def test_fetch_code_defaults_format_to_cloudpickle_when_absent():
 
     thread = _run_fake_endpoint(address, b"pickled-bytes", {})
 
-    _, code_format, _, _ = fetch_code(address, "add", 1)
+    _, code_format, _, _, call_style = fetch_code(address, "add", 1)
     thread.join(timeout=2.0)
 
     assert code_format == "cloudpickle"
 
 
 def test_materialize_function_unpickles_for_cloudpickle_format():
-    payload = cloudpickle.dumps(lambda params, ctx: params["a"] + params["b"])
+    payload = cloudpickle.dumps(lambda a, b: a + b)
     fn = materialize_function(payload, "cloudpickle", "add")
     assert fn({"a": 2, "b": 3}, None) == 5
 
 
 def test_materialize_function_execs_source_for_source_format():
-    source = b"def add(params, ctx):\n    return params['a'] + params['b']\n"
+    source = b"def add(a, b):\n    return a + b\n"
     fn = materialize_function(source, "source", "add")
     assert fn({"a": 2, "b": 3}, None) == 5

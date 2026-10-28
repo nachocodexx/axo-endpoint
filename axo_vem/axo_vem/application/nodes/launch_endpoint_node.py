@@ -31,6 +31,22 @@ def _reachable_pub_address(peer: Endpoint) -> Optional[str]:
     return f"tcp://{peer.endpoint_id}:{port}"
 
 
+def object_backend_env(mongo_uri: str = "", redis_uri: str = "", blobs: str = "") -> Dict[str, str]:
+    """The endpoint settings for active-object state: manifests in Mongo,
+    small values in Redis (else Mongo), big ones in ``blobs`` (axo_storage:
+    the VE's ``axo/ve-<id>-objects`` bucket). Nothing given = the endpoint's
+    own default (memory)."""
+    env: Dict[str, str] = {}
+    if mongo_uri:
+        env.update({"AXO_ENDPOINT_OBJECT_MANIFESTS": "mongo", "AXO_ENDPOINT_OBJECT_MONGO_URI": mongo_uri,
+                    "AXO_ENDPOINT_OBJECT_MONGO_DB": "axo_objects", "AXO_ENDPOINT_OBJECT_HOT": "mongo"})
+    if redis_uri:
+        env.update({"AXO_ENDPOINT_OBJECT_HOT": "redis", "AXO_ENDPOINT_OBJECT_REDIS_URI": redis_uri})
+    if blobs:
+        env["AXO_ENDPOINT_OBJECT_BLOBS"] = blobs
+    return env
+
+
 @dataclass(frozen=True)
 class LaunchEndpointNodeResult:
     endpoint_id: str
@@ -64,6 +80,7 @@ class LaunchEndpointNodeUseCase:
         virtual_environment_id: str = "",
         storage_uri: str = "",
         storage_token: str = "",
+        object_env: Optional[Dict[str, str]] = None,
     ) -> None:
         """Every endpoint this launches belongs to this VEM's one VE
         (``virtual_environment_id``) and gets that VE's finished axo_storage
@@ -72,6 +89,7 @@ class LaunchEndpointNodeUseCase:
         self._virtual_environment_id = virtual_environment_id
         self._storage_uri = storage_uri
         self._storage_token = storage_token
+        self._object_env = dict(object_env or {})
         self._image = image
         self._network = network
         self._mode = mode
@@ -107,11 +125,15 @@ class LaunchEndpointNodeUseCase:
             "AXO_ENDPOINT_ROUTER_BIND": router_bind,
             "AXO_ENDPOINT_PUB_BIND": f"tcp://0.0.0.0:{pub_port}",
             "AXO_ENDPOINT_VIRTUAL_ENV_ID": virtual_environment_id or "",
+            # Runners go on the endpoint's own network: they reach it back
+            # by name for CONTAINER_BOOTSTRAP.
+            "AXO_ENDPOINT_CONTAINER_NETWORK": self._network,
         }
         if self._storage_uri:
             env["AXO_ENDPOINT_STORAGE_URI"] = self._storage_uri
         if self._storage_token:
             env["AXO_ENDPOINT_STORAGE_TOKEN"] = self._storage_token
+        env.update(self._object_env)
         if cpu_cores is not None and memory_mb is not None:
             env["AXO_ENDPOINT_CPU_CORES"] = str(cpu_cores)
             env["AXO_ENDPOINT_MEMORY_MB"] = str(memory_mb)

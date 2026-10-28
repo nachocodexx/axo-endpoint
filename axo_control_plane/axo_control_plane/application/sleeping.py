@@ -6,6 +6,7 @@ import uuid
 from typing import Any, Callable, Dict, List, Optional
 
 from pymongo.database import Database
+from pymongo.errors import DuplicateKeyError
 
 from axo_control_plane.application import notifications as N
 from axo_control_plane.application.catalog import PlanCatalog
@@ -18,9 +19,18 @@ from axo_control_plane.domain.virtual_environment import VirtualEnvironment
 WAITING = "waiting"
 DELIVERED = "delivered"
 FAILED = "failed"
+CANCELLED = "cancelled"
 
 KIND_JOB = "job"
 KIND_CHOREOGRAPHY = "choreography_run"
+KIND_BUCKET_EVENT = "bucket_event"
+KIND_EVENT = "event"                    # someone's own event (POST /events): starts runs
+_ID_FIELDS = {KIND_JOB: "job_id", KIND_EVENT: "event_id"}
+
+
+def id_field(kind: str) -> str:
+    """What the saved request's id is called in its answer (and its body)."""
+    return _ID_FIELDS.get(kind, "run_id")
 
 
 def new_job_id() -> str:
@@ -96,22 +106,48 @@ class SleepManager:
     # ── requests while asleep ────────────────────────────────────────────────
     def is_asleep(self, ve: VirtualEnvironment) -> bool:
         return ve.desired == V.DESIRED_SLEEPING or ve.lifecycle in (V.SLEEPING, V.WAKING) or \
-            (ve.desired == V.DESIRED_RUNNING and self._pending.count_documents({"ve_id": ve.ve_id, "status": WAITING}) > 0)
+            (ve.desired == V.DESIRED_RUNNING and self._pending.count_documents(
+                {"ve_id": ve.ve_id, "status": WAITING, "kind": {"$ne": KIND_BUCKET_EVENT}}) > 0)
 
     def accept(self, ve_id: str, kind: str, path: str, body: Dict[str, Any], acting_user: str,
                max_wait: Optional[float] = None) -> Dict[str, Any]:
         """Save one request for a sleeping VE and wake it. ``path`` is the VEM
         route it will be delivered to."""
         now = self._now_fn()
-        request_id = new_job_id() if kind == KIND_JOB else f"run-{uuid.uuid4().hex}"
-        id_field = "job_id" if kind == KIND_JOB else "run_id"
-        self._pending.insert_one({
-            "_id": request_id, "ve_id": ve_id, "kind": kind, "path": path,
-            "body": {**body, id_field: request_id}, "acting_user": acting_user, "max_wait": max_wait,
-            "status": WAITING, "created_at": now, "attempts": 0,
-        })
+        field = id_field(kind)
+        if kind == KIND_EVENT:
+            # an event keeps its sender's id: the same event twice is saved once
+            request_id = str(body.get(field) or uuid.uuid4().hex)
+            saved_as = f"event:{ve_id}:{request_id}"
+        else:
+            request_id = new_job_id() if kind == KIND_JOB else f"run-{uuid.uuid4().hex}"
+            saved_as = request_id
+        try:
+            self._pending.insert_one({
+                "_id": saved_as, "ve_id": ve_id, "kind": kind, "path": path,
+                "body": {**body, field: request_id}, "acting_user": acting_user, "max_wait": max_wait,
+                "status": WAITING, "created_at": now, "attempts": 0,
+            })
+        except DuplicateKeyError:
+            if kind != KIND_EVENT:
+                raise
         self.wake(ve_id, reason=f"request from {acting_user}")
-        return {id_field: request_id, "status": WAITING, "reason": "the VE is waking up"}
+        return {field: request_id, "status": WAITING, "reason": "the VE is waking up"}
+
+    def enqueue(self, ve_id: str, request_id: str, path: str, body: Dict[str, Any], acting_user: str) -> bool:
+        """Save one platform-made request (e.g. a bucket event) with a fixed
+        id -- the same id twice is kept once -- and wake the VE if it sleeps.
+        Delivered like the others, once the VE runs. False = already saved."""
+        try:
+            self._pending.insert_one({
+                "_id": request_id, "ve_id": ve_id, "kind": KIND_BUCKET_EVENT, "path": path, "body": body,
+                "acting_user": acting_user, "max_wait": None, "status": WAITING, "created_at": self._now_fn(),
+                "attempts": 0,
+            })
+        except DuplicateKeyError:
+            return False
+        self.wake(ve_id, reason="a new file for a choreography trigger")
+        return True
 
     def wake(self, ve_id: str, reason: str) -> bool:
         now = self._now_fn()
@@ -129,8 +165,21 @@ class SleepManager:
         doc = self._pending.find_one({"_id": request_id})
         if doc is None or doc["status"] == DELIVERED:
             return None
-        return {"job_id" if doc["kind"] == KIND_JOB else "run_id": doc["_id"], "status": doc["status"],
+        return {id_field(doc["kind"]): doc["_id"], "status": doc["status"],
                 "reason": doc.get("error") or "the VE is waking up", "ve_id": doc["ve_id"]}
+
+    def cancel(self, request_id: str, user_id: str) -> Optional[Dict[str, Any]]:
+        """A saved job / run not delivered yet is dropped: it never runs (not
+        billed). None when there's no such waiting request (it went to the VE)."""
+        doc = self._pending.find_one_and_update(
+            {"_id": request_id, "status": WAITING, "kind": {"$ne": KIND_BUCKET_EVENT}},
+            {"$set": {"status": CANCELLED, "done_at": self._now_fn(), "cancelled_by": user_id}})
+        if doc is None:
+            return None
+        self._history.append(f"ve-{doc['ve_id']}", "SavedRequestCancelled",
+                             {"ve_id": doc["ve_id"], "request_id": request_id, "kind": doc["kind"],
+                              "cancelled_by": user_id, "at": self._now_fn()})
+        return {id_field(doc["kind"]): request_id, "cancelled": True, "status": CANCELLED}
 
     # ── delivering after the wake ────────────────────────────────────────────
     def deliver(self) -> int:
@@ -161,7 +210,9 @@ class SleepManager:
                 continue
             try:
                 self._vem.submit_job(ve_id, {"path": req["path"], "body": req["body"],
-                                             "acting_user": req["acting_user"]})
+                                             "acting_user": req["acting_user"],
+                                             # held here while the VE woke: the job's CP wait
+                                             "wait_ms": round(waited * 1000, 3)})
             except UnavailableError:
                 self._pending.update_one({"_id": req["_id"]}, {"$inc": {"attempts": 1}})
                 break                                  # try again next tick, keep order

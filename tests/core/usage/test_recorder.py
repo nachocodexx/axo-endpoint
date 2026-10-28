@@ -116,20 +116,47 @@ def test_retried_attempts_are_each_recorded():
     published = []
     recorder = _recorder(published, now=101.0)
     recorder.on_job_submitted(_submitted())
-    recorder.on_attempt_retried("job-1", JobTimeoutError("slow"), started_at=100.2)
-    recorder.on_attempt_retried("job-1", ContainerCrashError("oom"), started_at=101.0)
+    recorder.on_attempt_failed("job-1", JobTimeoutError("slow"), 100.2, 103.0, "code_failed")
+    recorder.on_attempt_failed("job-1", ContainerCrashError("oom"), 101.0, 104.0, "platform_failed")
     recorder.on_job_finished(_finished(started_at=101.5, finished_at=102.0))
 
     records = [event_models.JobAttemptRecorded(**data) for _, data in published]
-    assert [(r.attempt, r.outcome, r.billable) for r in records] == [
-        (1, "failed_user", True),
-        (2, "failed_platform", False),
-        (3, "completed", True),
+    assert [(r.attempt, r.outcome, r.billable, r.reason) for r in records] == [
+        (1, "failed_user", True, "first"),
+        (2, "failed_platform", False, "code_failed"),
+        (3, "completed", True, "platform_failed"),
     ]
+    assert (records[0].failure.error_class, records[0].failure.message) == (JobTimeoutError.name, "slow")
+    assert records[0].retry_at.timestamp() == 103.0 and records[2].retry_at is None
     assert len({r.event_id for r in records}) == 3  # distinct ids: none deduplicated away
+
+
+def test_files_a_job_wrote_go_on_its_attempt():
+    published = []
+    recorder = _recorder(published)
+    recorder.on_job_submitted(_submitted())
+    recorder.on_io("job-1", "reports", bytes_written=40,
+                   file={"bucket": "reports", "name": "out.csv", "version": 2, "size": 40, "format": "csv"})
+    recorder.on_job_finished(_finished())
+    record = event_models.JobAttemptRecorded(**published[0][1])
+    assert [(f.name, f.version, f.size) for f in record.files_written] == [("out.csv", 2, 40)]
 
 
 def test_from_envelope_defaults():
     context = JobUsageContext.from_envelope({"function_id": "f", "function_version": 1, "user_id": "u-1"}, "j", now=5.0)
     assert (context.trace_id, context.attempt, context.received_at) == ("j", 1, 5.0)
     assert (context.started_by_type, context.started_by_id) == ("user", "u-1")
+
+
+def test_bytes_per_bucket_and_cache_hits_go_on_the_attempt():
+    published = []
+    recorder = _recorder(published)
+    recorder.on_job_submitted(_submitted())
+    recorder.on_io("job-1", "sales", bytes_read=100, cache_hit=False)
+    recorder.on_io("job-1", "sales", cache_hit=True)
+    recorder.on_io("job-1", "reports", bytes_written=40)
+    recorder.on_io("unknown-job", "sales", bytes_read=5)        # not running here: ignored
+    recorder.on_job_finished(_finished())
+    record = event_models.JobAttemptRecorded(**published[0][1])
+    assert record.bytes_read == {"sales": 100} and record.bytes_written == {"reports": 40}
+    assert (record.cache_hits, record.cache_misses) == (1, 1)

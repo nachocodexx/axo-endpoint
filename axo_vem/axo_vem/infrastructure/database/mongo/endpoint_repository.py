@@ -51,6 +51,16 @@ class MongoEndpointRepository(EndpointRepository):
         projector/upserts.py's former upsert_endpoint(collection, endpoint_id, data)."""
         self._collection.update_one({"_id": endpoint_id}, {"$set": data}, upsert=True)
 
+    def apply_reading(self, endpoint_id: str, data: Dict[str, Any]) -> None:
+        """Only for an endpoint already listed (its EndpointStarted was
+        projected) -- a late reading never brings back a forgotten one -- and
+        only if it isn't older than what's kept (``created_at`` = when the
+        endpoint was last heard from): a resent reading can't put old
+        figures back."""
+        at = data.get("created_at")
+        newer = {"$or": [{"created_at": {"$exists": False}}, {"created_at": {"$lte": at}}]}
+        self._collection.update_one({"_id": endpoint_id, **newer}, {"$set": data})
+
     def list_all(self) -> List[Endpoint]:
         """Ordered most-recently-seen first (last_seen_at desc, i.e. the doc's
         `created_at` from whichever EndpointStarted/MetricsReported/Stopped

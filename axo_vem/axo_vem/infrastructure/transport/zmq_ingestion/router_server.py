@@ -106,9 +106,22 @@ class IngestionRouterServer:
                 frames = self._socket.recv_multipart()
             except zmq.Again:
                 continue
-            except zmq.ZMQError:
-                break
-            self._handle_frames(frames)
+            except zmq.ZMQError as exc:
+                if self._shutdown.is_set() or exc.errno == zmq.ETERM:
+                    break
+                # Anything else (e.g. after the host slept) must not end
+                # ingestion: the endpoints would never be heard again.
+                self._logger.error_event(
+                    Event.Ingestion.RECEIVE_FAILED, component=Component.INGESTION, error=str(exc),
+                )
+                time.sleep(0.5)
+                continue
+            try:
+                self._handle_frames(frames)
+            except Exception as exc:  # one bad message must not stop ingestion; unacked, so it's resent
+                self._logger.error_event(
+                    Event.Ingestion.HANDLE_FAILED, component=Component.INGESTION, error=repr(exc),
+                )
 
     def _handle_frames(self, frames) -> None:
         if len(frames) < 2:

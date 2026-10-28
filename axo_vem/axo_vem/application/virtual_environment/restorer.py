@@ -40,7 +40,9 @@ class VeRestorer:
         code_store: FunctionCodeStore,
         endpoint_picker: EndpointPicker,
         command_timeout_seconds: float = 10.0,
+        secrets: Any = None,                       # FunctionSecrets: secret env values
     ) -> None:
+        self._secrets = secrets
         self._functions = function_repository
         self._code = code_store
         self._picker = endpoint_picker
@@ -78,14 +80,18 @@ class VeRestorer:
         envelope: Dict[str, Any] = {
             "function_id": function.function_id,
             "name": function.name or function.function_id,
-            "code_format": "source",
+            "code_format": function.code_format or "source",
             "restore": True,
             "version": function.version,
         }
         if function.runtime_spec is not None:
-            envelope["runtime_spec"] = function.runtime_spec
+            envelope["runtime_spec"] = (self._secrets.filled(function.function_id, function.version,
+                                                             function.runtime_spec)
+                                        if self._secrets is not None else function.runtime_spec)
         if function.params_schema:
             envelope["params_schema"] = function.params_schema
+        if function.code_hash:
+            envelope["code_hash"] = function.code_hash
         command = Command(
             operation=wire.FUNCTION_REGISTER, content_type="application/octet-stream",
             envelope=envelope, payload=code,

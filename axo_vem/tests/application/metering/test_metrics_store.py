@@ -35,10 +35,12 @@ def test_dims_filter_and_old_bins_are_dropped():
     assert store.value(m.JOB_WAIT_MS, "count", 10_000) == 1
 
 
-def test_minute_summaries_roll_ten_second_bins_up_and_drop_the_endpoint():
+def test_minute_summaries_roll_ten_second_bins_up_per_endpoint_without_users():
     store = MetricsStore(now_fn=lambda: 200.0)
     for i, start in enumerate(range(60, 120, 10)):
-        store.ingest(bin_of(f"ep-{i % 2}", float(start), m.REQUESTS_RECEIVED, [1, 1]))
-    (minute,) = store.minute_summaries(before=120.0)
-    assert (minute.bin_start, minute.width_s, minute.stats.sum) == (60.0, 60, 12)
-    assert dict(minute.dims) == {}
+        store.ingest(bin_of(f"ep-{i % 2}", float(start), m.REQUESTS_RECEIVED, [1, 1],
+                            dims={m.DIM_PRINCIPAL: f"user-{i}"}))
+    minutes = store.minute_summaries(before=120.0)
+    assert [(mi.bin_start, mi.width_s, mi.stats.sum) for mi in minutes] == [(60.0, 60, 6), (60.0, 60, 6)]
+    assert sorted(dict(mi.dims)[m.DIM_ENDPOINT] for mi in minutes) == ["ep-0", "ep-1"]
+    assert all(m.DIM_PRINCIPAL not in dict(mi.dims) for mi in minutes)

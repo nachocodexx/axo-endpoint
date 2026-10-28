@@ -56,7 +56,7 @@ class DeleteFunctionUseCase:
         if function.container_status == "running":
             raise ConflictError("function has a live deployed container -- stop it before deleting")
         active_jobs = self._job_repository.list_by_function(function_id, version)
-        if any(job.status in (JobStatus.QUEUED, JobStatus.STARTED) for job in active_jobs):
+        if any(job.active for job in active_jobs):
             raise ConflictError("function has jobs still queued or running -- wait for them to finish before deleting")
         if not function.endpoint_id:
             raise ConflictError("function has no recorded endpoint to route this request to")

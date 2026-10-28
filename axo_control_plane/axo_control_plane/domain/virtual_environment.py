@@ -13,6 +13,9 @@ DESIRED_SLEEPING = "sleeping"
 DESIRED_DELETED = "deleted"
 DESIRED_STATES = (DESIRED_RUNNING, DESIRED_STOPPED, DESIRED_SLEEPING, DESIRED_DELETED)
 
+# lifecycle_reason while the VEM sends no heartbeats; cleared by the next one.
+VEM_DOWN_REASON = "the VE manager is not responding"
+
 # What the VE IS doing (the shared vocabulary of upgrade.md section 2).
 CREATING = "Creating"
 RUNNING = "Running"
@@ -78,6 +81,24 @@ class VirtualEnvironment:
     stopped_at: Optional[float] = None
     deleted_at: Optional[float] = None
     purge_after: Optional[float] = None
+    # Rental (upgrade.md 13.2): monthly periods from the purchase moment, the
+    # full plan fee each period. ``period_fee_cents`` = what this period was
+    # paid at (an upgrade pays the difference up to the new fee).
+    period_anchor: Optional[float] = None
+    period_anchor_index: int = 0
+    period_index: int = 0
+    period_start: Optional[float] = None
+    period_end: Optional[float] = None
+    period_fee_cents: int = 0
+    cancel_at_period_end: bool = False
+    # A downgrade waits for the next renewal: {"plan_id", "quota", "by", "at"}.
+    pending_change: Optional[Dict[str, Any]] = None
+    # Set when a cancelled rental ran out (the VE is stopped, data kept until
+    # ``rental_delete_after``).
+    rental_ended_at: Optional[float] = None
+    rental_delete_after: Optional[float] = None
+    # Per-period budget the owner set (warnings only, at 80 % and 100 %).
+    budget_cents: Optional[int] = None
     version: int = 0
 
     @property
@@ -133,4 +154,14 @@ class VirtualEnvironment:
             "created_at": self.created_at,
             "idle_since": self.idle_since,
             "heartbeat_at": self.heartbeat_at,
+            "rental": {
+                "period_start": self.period_start,
+                "period_end": self.period_end,
+                "period_fee_cents": self.period_fee_cents,
+                "cancel_at_period_end": self.cancel_at_period_end,
+                "pending_change": self.pending_change,
+                "ended_at": self.rental_ended_at,
+                "delete_after": self.rental_delete_after,
+                "budget_cents": self.budget_cents,
+            },
         }

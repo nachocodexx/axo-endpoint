@@ -16,6 +16,7 @@ class Component:
     HANDLER_PEER_ANNOUNCE            = "handler.peer_announce"
     HANDLER_CONTAINER_BOOTSTRAP      = "handler.container_bootstrap"
     CONTAINER_RUNTIME                = "container_runtime"
+    JOB_ATTEMPTS                     = "job_attempts"
     CONTAINER_SPAWNER                = "container_spawner"
     CONTAINER_RUNNER                 = "container_runner"
     RESULT_RECEIVER                  = "result_receiver"
@@ -35,6 +36,7 @@ class Component:
     HANDLER_CONSISTENCY_CHECK_REQUEST = "handler.consistency_check_request"
     RESULT_CONSISTENCY               = "result_consistency"
     HANDLER_JOB_CANCEL               = "handler.job_cancel"
+    OBJECTS                          = "objects"
 
 
 class Event:
@@ -131,6 +133,7 @@ class Event:
         READY               = "CONTAINER.READY"
         DISMISSED           = "CONTAINER.DISMISSED"
         CRASHED             = "CONTAINER.CRASHED"
+        STARTING            = "CONTAINER.STARTING"
         JOB_TIMEOUT         = "CONTAINER.JOB_TIMEOUT"
         JOB_CANCELLED       = "CONTAINER.JOB_CANCELLED"
         BOOTSTRAP_REQUESTED = "CONTAINER.BOOTSTRAP_REQUESTED"
@@ -159,3 +162,11 @@ class Event:
         HASH_MISMATCH         = "RESULT_CONSISTENCY.HASH_MISMATCH"
         CHECK_STARTED         = "RESULT_CONSISTENCY.CHECK_STARTED"
         CHECK_FINISHED        = "RESULT_CONSISTENCY.CHECK_FINISHED"
+
+    class Objects:
+        CALL_QUEUED    = "OBJECTS.CALL_QUEUED"
+        CALL_FINISHED  = "OBJECTS.CALL_FINISHED"
+        CALL_FAILED    = "OBJECTS.CALL_FAILED"
+        SWEEP_FINISHED = "OBJECTS.SWEEP_FINISHED"
+        SWEEP_FAILED   = "OBJECTS.SWEEP_FAILED"
+        SIZES_FAILED   = "OBJECTS.SIZES_FAILED"

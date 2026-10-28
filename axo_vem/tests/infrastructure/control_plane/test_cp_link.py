@@ -119,3 +119,84 @@ def test_without_a_cp_job_attempts_go_to_the_vem_event_log():
     assert link.job_attempt({"job_id": "j1"})
     assert log.appended == [("usage-ve-1", models.JOB_ATTEMPT_RECORDED, {"job_id": "j1"})]
     assert link.heartbeat() is None and link.send_minute_summaries() == 0
+
+
+class _Sender:
+    def __init__(self):
+        self.sent = []
+
+    def publish(self, event_type, data):
+        from option import Ok
+        self.sent.append((event_type, data))
+        return Ok(None)
+
+    def stats(self):
+        return {"pending": 0}
+
+
+def test_object_state_is_sent_once_per_finished_hour_and_catches_up_after_a_restart():
+    import mongomock
+
+    from axo_vem.infrastructure.database.mongo.object_repository import MongoActiveObjectRepository
+
+    objects = MongoActiveObjectRepository(mongomock.MongoClient()["vem"]["active_objects"])
+    clock = {"t": 10 * 3600 + 120.0}
+    sender = _Sender()
+    link = ControlPlaneLink("ve-1", status_fn=lambda: STATUS, metrics=MetricsStore(), event_log=_Log(),
+                            sender=sender, objects=objects, now_fn=lambda: clock["t"])
+    assert link.send_object_state_hours() == 0                   # nothing reported yet
+    objects.apply_sizes({"obj-1": 10}, stored_bytes=2048)
+    assert link.send_object_state_hours() == 1
+    assert sender.sent[-1] == (models.OBJECT_STATE_HOUR_REPORTED, {
+        **sender.sent[-1][1], "virtual_environment_id": "ve-1", "hour_start": 9 * 3600.0, "stored_bytes": 2048})
+    assert link.send_object_state_hours() == 0                   # same hour: not again
+    clock["t"] += 3 * 3600                                       # down for 3 hours
+    assert link.send_object_state_hours() == 3
+    assert [d["hour_start"] for _t, d in sender.sent] == [9 * 3600.0, 10 * 3600.0, 11 * 3600.0, 12 * 3600.0]
+    clock["t"] += 90 * 86400                                     # asleep for 90 days: 31 days at most
+    assert link.send_object_state_hours() == 31 * 24
+
+
+def test_the_heartbeat_lists_the_buckets_the_triggers_watch():
+    import mongomock
+
+    from axo_vem.infrastructure.database.mongo.choreography_repository import MongoChoreographyRepository
+
+    col = mongomock.MongoClient()["vem"]["choreographies"]
+    col.insert_many([
+        {"_id": "c1", "deleted_at": None, "triggers": [{"bucket": "alice/raw", "created_by": "u1"},
+                                                        {"bucket": "alice/raw", "created_by": "u1"}]},
+        {"_id": "c2", "deleted_at": None, "triggers": [{"bucket": "team/in", "created_by": "u2"}]},
+        {"_id": "c3", "deleted_at": "2026-10-01", "triggers": [{"bucket": "old/gone", "created_by": "u3"}]},
+    ])
+    repository = MongoChoreographyRepository(col)
+    sender = _Sender()
+    link = ControlPlaneLink("ve-1", status_fn=lambda: STATUS, metrics=MetricsStore(), event_log=_Log(),
+                            sender=sender, triggers_fn=repository.trigger_buckets)
+    link.heartbeat()
+    assert sender.sent[-1][1]["triggers"] == [{"bucket": "alice/raw", "created_by": "u1"},
+                                              {"bucket": "team/in", "created_by": "u2"}]
+
+
+def test_a_stopping_vem_sends_the_minutes_still_in_memory_even_the_one_going_on():
+    clock = {"t": 36000 + 95.0}                                   # 35 s into the second minute
+    metrics = MetricsStore(now_fn=lambda: clock["t"])
+    for start in (36000, 36060, 36070):
+        stats = StatSummary()
+        stats.add(5)
+        metrics.ingest({"component_id": "ep-1", "bin_start": float(start), "bin_width_s": 10,
+                        "summaries": [{"metric": m.JOB_TOTAL_MS, "dims": {"outcome": "completed"},
+                                       "stats": stats.to_dict()}]})
+    sender = _Sender()
+    link = ControlPlaneLink("ve-1", status_fn=lambda: STATUS, metrics=metrics, event_log=_Log(),
+                            sender=sender, now_fn=lambda: clock["t"])
+    assert link.send_minute_summaries() == 1                      # only the finished minute, normally
+    assert link.settle(timeout_s=1, reports_wait_s=0)
+    minutes = [d for t, d in sender.sent if t == models.METRIC_SUMMARY_REPORTED]
+    assert [mi["bin_start"] for mi in minutes] == [36000.0, 36060.0]
+    assert minutes[1]["summaries"][0]["stats"]["count"] == 2     # the partial minute, not lost with the process
+    parts = {mi["part"] for mi in minutes}
+    assert len(parts) == 1 and None not in parts                 # one part per process
+    restarted = ControlPlaneLink("ve-1", status_fn=lambda: STATUS, metrics=MetricsStore(), event_log=_Log(),
+                                 sender=_Sender(), now_fn=lambda: clock["t"])
+    assert restarted._part not in parts                          # a restarted VEM adds a second part

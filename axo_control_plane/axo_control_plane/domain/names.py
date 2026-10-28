@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import secrets
-from typing import Tuple
+from typing import Optional, Tuple
 
 from axo_control_plane.domain.errors import InvalidError
 
@@ -67,3 +67,30 @@ def split_bucket_name(full_name: str) -> Tuple[str, str]:
 def code_bucket_for(virtual_environment_id: str) -> str:
     """The platform bucket holding a VE's function code."""
     return full_bucket_name(PLATFORM_OWNER, f"ve-{virtual_environment_id}-functions")
+
+
+def results_bucket_for(virtual_environment_id: str) -> str:
+    """The platform bucket holding every result of a VE's jobs (kept per job)."""
+    return full_bucket_name(PLATFORM_OWNER, f"ve-{virtual_environment_id}-results")
+
+
+def objects_bucket_for(virtual_environment_id: str) -> str:
+    """The platform bucket holding a VE's big active-object values (the
+    endpoints' ``axo_shared.active_objects.state.objects_bucket_name``)."""
+    return full_bucket_name(PLATFORM_OWNER, f"ve-{virtual_environment_id}-objects")
+
+
+def ve_of_objects_bucket(full_name: str) -> Optional[str]:
+    """``axo/ve-<id>-objects`` -> ``<id>`` (else None)."""
+    prefix, suffix = f"{PLATFORM_OWNER}/ve-", "-objects"
+    if full_name and full_name.startswith(prefix) and full_name.endswith(suffix):
+        return full_name[len(prefix):-len(suffix)] or None
+    return None
+
+
+def ve_of_results_bucket(full_name: str) -> Optional[str]:
+    """``axo/ve-<id>-results`` -> ``<id>`` (else None)."""
+    prefix, suffix = f"{PLATFORM_OWNER}/ve-", "-results"
+    if full_name and full_name.startswith(prefix) and full_name.endswith(suffix):
+        return full_name[len(prefix):-len(suffix)] or None
+    return None

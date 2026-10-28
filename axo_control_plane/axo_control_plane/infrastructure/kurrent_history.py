@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from kurrentdbclient import KurrentDBClient, NewEvent, StreamState
+from kurrentdbclient.exceptions import NotFoundError
 
 from axo_control_plane.application.ports import HistoryLog
 
@@ -22,3 +23,10 @@ class KurrentHistory(HistoryLog):
             events=NewEvent(type=event_type, data=json.dumps(data, default=str).encode("utf-8")),
             current_version=StreamState.ANY,
         )
+
+    def read(self, stream: str, limit: int = 100) -> List[Dict[str, Any]]:
+        try:
+            events = self._client.get_stream(stream, backwards=True, limit=limit)
+        except NotFoundError:
+            return []
+        return [{"type": e.type, "data": json.loads(e.data or b"{}")} for e in events]

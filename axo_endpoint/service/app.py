@@ -52,6 +52,7 @@ from axo_endpoint.core.events import InMemoryEventBus
 from axo_endpoint.core.functions import FunctionRegistry
 from axo_shared.functions.lifecycle import FunctionState
 from axo_endpoint.core.network import PeerInfo
+from axo_endpoint.core.result_store import ResultStore
 from axo_endpoint.core.results import FunctionResult
 from axo_shared.protocol import Command, CommandResult
 from axo_endpoint.core.storage import InMemoryStorageBackend
@@ -69,7 +70,18 @@ from axo_endpoint.service.consensus_loop import (
 )
 from axo_endpoint.service.container import ContainerResultReceiver, ContainerSummoner
 from axo_endpoint.service.container.handle import ContainerStatus
+from axo_endpoint.core.objects import (
+    ACTIVE_OBJECT_CALLED_EVENT,
+    ACTIVE_OBJECT_CREATED_EVENT,
+    ACTIVE_OBJECT_DELETED_EVENT,
+    ACTIVE_OBJECT_SIZES_EVENT,
+    ACTIVE_OBJECT_UPGRADED_EVENT,
+    ObjectCoordinator,
+    StateAwareDataIO,
+)
+from axo_endpoint.core.objects.backends import build_state_store
 from axo_endpoint.service.handlers import (
+    ActiveObjectHandler,
     ActivityListHandler,
     ConcurrencyReconcilePullHandler,
     ConcurrencySlotReleaseHandler,
@@ -95,6 +107,7 @@ from axo_endpoint.service.handlers import (
     build_completion_recorder,
     make_replicate_fn,
     make_reverify_fn,
+    submit_job,
 )
 from axo_endpoint.service.runtime.concurrency_client import ConcurrencyClient
 from axo_endpoint.service.runtime.container_runtime import ContainerFunctionRuntime
@@ -105,6 +118,7 @@ from axo_shared import wire
 from axo_endpoint.service.transport.address import resolve_peer_address
 from axo_endpoint.service.transport.reliable_event_publisher import ReliableEventPublisher
 from axo_endpoint.core.usage import EndpointMetrics, UsageRecorder
+from axo_endpoint.core.runtime.attempts import JobAttempts
 from axo_endpoint.core.runtime.queue_deadlines import QueueDeadlines
 from axo_shared.metrics import MetricAggregator
 from axo_endpoint.service.transport.heartbeat_zmq import (
@@ -144,7 +158,7 @@ class App:
         )
 
         self.functions_store = InMemoryStorageBackend()
-        self.results_store   = InMemoryStorageBackend()
+        self.results_store   = ResultStore()
         self.event_bus       = InMemoryEventBus()
         self.registry        = FunctionRegistry(backend=self.functions_store, event_bus=self.event_bus)
 
@@ -216,6 +230,7 @@ class App:
                 function_registry=self.registry,
                 get_virtual_environment_id=self._get_virtual_environment_id,
                 logger=self._logger,
+                attempt_of=lambda job_id: self.job_attempts.attempt_of(job_id),
             )
             # Only REGISTERED ever actually fires via FunctionRegistry.register() --
             # the other FunctionState values are only reachable through
@@ -245,6 +260,9 @@ class App:
             self.event_bus.subscribe(CLUSTER_QUORUM_LOST_EVENT, self.external_bridge.on_cluster_quorum_event)
             self.event_bus.subscribe(CLUSTER_QUORUM_RESTORED_EVENT, self.external_bridge.on_cluster_quorum_event)
             self.event_bus.subscribe(CLUSTER_DEGRADED_EVENT, self.external_bridge.on_cluster_quorum_event)
+            for object_event in (ACTIVE_OBJECT_CREATED_EVENT, ACTIVE_OBJECT_CALLED_EVENT, ACTIVE_OBJECT_UPGRADED_EVENT,
+                                 ACTIVE_OBJECT_DELETED_EVENT, ACTIVE_OBJECT_SIZES_EVENT):
+                self.event_bus.subscribe(object_event, self.external_bridge.on_active_object_event)
 
         # Metering: one JobAttemptRecorded per attempt this endpoint runs,
         # delivered reliably to the VEM (billing). Built even without an API
@@ -297,6 +315,7 @@ class App:
             event_bus     = self.event_bus,
             logger        = self._logger,
             replicate_fn  = _replicate_result,
+            attempt_of    = lambda job_id: self.job_attempts.attempt_of(job_id),
         )
         # max_wait per job: both runtimes check it where a job enters/leaves a
         # runner queue; _queue_deadline_loop drops jobs that overstay.
@@ -308,9 +327,55 @@ class App:
             cache=self.chunk_cache,
             user_for_job=self.usage_recorder.acting_user,
             access_recheck_seconds=config.AXO_ENDPOINT_STORAGE_ACCESS_RECHECK_SECONDS,
+            on_io=self.usage_recorder.on_io,
+            virtual_environment_id=config.AXO_ENDPOINT_VIRTUAL_ENV_ID,
         )
         self.event_bus.subscribe("JOB_COMPLETED", lambda event: self.queue_deadlines.discard(event.payload["job_id"]))
         self.event_bus.subscribe("JOB_FAILED", lambda event: self.queue_deadlines.discard(event.payload["job_id"]))
+
+        # Active objects: the leader runs every call (one at a time per
+        # object) and saves what it changed. Every endpoint builds the
+        # coordinator; followers proxy the ops to the leader.
+        built_store = build_state_store(config, self.storage_client)
+        if built_store.is_err:
+            raise ValueError(built_store.unwrap_err().message)
+        self.object_coordinator = ObjectCoordinator(
+            store=built_store.unwrap(),
+            submit_fn=lambda command, job_id: submit_job(
+                command, job_id,
+                runtime=self.runtime,
+                results=self.results_store,
+                event_bus=self.event_bus,
+                function_registry=self.registry,
+                logger=self._logger,
+                queue_deadlines=self.queue_deadlines,
+                default_max_wait_s=config.AXO_ENDPOINT_DEFAULT_MAX_WAIT_SECONDS,
+                attempts=self.job_attempts,
+            ),
+            results=self.results_store,
+            event_bus=self.event_bus,
+            self_id=config.AXO_ENDPOINT_ID,
+            logger=self._logger,
+        )
+        recorder = on_complete
+
+        def on_complete(handle, outcome, warnings=None):
+            # Background writes (dataio.write_async / store.write(wait=False))
+            # finish before the job does.
+            recorder(handle, outcome, list(warnings or []) + self.dataio.flush(handle.job_id))
+
+        on_complete = self.object_coordinator.wrap(on_complete)
+        # Every failed attempt passes here first: tried again (same job id)
+        # or handed on as the job's final outcome. Placed before the object
+        # coordinator so an object call isn't freed while it's retried.
+        self.job_attempts = JobAttempts(
+            invoke_fn=lambda function_ref, job_id, params: self.runtime.invoke(function_ref, job_id, params),
+            on_attempt_failed=self.usage_recorder.on_attempt_failed,
+            queue_deadlines=self.queue_deadlines,
+            logger=self._logger,
+        )
+        on_complete = self.job_attempts.wrap(on_complete)
+        runtime_dataio = StateAwareDataIO(self.dataio, self.object_coordinator)
 
         self.process_runtime = ProcessFunctionRuntime(
             function_registry  = self.registry,
@@ -318,7 +383,7 @@ class App:
             scratch_root       = config.AXO_ENDPOINT_SCRATCH_ROOT,
             memory_limit_bytes = config.AXO_ENDPOINT_WORKER_RLIMIT_AS_BYTES,
             cpu_limit_seconds  = config.AXO_ENDPOINT_WORKER_RLIMIT_CPU_SECONDS,
-            dataio             = self.dataio,
+            dataio             = runtime_dataio,
             event_bus          = self.event_bus,
             queue_deadlines    = self.queue_deadlines,
             logger             = self._logger,
@@ -359,7 +424,7 @@ class App:
             summoner          = self.container_summoner,
             on_complete       = on_complete,
             config            = config,
-            dataio            = self.dataio,
+            dataio            = runtime_dataio,
             event_bus         = self.event_bus,
             queue_deadlines   = self.queue_deadlines,
             logger            = self._logger,
@@ -368,7 +433,6 @@ class App:
             concurrency_client=self.concurrency_client,
             forward_job_fn=self._forward_job_to_endpoint,
         )
-        self.container_runtime.attach_usage_hook(self.usage_recorder.on_attempt_retried)
         self.runtime = RuntimeDispatcher(
             registry          = self.registry,
             process_runtime   = self.process_runtime,
@@ -449,6 +513,7 @@ class App:
                 logger            = self._logger,
                 queue_deadlines   = self.queue_deadlines,
                 is_draining       = self._draining.is_set,
+                attempts          = self.job_attempts,
             ),
         )
 
@@ -463,6 +528,7 @@ class App:
                 queue_deadlines    = self.queue_deadlines,
                 default_max_wait_s = config.AXO_ENDPOINT_DEFAULT_MAX_WAIT_SECONDS,
                 is_draining        = self._draining.is_set,
+                attempts           = self.job_attempts,
             ),
         )
         self.dispatcher.register_handler(
@@ -470,6 +536,23 @@ class App:
             JobResultHandler(results=self.results_store, logger=self._logger),
         )
         self.dispatcher.register_handler(wire.METRICS, MetricsHandler(metrics_provider=self._collect_metrics))
+        # Leader-gated: the leader holds each object's queue and saves its state.
+        for operation, handle_fn in (
+            (wire.ACTIVE_OBJECT_CALL, self.object_coordinator.handle_call),
+            (wire.ACTIVE_OBJECT_CLONE, self.object_coordinator.handle_clone),
+            (wire.ACTIVE_OBJECT_DELETE, self.object_coordinator.handle_delete),
+            (wire.ACTIVE_OBJECT_STATE, self.object_coordinator.handle_state),
+            (wire.ACTIVE_OBJECT_RESTORE, self.object_coordinator.handle_restore),
+        ):
+            self.dispatcher.register_handler(operation, LeaderProxyHandler(
+                inner=ActiveObjectHandler(handle_fn),
+                elector=self.elector,
+                self_id=config.AXO_ENDPOINT_ID,
+                resolve_leader_rpc_uri=self._resolve_leader_rpc_uri,
+                forward_fn=self._forward_command,
+                forward_timeout_seconds=config.AXO_ENDPOINT_CONSENSUS_FORWARD_TIMEOUT_SECONDS,
+                logger=self._logger,
+            ))
         self.dispatcher.register_handler(
             wire.ACTIVITY_LIST,
             ActivityListHandler(repository=self.activity_repository, logger=self._logger),
@@ -513,7 +596,8 @@ class App:
             ),
             # Never leader-proxied -- a job runs on one specific endpoint,
             # only that endpoint's own runtime state can act on it.
-            wire.JOB_CANCEL: JobCancelHandler(runtime=self.runtime, logger=self._logger),
+            wire.JOB_CANCEL: JobCancelHandler(runtime=self.runtime, logger=self._logger,
+                                              attempts=self.job_attempts),
             # Never leader-proxied: draining is about THIS endpoint.
             wire.ENDPOINT_DRAIN: EndpointDrainHandler(
                 set_draining=self._set_draining,
@@ -664,6 +748,8 @@ class App:
             threading.Thread(target=self._scratch_sweep_loop, daemon=True),
             threading.Thread(target=self._result_consistency_loop, daemon=True),
             threading.Thread(target=self._queue_deadline_loop, daemon=True),
+            threading.Thread(target=self._result_prune_loop, daemon=True),
+            threading.Thread(target=self._object_housekeeping_loop, daemon=True),
             threading.Thread(target=self.endpoint_metrics.run_flush_loop, args=(self._stop_event,), daemon=True),
         ]
         for thread in self._background_threads:
@@ -769,9 +855,10 @@ class App:
         # The target runs the job, so it records the usage: hand it this job's
         # context (trace, received time, who started it) and forget it here.
         usage = self.usage_recorder.take_for_forward(job_id)
+        attempt_settings = self.job_attempts.take_for_forward(job_id)
         envelope = {
             "function_id": function_ref.id, "function_version": function_ref.version,
-            "job_id": job_id, "params": params,
+            "job_id": job_id, "params": params, **attempt_settings,
         }
         if usage is not None:
             envelope["usage"] = usage
@@ -784,6 +871,9 @@ class App:
         if command_result is None or not command_result.ok:
             if usage is not None:
                 self.usage_recorder.restore(usage)
+            self.job_attempts.restore(job_id, function_ref, params, attempt_settings,
+                                      attempt=(usage or {}).get("attempt", 1),
+                                      max_wait_s=(usage or {}).get("max_wait_s", -1.0))
             if command_result is None:
                 return Err(result.unwrap_err())
             return Err(AxoError(command_result.error, context={"error_code": command_result.error_code}))
@@ -1045,6 +1135,37 @@ class App:
                     interval_seconds=self.config.AXO_ENDPOINT_RESULT_CONSISTENCY_CHECK_INTERVAL_SECONDS,
                 )
             self._stop_event.wait(min(30.0, self.config.AXO_ENDPOINT_RESULT_CONSISTENCY_CHECK_INTERVAL_SECONDS))
+
+    def _object_housekeeping_loop(self) -> None:
+        """Runs in the background, only while leader: deletes saved object
+        values nothing uses any more (after the grace time) and reports the
+        stored state size for billing."""
+        last_sweep = last_sizes = time.monotonic()
+        while not self._stop_event.wait(min(30.0, self.config.AXO_ENDPOINT_OBJECT_SWEEP_INTERVAL_SECONDS)):
+            if not self.elector.is_leader(self.config.AXO_ENDPOINT_ID):
+                continue
+            now = time.monotonic()
+            if now - last_sweep >= self.config.AXO_ENDPOINT_OBJECT_SWEEP_INTERVAL_SECONDS:
+                last_sweep = now
+                swept = self.object_coordinator.store.sweep(self.config.AXO_ENDPOINT_OBJECT_SWEEP_GRACE_SECONDS)
+                if swept.is_err:
+                    self._logger.warning_event(Event.Objects.SWEEP_FAILED, component=Component.OBJECTS,
+                                               **swept.unwrap_err().to_dict())
+                else:
+                    self._logger.debug_event(Event.Objects.SWEEP_FINISHED, component=Component.OBJECTS,
+                                             deleted=swept.unwrap())
+            if now - last_sizes >= self.config.AXO_ENDPOINT_OBJECT_SIZES_INTERVAL_SECONDS:
+                last_sizes = now
+                reported = self.object_coordinator.report_sizes()
+                if reported.is_err:
+                    self._logger.warning_event(Event.Objects.SIZES_FAILED, component=Component.OBJECTS,
+                                               **reported.unwrap_err().to_dict())
+
+    def _result_prune_loop(self) -> None:
+        """Runs in the background: forgets results finished more than
+        AXO_ENDPOINT_RESULT_KEEP_SECONDS ago (the VEM keeps them)."""
+        while not self._stop_event.wait(60.0):
+            self.results_store.prune(self.config.AXO_ENDPOINT_RESULT_KEEP_SECONDS)
 
     def _queue_deadline_loop(self) -> None:
         """Runs in the background: fails jobs still waiting in a runner queue

@@ -78,5 +78,6 @@ class ContainerBootstrapHandler(CommandHandler):
         return CommandResult(
             ok=True,
             payload=record.code,
-            metadata={"requirements": requirements, "code_format": record.code_format, "name": record.name},
+            metadata={"requirements": requirements, "code_format": record.code_format, "name": record.name,
+                      "call_style": record.runtime_spec.call_style if record.runtime_spec else "kwargs"},
         )

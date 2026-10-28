@@ -1,110 +1,118 @@
 #!/usr/bin/env bash
+# Deploys the axo platform (docker-compose.yml): the Control Plane, axo-storage,
+# Xolo and axo-ui. The VEs themselves are created later by the Control Plane.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-COMPOSE_FILE="${SCRIPT_DIR}/docker-compose.yml"
-COMPOSE_ENV_FILE="${SCRIPT_DIR}/deploy/env/compose.env"
+COMPOSE=(docker compose
+  --project-directory "$SCRIPT_DIR"
+  --file "$SCRIPT_DIR/docker-compose.yml"
+  --env-file "$SCRIPT_DIR/deploy/env/compose.env"
+)
 
 usage() {
-  echo "Usage: $0 <command> [options]"
-  echo ""
-  echo "Commands:"
-  echo "  build          Build only the axo-endpoint node image and the"
-  echo "                 axo-runner image (no compose services touched)"
-  echo "  up [--build]   Start all services (add --build to rebuild compose"
-  echo "                 images plus the axo-endpoint node image used for"
-  echo "                 dynamically-launched endpoints, and pre-build the"
-  echo "                 axo-runner image so it's already there on next use)"
-  echo "  down           Stop and remove containers"
-  echo "  restart        Restart all services"
-  echo "  logs [service] Follow logs (all services or a specific one)"
-  echo "  ps             Show running containers"
-  echo "  pull           Pull latest images"
-  echo ""
-  echo "Env file: ${COMPOSE_ENV_FILE}"
+  cat <<EOF
+Usage: $0 <command> [options]
+
+Commands:
+  up [--build]     Start the platform (--build: rebuild every image first,
+                   including the VEM / endpoint / runner images the Control
+                   Plane starts for each VE)
+  build            Build every image, start nothing
+  down [--ves]     Stop the platform (--ves: also remove every VE container
+                   and network the Control Plane created; data volumes stay)
+  restart [svc]    Restart all services, or one
+  logs [svc]       Follow logs (all services, or one)
+  ps               The platform's containers, and the VEs' ones
+  urls             Where everything is
+EOF
+}
+
+build_images() {
+  "${COMPOSE[@]}" --profile images build axo-vem-image axo-endpoint-image axo-runner-image
+  "${COMPOSE[@]}" build
+}
+
+urls() {
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/deploy/env/compose.env"
+  cat <<EOF
+
+  axo-ui             http://localhost:${AXO_UI_PUBLIC_PORT:-3080}
+  Control Plane API  http://localhost:${AXO_CP_PUBLIC_PORT:-9000}/docs
+  Xolo admin UI      http://127.0.0.1:${XOLO_UI_PUBLIC_PORT:-3001}
+
+  First sign-in: the bootstrap Platform Admin (AXO_CP_ADMIN_USERNAME /
+  AXO_CP_ADMIN_PASSWORD in deploy/env/axo.control-plane.prod.env); you are
+  asked to change the password first. Then sign up a normal account to buy VEs.
+EOF
+}
+
+wait_for_cp() {
+  # shellcheck disable=SC1091
+  source "$SCRIPT_DIR/deploy/env/compose.env"
+  local url="http://localhost:${AXO_CP_PUBLIC_PORT:-9000}/errors"
+  echo -n "Waiting for the Control Plane"
+  for _ in $(seq 1 90); do
+    if curl -fsS -o /dev/null "$url" 2>/dev/null; then
+      echo " ready."
+      return 0
+    fi
+    echo -n "."
+    sleep 2
+  done
+  echo " not answering yet -- see: $0 logs axo-control-plane"
+  return 1
+}
+
+remove_ves() {
+  local containers networks
+  containers=$(docker ps -aq --filter label=axo.managed-by=axo-control-plane)
+  runners=$(docker ps -aq --filter label=axo.role=runner)
+  endpoints=$(docker ps -aq --filter label=axo.role=endpoint)
+  for id in $containers $runners $endpoints; do docker rm -f "$id" >/dev/null || true; done
+  networks=$(docker network ls -q --filter label=axo.managed-by=axo-control-plane)
+  for id in $networks; do docker network rm "$id" >/dev/null || true; done
+  echo "VE containers and networks removed (volumes kept: docker volume ls | grep '^ve-')."
 }
 
 CMD="${1:-up}"
 shift || true
 
-BASE_CMD=(docker compose
-  --file "$COMPOSE_FILE"
-  --env-file "$COMPOSE_ENV_FILE"
-)
-
-build_node_images() {
-  # Bring AXO_ENDPOINT_DOCKERFILE/AXO_ENDPOINT_IMAGE/runner vars into
-  # the shell -- plain `docker build` below doesn't get compose's
-  # --env-file substitution, so the env file needs sourcing directly.
-  set -a
-  # shellcheck disable=SC1090
-  source "$COMPOSE_ENV_FILE"
-  set +a
-  docker build \
-    --file "${SCRIPT_DIR}/${AXO_ENDPOINT_DOCKERFILE:-Dockerfile}" \
-    --tag "${AXO_ENDPOINT_IMAGE:-axo-endpoint:local}" \
-    "$SCRIPT_DIR"
-
-  # Matches ContainerSummoner._runner_image()'s own tag convention
-  # (AXO_ENDPOINT_CONTAINER_RUNNER_IMAGE:py<python_version>) -- keep
-  # AXO_ENDPOINT_RUNNER_PYTHON_VERSION in sync with whatever
-  # python_version your functions actually register with (default
-  # "3.11") if you rely on this pre-build to cover them.
-  docker build \
-    --file "${SCRIPT_DIR}/axo_endpoint/runner/Dockerfile" \
-    --tag "${AXO_ENDPOINT_RUNNER_IMAGE:-axo-runner}:py${AXO_ENDPOINT_RUNNER_PYTHON_VERSION:-3.11}" \
-    --build-arg "PYTHON_VERSION=${AXO_ENDPOINT_RUNNER_PYTHON_VERSION:-3.11}" \
-    "$SCRIPT_DIR"
-}
-
 case "$CMD" in
-  build)
-    # Builds only the images compose never builds itself (see `up` below):
-    # the axo-endpoint node image and the axo-runner image.
-    build_node_images
-    ;;
   up)
-    # --build rebuilds compose services (axo-vem, ...) via the flag passed
-    # straight through in "$@" below, PLUS two images compose can never
-    # reach on its own:
-    #   - axo-endpoint:local: endpoint nodes aren't compose services --
-    #     they're created dynamically from axo-ui via axo_vem's
-    #     POST /endpoints (LaunchEndpointNodeUseCase -> ContainerSpawner.spawn,
-    #     a plain `docker run` against AXO_VEM_NODE_IMAGE, default
-    #     axo-endpoint:local). No compose service has a build: section for
-    #     that tag, so `docker compose build`/`up --build` silently never
-    #     touches it -- it goes stale across deploys unless built here
-    #     directly.
-    #   - axo-runner:pyX.Y: otherwise only ever built lazily by the running
-    #     endpoint process itself (ContainerSummoner._ensure_image, the
-    #     first time a container-runtime function needs it -- see
-    #     axo_endpoint/service/container/spawner.py). Pre-building it here
-    #     means that first-use build happens once, up front, instead of
-    #     racing N concurrent cold-start pool members (e.g. a function
-    #     registered with max_concurrency=5) into starting N redundant
-    #     `docker build`s of the same image at once.
-    for arg in "$@"; do
-      if [ "$arg" == "--build" ]; then
-        build_node_images
-        break
-      fi
-    done
-    "${BASE_CMD[@]}" up -d "$@"
+    if [[ " $* " == *" --build "* ]]; then
+      build_images
+    fi
+    "${COMPOSE[@]}" up -d "$@"
+    wait_for_cp || true
+    urls
+    ;;
+  build)
+    build_images
     ;;
   down)
-    "${BASE_CMD[@]}" down "$@"
+    if [[ " $* " == *" --ves "* ]]; then
+      remove_ves
+    fi
+    args=()
+    for a in "$@"; do [[ "$a" == "--ves" ]] || args+=("$a"); done
+    "${COMPOSE[@]}" down "${args[@]}"
     ;;
   restart)
-    "${BASE_CMD[@]}" restart "$@"
+    "${COMPOSE[@]}" restart "$@"
     ;;
   logs)
-    "${BASE_CMD[@]}" logs -f "$@"
+    "${COMPOSE[@]}" logs -f "$@"
     ;;
   ps)
-    "${BASE_CMD[@]}" ps
+    "${COMPOSE[@]}" ps
+    echo
+    echo "VE containers:"
+    docker ps -a --filter label=axo.ve --format 'table {{.Names}}\t{{.Label "axo.role"}}\t{{.Status}}'
     ;;
-  pull)
-    "${BASE_CMD[@]}" pull
+  urls)
+    urls
     ;;
   help|--help|-h)
     usage

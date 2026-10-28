@@ -11,6 +11,7 @@ from axo_control_plane.application.people import Actor, Names
 from axo_control_plane.application.ports import HistoryLog, IdentityProvider
 from axo_control_plane.domain import roles as R
 from axo_control_plane.domain.errors import ConflictError, ForbiddenError, InvalidError, NotFoundError
+from axo_control_plane.domain.names import check_owner_name
 
 # Three Xolo groups per team, so Xolo's "union of grants" gives each team
 # role exactly its rights on team-owned VEs / buckets:
@@ -47,6 +48,10 @@ class Teams:
         doc = self._col.find_one({"name": name, "deleted": {"$ne": True}})
         return _public(doc) if doc else None
 
+    def of_group(self, group_id: str) -> Optional[Dict[str, Any]]:
+        """The team one of whose three Xolo groups this is (None if no team's)."""
+        return self._col.find_one({"$or": [{f"groups.{kind}": group_id} for kind in ("owner", "admins", "members")]})
+
     def groups(self, team_id: str) -> Dict[str, str]:
         return dict(self._doc(team_id)["groups"])
 
@@ -71,6 +76,70 @@ class Teams:
     def of_user(self, user_id: str) -> List[Dict[str, Any]]:
         return [_public(d) for d in self._col.find({f"members.{user_id}": {"$exists": True},
                                                      "deleted": {"$ne": True}}).sort("name", 1)]
+
+    def name_free(self, name: str) -> Dict[str, Any]:
+        """For the New team dialog: whether a name can be taken (people and
+        teams share one list of names), and why not."""
+        try:
+            name = check_owner_name(name)
+        except InvalidError as exc:
+            return {"name": name, "free": False, "reason": str(exc)}
+        if self._names.lookup(name) is not None:
+            return {"name": name, "free": False, "reason": f"{name} is already taken"}
+        return {"name": name, "free": True, "reason": None}
+
+    def summaries(self, user_id: str) -> List[Dict[str, Any]]:
+        """The Teams list: each team of the person with their role and how
+        many members, VEs and buckets it has."""
+        out = []
+        for team in self.of_user(user_id):
+            team_id = team["team_id"]
+            out.append({**team, "my_role": next((m["role"] for m in team["members"] if m["user_id"] == user_id), None),
+                        "member_count": len(team["members"]),
+                        "ve_count": self._ves.count_documents(_owned_by(team_id, "desired")),
+                        "bucket_count": self._buckets.count_documents(_owned_by(team_id, "deleted"))})
+        return out
+
+    def resources(self, actor: Actor, team_id: str) -> List[Dict[str, Any]]:
+        """What the team owns, and what others shared with it (``shared_by``
+        from the invitation that did it). Shares are read from the grants of
+        what the person can see -- a member sees everything shared with the
+        team, so nothing is missed and Xolo answers stay cached."""
+        self.require(actor, team_id, R.MEMBER)
+        out: List[Dict[str, Any]] = []
+        for ve in self._ves.find(_owned_by(team_id, "desired")).sort("name", 1):
+            out.append({"kind": "ve", "id": ve["_id"], "name": ve["name"], "owned": True, "role": R.OWNER})
+        for bucket in self._buckets.find(_owned_by(team_id, "deleted")).sort("full_name", 1):
+            out.append({"kind": "bucket", "id": bucket["_id"], "name": bucket["full_name"], "owned": True,
+                        "role": R.OWNER})
+        owned = {(r["kind"], r["id"]) for r in out}
+        groups = set(self.groups(team_id).values())
+        invites = self._col.database["invitations"]
+        for resource in self._access.visible_resources(actor.user_id):
+            kind, _, target_id = resource.partition(":")
+            if kind not in ("ve", "bucket") or (kind, target_id) in owned:
+                continue
+            grant = next((g for g in self._access.grants(resource) if g.principal_id in groups), None)
+            if grant is None:
+                continue
+            if kind == "ve":
+                doc = self._ves.find_one({"_id": target_id, "desired": {"$ne": "deleted"}})
+                role = R.ve_role_from_permissions(grant.permissions, grant.is_owner)
+            else:
+                doc = self._buckets.find_one({"_id": target_id, "deleted": {"$ne": True}})
+                role = R.bucket_role_from_permissions(grant.permissions, grant.is_owner)
+            if doc is None:
+                continue
+            invite = invites.find_one({"kind": kind, "target_id": target_id, "invitee.id": team_id,
+                                       "status": "accepted"}, sort=[("answered_at", -1)])
+            out.append({"kind": kind, "id": target_id, "name": doc.get("full_name") or doc["name"], "owned": False,
+                        "role": role, "shared_by": invite.get("invited_by_name") if invite else None})
+        return out
+
+    def history(self, actor: Actor, team_id: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """The team's history (created, joined, roles, limits, transfer...), newest first."""
+        self.require(actor, team_id, R.MEMBER)
+        return [{"type": e["type"], **e["data"]} for e in self._history.read(f"team-{team_id}", limit)]
 
     # ── changes ──────────────────────────────────────────────────────────────
     def create(self, actor: Actor, name: str, description: str = "") -> Dict[str, Any]:
@@ -206,6 +275,11 @@ class Teams:
     def _record(self, team_id: str, event_type: str, actor: Actor, **data: Any) -> None:
         self._history.append(f"team-{team_id}", event_type,
                              {"team_id": team_id, "by": actor.user_id, "at": self._now_fn(), **data})
+
+
+def _owned_by(team_id: str, gone_field: str) -> Dict[str, Any]:
+    gone = {"$ne": "deleted"} if gone_field == "desired" else {"$ne": True}
+    return {"owner.kind": "team", "owner.id": team_id, gone_field: gone}
 
 
 def _public(doc: Dict[str, Any]) -> Dict[str, Any]:

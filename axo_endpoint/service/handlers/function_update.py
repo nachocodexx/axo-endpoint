@@ -16,7 +16,9 @@ _Logger = Union[Log, DumbLogger]
 
 class FunctionUpdateHandler(CommandHandler):
     """In-place mutation of an existing function version's params_schema/
-    env_vars -- no new version created, no code touched. Takes effect
+    env_vars / settings (``runtime``: attempts, keep time, idle time, max
+    concurrency; ``secret_env``: names never shown again) -- no new version
+    created, no code touched. Takes effect
     lazily on whatever worker/container next naturally redeploys."""
 
     def __init__(
@@ -50,8 +52,15 @@ class FunctionUpdateHandler(CommandHandler):
             )
             return CommandResult.from_error(err)
 
-        params_schema = parse_params_schema(command.envelope.get("params_schema")) or None
+        replace_params = bool(command.envelope.get("params_schema_replace"))
+        raw_schema = command.envelope.get("params_schema")
+        params_schema = parse_params_schema(raw_schema) if raw_schema is not None else None
+        if not replace_params:
+            params_schema = params_schema or None
+        replace_env = bool(command.envelope.get("env_vars_replace"))
         env_vars = command.envelope.get("env_vars") or None
+        secret_env = command.envelope.get("secret_env")
+        runtime = command.envelope.get("runtime") or None
         max_concurrency = command.envelope.get("max_concurrency")
         if max_concurrency is not None and (not isinstance(max_concurrency, int) or max_concurrency < 1):
             return CommandResult.from_error(MissingFieldError(
@@ -61,7 +70,8 @@ class FunctionUpdateHandler(CommandHandler):
         key = StorageKey(id=function_id, version=version, alias=function_id)
         result = self._registry.update(
             key, now=self._now_fn(), params_schema=params_schema, env_vars=env_vars,
-            max_concurrency=max_concurrency,
+            max_concurrency=max_concurrency, runtime=runtime, replace_env=replace_env,
+            secret_env=list(secret_env) if secret_env is not None else None, replace_params=replace_params,
         )
         if result.is_err:
             raw = result.unwrap_err()

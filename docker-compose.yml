@@ -1,215 +1,275 @@
-# 3-node axo_endpoint mesh, plus axo_vem (+ Kurrent + Mongo) and the
-# xolo stack, sharing one compose network (axo-net) for local/production-shaped
-# testing.
+# The axo platform, deployed once by the Platform Admin:
+#   axo-control-plane (+ its Kurrent and Mongo), axo-storage, xolo (+ Mongo,
+#   Redis, admin UI) and axo-ui. Every VE (its VEM, Kurrent, Mongo, Redis and
+#   endpoints) is created later by the Control Plane, on its own network.
 #
-# Prerequisite (one-time, not created by this file since it's a shared
-# resource with any ad-hoc container-runtime function testing too):
-#   docker network create axo-net
+#   ./deploy.sh up --build      (preferred: also builds the images below)
 #
-# Usage:
-#   docker compose up --build
-#   (or: ./deploy.sh up --build, which also passes deploy/env/compose.env as
-#   the --env-file supplying every ${VAR:-default} below)
+# or by hand:
+#   docker compose --env-file deploy/env/compose.env --profile images build
+#   docker compose --env-file deploy/env/compose.env up -d --build
 #
-# Each node is reachable from the host on its own port range (internal
-# container ports stay the plain .env.prod defaults -- 5555/5556/5557 --
-# since each container has its own isolated network namespace; only the
-# host-side mapping needs to differ per node):
-#   node 0: tcp://localhost:5555 (router) / 5556 (pub) / 5557 (container results)
-#   node 1: tcp://localhost:5565 / 5566 / 5567
-#   node 2: tcp://localhost:5575 / 5576 / 5577
+# The "images" profile only builds the images the Control Plane starts for
+# each VE (VEM, endpoint, runner); those are never started by compose.
 #
-# Unlike the local host-based 2-node dev setup (.env.dev/.env.dev.1, which
-# needs AXO_ENDPOINT_LOCAL_MODE=true because peer ids aren't resolvable
-# hostnames on one shared host), real compose service names ARE resolvable
-# hostnames on the compose network -- so AXO_ENDPOINT_LOCAL_MODE=false
-# (.env.prod's default) is correct as-is, and AXO_ENDPOINT_ID is simply each
-# service's own compose name.
-
-x-axo-endpoint-common: &axo-endpoint-common
-  build:
-    context: .
-    dockerfile: ${AXO_ENDPOINT_DOCKERFILE:-Dockerfile}
-  image: ${AXO_ENDPOINT_IMAGE:-axo-endpoint:local}
-  networks:
-    - axo-net
-  env_file:
-    - ${AXO_ENDPOINT_ENV_FILE:-.env.prod}
-  restart: unless-stopped
+# On the host:
+#   axo-ui            http://localhost:3080   (the people's app)
+#   axo-control-plane http://localhost:9000   (the API, /docs)
+#   xolo-ui           http://127.0.0.1:3001   (accounts, Platform Admin)
+#   xolo API          http://127.0.0.1:10000
 
 services:
-
-  kurrentdb:
+  # --- the Control Plane ------------------------------------------------------
+  cp-kurrentdb:
     image: eventstore/eventstore:${AXO_KURRENTDB_IMAGE_TAG:-24.10.0-jammy}
-    container_name: ${AXO_KURRENTDB_CONTAINER_NAME:-axo-kurrentdb}
-    hostname: kurrentdb
     restart: unless-stopped
-    env_file:
-      - ${AXO_KURRENTDB_ENV_FILE:-./deploy/env/axo.kurrentdb.prod.env}
-    volumes:
-      - ${AXO_KURRENTDB_VOLUME_NAME:-axo-kurrentdb-data}:/var/lib/eventstore
-    ports:
-      - "${AXO_KURRENTDB_PUBLIC_PORT:-2113}:2113"
-      - "${AXO_KURRENTDB_TCP_PORT:-1113}:1113"
-    networks:
-      - axo-net
+    env_file: [./deploy/env/axo.kurrentdb.prod.env]
     command: ["--insecure", "--ext-ip", "0.0.0.0"]
-    # No host port published -- only axo-vem talks to this.
-
-  axo-vem-mongo:
-    image: mongo:${AXO_VEM_MONGO_IMAGE_TAG:-7}
-    container_name: ${AXO_VEM_MONGO_CONTAINER_NAME:-axo-vem-mongo}
-    hostname: axo-vem-mongo
-    restart: unless-stopped
-    env_file:
-      - ${AXO_VEM_MONGO_ENV_FILE:-./deploy/env/axo.vem.mongodb.env}
     volumes:
-      - ${AXO_VEM_MONGO_VOLUME_NAME:-axo-vem-mongo-data}:/data/db
-    ports:
-      - "${AXO_VEM_MONGO_PUBLIC_PORT:-27019}:27017"
-    networks:
-      - axo-net
-    # No host port published -- only axo-vem talks to this. This
-    # is a dedicated instance for axo_vem's own read model, kept
-    # separate from the unrelated xolo-db service above.
+      - axo-cp-kurrentdb-data:/var/lib/eventstore
+    networks: [axo-control-net]
 
+  cp-mongo:
+    image: mongo:${AXO_CP_MONGO_IMAGE_TAG:-7}
+    restart: unless-stopped
+    volumes:
+      - axo-cp-mongo-data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [axo-control-net]
+
+  axo-control-plane:
+    build:
+      context: .
+      dockerfile: axo_control_plane/Dockerfile
+    image: ${AXO_CP_IMAGE:-axo-control-plane:local}
+    container_name: axo-control-plane
+    restart: unless-stopped
+    env_file: [./deploy/env/axo.control-plane.prod.env]
+    ports:
+      - "${AXO_CP_PUBLIC_PORT:-9000}:9000"
+    volumes:
+      # Creates and removes the VE containers and networks.
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      cp-mongo:
+        condition: service_healthy
+      cp-kurrentdb:
+        condition: service_started
+      xolo:
+        condition: service_healthy
+    networks: [axo-control-net]
+
+  # --- buckets --------------------------------------------------------------
   axo-storage:
     build:
       context: .
       dockerfile: axo_storage/Dockerfile
     image: ${AXO_STORAGE_IMAGE:-axo-storage:local}
-    container_name: ${AXO_STORAGE_CONTAINER_NAME:-axo-storage}
-    hostname: axo-storage
+    container_name: axo-storage          # the CP attaches it to every VE network by this name
     restart: unless-stopped
-    env_file:
-      - ${AXO_STORAGE_ENV_FILE:-./deploy/env/axo.storage.prod.env}
+    env_file: [./deploy/env/axo.storage.platform.env]
     volumes:
-      # Every bucket's bytes + the SQLite catalog. Endpoints only cache.
-      - ${AXO_STORAGE_VOLUME_NAME:-axo-storage-data}:/data
-    networks:
-      - axo-net
-    # No host port published -- only endpoints and axo-vem talk to this.
+      - axo-storage-data:/data
+    networks: [axo-control-net]
 
-  axo-vem:
+  # --- the people's app -----------------------------------------------------
+  # The browser calls the Control Plane at AXO_UI_API_BASE.
+  axo-ui:
+    build:
+      context: .
+      dockerfile: axo-ui/Dockerfile
+    image: ${AXO_UI_IMAGE:-axo-ui:local}
+    container_name: axo-ui
+    restart: unless-stopped
+    environment:
+      NUXT_PUBLIC_API_BASE: ${AXO_UI_API_BASE:-http://localhost:9000}
+      # Its own server renders pages too: it reaches the CP inside the network.
+      NUXT_API_BASE_SERVER: http://axo-control-plane:9000
+    ports:
+      - "${AXO_UI_PUBLIC_PORT:-3080}:3000"
+    depends_on:
+      - axo-control-plane
+    networks: [axo-control-net]
+
+  # --- xolo (published images nachocode/xolo:api-<v> / ui-<v>) -------------
+  # Only the CP talks to Xolo, so its Mongo/Redis publish no ports and the
+  # API only on 127.0.0.1 (the admin UI's browser calls it).
+  # Mongo is a one-member replica set (xolo-rs, set up by xolo-db-init):
+  # Xolo uses transactions for group changes.
+  xolo-db:
+    image: mongo:${XOLO_MONGO_IMAGE_TAG:-8-noble}
+    restart: unless-stopped
+    env_file: [./deploy/env/mongodb.env]
+    command: ["mongod", "--config", "/etc/mongo/mongod.conf"]
+    volumes:
+      - xolo-mongodb-data:/data/db
+      - ./deploy/xolo/mongod.conf:/etc/mongo/mongod.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+    networks: [axo-control-net]
+
+  xolo-db-init:
+    image: mongo:${XOLO_MONGO_IMAGE_TAG:-8-noble}
+    depends_on:
+      xolo-db:
+        condition: service_healthy
+    command:
+      - sh
+      - -ec
+      - |
+        mongosh --host xolo-db:27017 --quiet --eval '
+          try { rs.status() }
+          catch (error) { rs.initiate({_id: "xolo-rs", members: [{_id: 0, host: "xolo-db:27017"}]}) }
+          while (!db.hello().isWritablePrimary) { sleep(500) }
+        '
+    restart: "no"
+    networks: [axo-control-net]
+
+  xolo-cache:
+    image: redis:${XOLO_REDIS_IMAGE_TAG:-7.0.11-alpine}
+    restart: unless-stopped
+    env_file: [./deploy/env/redis.env]
+    command:
+      - sh
+      - -ec
+      - |
+        if [ -n "$${REDIS_REQUIREPASS}" ]; then
+          exec redis-server --appendonly "$${REDIS_APPENDONLY}" --save "$${REDIS_SAVE}" --requirepass "$${REDIS_REQUIREPASS}"
+        fi
+        exec redis-server --appendonly "$${REDIS_APPENDONLY}" --save "$${REDIS_SAVE}"
+    volumes:
+      - xolo-redis-data:/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "if [ -n \"$${REDIS_REQUIREPASS}\" ]; then redis-cli -a \"$${REDIS_REQUIREPASS}\" ping; else redis-cli ping; fi",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks: [axo-control-net]
+
+  xolo:
+    image: ${XOLO_IMAGE:-nachocode/xolo:api-0.1.0a8}
+    restart: unless-stopped
+    env_file: [./deploy/env/app.prod.env]
+    command:
+      - uvicorn
+      - xoloapi.server:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "10000"
+      - --proxy-headers
+      - --forwarded-allow-ips=*
+      - --log-level
+      - ${XOLO_UVICORN_LOG_LEVEL:-info}
+    ports:
+      - "127.0.0.1:${XOLO_API_PUBLIC_PORT:-10000}:10000"
+    volumes:
+      - xolo-data:/xolo
+      - xolo-logs:/app/log
+    depends_on:
+      xolo-db:
+        condition: service_healthy
+      xolo-db-init:
+        condition: service_completed_successfully
+      xolo-cache:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:10000/openapi.json', timeout=5).read()",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [axo-control-net]
+
+  # Xolo's admin UI (Platform Admin only); the browser calls the API at
+  # XOLO_UI_API_BASE, so its origin must be in XOLO_CORS_ALLOW_ORIGINS.
+  xolo-ui:
+    image: ${XOLO_UI_IMAGE:-nachocode/xolo:ui-0.1.0a8}
+    restart: unless-stopped
+    environment:
+      NUXT_PUBLIC_API_BASE: ${XOLO_UI_API_BASE:-http://localhost:10000/api/v4}
+      NUXT_PUBLIC_VERSION: ${XOLO_VERSION:-0.1.0a8}
+      HOST: 0.0.0.0
+      PORT: 3000
+    ports:
+      - "127.0.0.1:${XOLO_UI_PUBLIC_PORT:-3001}:3000"
+    depends_on:
+      xolo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://127.0.0.1:3000/"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks: [axo-control-net]
+
+  # --- images the Control Plane starts for each VE (built, never started) ----
+  axo-vem-image:
+    profiles: ["images"]
     build:
       context: .
       dockerfile: axo_vem/Dockerfile
     image: ${AXO_VEM_IMAGE:-axo-vem:local}
-    container_name: ${AXO_VEM_CONTAINER_NAME:-axo-vem}
-    hostname: axo-vem
-    restart: unless-stopped
-    env_file:
-      - ${AXO_VEM_ENV_FILE:-./deploy/env/axo.vem.prod.env}
-    ports:
-      - "${AXO_VEM_PUBLIC_PORT:-8080}:8080"   # HTTP only -- the ZMQ ingestion port (6000) stays internal to axo-net
-    depends_on:
-      - kurrentdb
-      - axo-vem-mongo
-      - axo-storage
-    networks:
-      - axo-net
-    volumes:
-      # Lets POST /endpoints launch new axo_endpoint node containers via the
-      # shared axo_shared.container.ContainerSpawner (see
-      # application/nodes/launch_endpoint_node.py). KNOWN LIMITATION: a
-      # newly-launched node only connects to whatever peer_addresses the
-      # caller supplies -- this does not reconfigure any already-running
-      # node's own AXO_ENDPOINT_SUB_CONNECT to include the new node back,
-      # so full bidirectional mesh membership after a dynamic launch is a
-      # manual (or future) follow-up step, not handled here.
-      - /var/run/docker.sock:/var/run/docker.sock:ro
-      # The Control Plane outbox (job attempts are billing records): kept
-      # across VEM restarts until the CP acks each one.
-      - axo-vem-outbox:/var/lib/axo_vem/outbox
 
-  xolo-db:
-    image: mongo:${XOLO_MONGO_IMAGE_TAG:-8-noble}
-    container_name: ${XOLO_MONGO_CONTAINER_NAME:-xolo-mongodb}
-    restart: unless-stopped
-    env_file:
-      - ${XOLO_MONGO_ENV_FILE:-./deploy/env/mongodb.env}
-    ports:
-      - "${XOLO_MONGODB_PUBLIC_PORT:-27018}:27017"
-    volumes:
-      - ${XOLO_MONGO_VOLUME_NAME:-xolo-mongodb-data}:/data/db
-    healthcheck:
-      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    networks:
-      - axo-net
+  axo-endpoint-image:
+    profiles: ["images"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${AXO_ENDPOINT_IMAGE:-axo-endpoint:local}
 
-  xolo-cache:
-    image: redis:${XOLO_REDIS_IMAGE_TAG:-7.0.11-alpine}
-    container_name: ${XOLO_REDIS_CONTAINER_NAME:-xolo-redis}
-    restart: unless-stopped
-    env_file:
-      - ${XOLO_REDIS_ENV_FILE:-./deploy/env/redis.env}
-    ports:
-      - "${XOLO_REDIS_PUBLIC_PORT:-6379}:6379"
-    volumes:
-      - ${XOLO_REDIS_VOLUME_NAME:-xolo-redis-data}:/data
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-    networks:
-      - axo-net
-
-  xolo:
-    image: ${XOLO_IMAGE:-xolo-api:latest}
-    container_name: ${XOLO_API_CONTAINER_NAME:-xolo-api}
-    restart: unless-stopped
-    env_file:
-      - ${XOLO_APP_ENV_FILE:-./deploy/env/app.prod.env}
-    ports:
-      - "${XOLO_API_PUBLIC_PORT:-10000}:${XOLO_PORT:-10000}"
-    volumes:
-      - ${XOLO_DATA_VOLUME_NAME:-xolo-data}:/xolo
-      - ${XOLO_LOG_VOLUME_NAME:-xolo-logs}:/app/log
-    command: >
-      uvicorn xoloapi.server:app
-      --host ${XOLO_HOST:-0.0.0.0}
-      --port ${XOLO_PORT:-10000}
-      --proxy-headers
-      --forwarded-allow-ips=*
-      --log-level ${XOLO_UVICORN_LOG_LEVEL:-info}
-    depends_on:
-      xolo-db:
-        condition: service_healthy
-      xolo-cache:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "python", "-c",
-             "import urllib.request; urllib.request.urlopen('http://localhost:${XOLO_PORT:-10000}/openapi.json')"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-    networks:
-      - axo-net
-
+  # An endpoint builds a runner image itself the first time a function asks
+  # for one; building it here saves that wait (tag = AXO_ENDPOINT_RUNNER_IMAGE
+  # :py<version>, matching the endpoint's own naming).
+  axo-runner-image:
+    profiles: ["images"]
+    build:
+      context: .
+      dockerfile: axo_endpoint/runner/Dockerfile
+      args:
+        PYTHON_VERSION: ${AXO_ENDPOINT_RUNNER_PYTHON_VERSION:-3.11}
+    image: ${AXO_ENDPOINT_RUNNER_IMAGE:-axo-runner}:py${AXO_ENDPOINT_RUNNER_PYTHON_VERSION:-3.11}
 
 networks:
-  axo-net:
-    name: ${AXO_NETWORK_NAME:-axo-net}
-    external: true
+  # The CP and every VEM (never the endpoints): its fixed name is what the
+  # CP attaches each VEM to.
+  axo-control-net:
+    name: axo-control-net
 
+# Fixed names, so the data outlives the compose project (and the Xolo
+# account the Control Plane's key belongs to is kept).
 volumes:
+  axo-cp-kurrentdb-data:
+    name: axo-cp-kurrentdb-data
+  axo-cp-mongo-data:
+    name: axo-cp-mongo-data
   axo-storage-data:
-    name: ${AXO_STORAGE_VOLUME_NAME:-axo-storage-data}
-  axo-kurrentdb-data:
-    name: ${AXO_KURRENTDB_VOLUME_NAME:-axo-kurrentdb-data}
-  axo-vem-mongo-data:
-    name: ${AXO_VEM_MONGO_VOLUME_NAME:-axo-vem-mongo-data}
-  axo-vem-outbox:
-    name: ${AXO_VEM_OUTBOX_VOLUME_NAME:-axo-vem-outbox}
+    name: axo-platform-storage-data
   xolo-mongodb-data:
-    name: ${XOLO_MONGO_VOLUME_NAME:-xolo-mongodb-data}
+    name: xolo-mongodb-data
   xolo-redis-data:
-    name: ${XOLO_REDIS_VOLUME_NAME:-xolo-redis-data}
-  xolo-logs:
-    name: ${XOLO_LOG_VOLUME_NAME:-xolo-logs}
+    name: xolo-redis-data
   xolo-data:
-    name: ${XOLO_DATA_VOLUME_NAME:-xolo-data}
+    name: xolo-data
+  xolo-logs:
+    name: xolo-logs

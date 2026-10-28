@@ -27,4 +27,7 @@ class FunctionRecord:
     state: FunctionState
     runtime_spec: Optional[RuntimeSpec] = None
     code_format: str = "cloudpickle"
+    # What the client computed over the code (axo.capture's code_hash): the
+    # VEM answers with this version instead of making a new one for the same code.
+    code_hash: Optional[str] = None
     params_schema: Optional[List[ParamSpec]] = None

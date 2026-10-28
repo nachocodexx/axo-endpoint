@@ -4,6 +4,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Optional
 
+from axo_shared.metrics import names as m
 from axo_shared.metrics import MetricRecord, StatSummary, rollup
 from axo_shared.metrics.timebins import freeze_dims
 
@@ -61,6 +62,14 @@ class MetricsStore:
             self._prune_locked()
         return len(added)
 
+    def add(self, records: List[MetricRecord]) -> int:
+        """Bins made inside the VEM itself (choreography runs), already shaped."""
+        if records:
+            with self._lock:
+                self._records.extend(records)
+                self._prune_locked()
+        return len(records)
+
     def _prune_locked(self) -> None:
         cutoff = self._now_fn() - self._keep
         if self._records and self._records[0].bin_start < cutoff:
@@ -88,14 +97,24 @@ class MetricsStore:
 
     def minute_summaries(self, before: float) -> List[MetricRecord]:
         """1-minute rollups of every complete minute that ended at or before
-        ``before`` (exact merges of the 10 s bins), endpoint dimension dropped
-        -- what the Control Plane receives."""
+        ``before`` (exact merges of the 10 s bins) -- what the Control Plane
+        receives. The endpoint stays a dimension (``endpoint``); the user /
+        API key (``principal``) is dropped: per-person figures come from the
+        job attempt records, never from bins (upgrade.md 13.5)."""
         with self._lock:
             records = [r for r in self._records if r.bin_start + r.width_s <= before]
-        without_component = [
-            MetricRecord(metric=r.metric, dims=freeze_dims({k: v for k, v in r.dims if k != "component"}),
+        reshaped = [
+            MetricRecord(metric=r.metric, dims=freeze_dims(_cp_dims(dict(r.dims))),
                          bin_start=r.bin_start, width_s=r.width_s, stats=r.stats)
             for r in records if 60 % r.width_s == 0
         ]
-        rolled = rollup(without_component, 60)
+        rolled = rollup(reshaped, 60)
         return rolled.unwrap() if rolled.is_ok else []
+
+
+def _cp_dims(dims: Dict[str, str]) -> Dict[str, str]:
+    component = dims.pop("component", "")
+    dims.pop(m.DIM_PRINCIPAL, None)
+    if component:
+        dims.setdefault(m.DIM_ENDPOINT, component)
+    return dims

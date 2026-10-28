@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -45,6 +45,8 @@ class FailureDetail(BaseModel):
     message: str
     traceback: Optional[str] = None
     is_transient: bool = False
+    # For an error the function's code raised: its Python type (KeyError, ...).
+    error_type: Optional[str] = None
 
     @classmethod
     def from_axo_error(
@@ -54,13 +56,17 @@ class FailureDetail(BaseModel):
         is_transient: bool = False,
         traceback: Optional[str] = None,
     ) -> "FailureDetail":
+        """The code's own traceback / Python type ride in the error's context
+        (axo_endpoint.core.runtime.failure)."""
+        context = getattr(err, "context", None) or {}
         return cls(
             error_class=err.name,
             error_code=err.code,
             component=component,
             message=err.message,
-            traceback=traceback,
+            traceback=traceback or context.get("traceback"),
             is_transient=is_transient,
+            error_type=context.get("error_type"),
         )
 
 
@@ -225,6 +231,9 @@ class FunctionRegistered(EventEnvelope):
     runtime_spec: Optional[Dict[str, Any]] = None
     params_schema: Optional[List[Dict[str, Any]]] = None
     owner_user_id: Optional[str] = None
+    # "source" or "cloudpickle", and the client's hash of the code (if sent).
+    code_format: Optional[str] = None
+    code_hash: Optional[str] = None
 
 
 class FunctionRegisterFailed(EventEnvelope):
@@ -300,7 +309,7 @@ class FunctionUpdated(EventEnvelope):
     function_id: str
     version: int
     params_schema: Optional[List[Dict[str, Any]]] = None
-    env_vars: Optional[Dict[str, str]] = None
+    env_vars: Optional[Dict[str, Optional[str]]] = None    # secret values are None
     # The whole current RuntimeSpec (e.g. a runner policy changed
     # max_concurrency) -- the VEM's read model replaces its copy with it.
     runtime_spec: Optional[Dict[str, Any]] = None
@@ -388,19 +397,44 @@ class JobStarted(EventEnvelope):
     function_id: str
     version: Optional[int] = None
     params: Optional[Dict[str, Any]] = None
+    attempt: int = 1
 
 
 class JobCompleted(EventEnvelope):
     job_id: str
     function_id: str
     duration_ms: Optional[float] = None
+    attempt: int = 1
 
 
 class JobFailed(EventEnvelope):
+    """The job's last attempt failed (no more attempts follow)."""
+
     job_id: str
     function_id: str
     failure: FailureDetail
     duration_ms: Optional[float] = None
+    attempt: int = 1
+
+
+# A person asked for it (VEM-made, for the Activity list): stop a job, or
+# try a finished one again (a new attempt of the same job).
+JOB_CANCEL_REQUESTED = "JobCancelRequested"
+JOB_RETRY_REQUESTED = "JobRetryRequested"
+
+
+class JobCancelRequested(EventEnvelope):
+    job_id: str
+    function_id: str
+    requested_by: str
+    attempt: int = 1
+
+
+class JobRetryRequested(EventEnvelope):
+    job_id: str
+    function_id: str
+    requested_by: str
+    attempt: int                       # the new attempt's number
 
 
 # ── Job attempt usage (metering / billing) ──────────────────────────────────
@@ -420,7 +454,29 @@ def is_billable(outcome: str) -> bool:
     return outcome in BILLABLE_OUTCOMES
 
 
+JobAttemptReason = Literal["first", "platform_failed", "code_failed", "manual"]
+
+
+class FileWritten(BaseModel):
+    """One file a job's attempt wrote to a bucket (dataio.write / write_chunks)."""
+
+    model_config = {"frozen": True}
+
+    bucket: str
+    name: str
+    version: Optional[int] = None
+    size: int = 0
+    format: Optional[str] = None
+
+
 class JobAttemptRecorded(EventEnvelope):
+    """One attempt of a job -- the billing record, and what the job page
+    shows for it. ``reason`` = why it started (the first run, the platform
+    failed, the code failed and max_attempts allows another, or a person
+    retried it: ``retried_by``); ``retry_at`` = when the next attempt starts
+    (None = this was the last); ``failure`` = what went wrong (its traceback
+    is kept by the VEM, never sent to the Control Plane)."""
+
     job_id: str
     attempt: int
     trace_id: str
@@ -446,10 +502,123 @@ class JobAttemptRecorded(EventEnvelope):
     bytes_written: Dict[str, int] = Field(default_factory=dict)
     cache_hits: int = 0
     cache_misses: int = 0
+    # An active object call: function_id / function_version are then the
+    # object's class name and class version.
+    object_id: Optional[str] = None
+    object_method: Optional[str] = None
+    # A choreography step's job: which run, step and version (step costs).
+    choreography_run_id: Optional[str] = None
+    choreography_step: Optional[str] = None
+    choreography_version: Optional[int] = None
+    # A run another choreography's step called: the calling runs, outermost
+    # first ({choreography_id, run_id, step}) -- the outer run's costs include it.
+    choreography_calls: List[Dict[str, Any]] = Field(default_factory=list)
+    reason: JobAttemptReason = "first"
+    retried_by: Optional[str] = None
+    max_attempts: int = 1
+    failure: Optional[FailureDetail] = None
+    retry_at: Optional[datetime] = None
+    files_written: List[FileWritten] = Field(default_factory=list)
 
     @property
     def billable(self) -> bool:
         return is_billable(self.outcome)
+
+
+# ── Active objects ──────────────────────────────────────────────────────────
+# History of each object (who created it, every call and what it changed).
+# Calls are billed through JobAttemptRecorded (object_id set); stored state
+# through ActiveObjectStateSizesReported.
+ACTIVE_OBJECT_CLASS_REGISTERED = "ActiveObjectClassRegistered"
+ACTIVE_OBJECT_CLASS_VERSION_DELETED = "ActiveObjectClassVersionDeleted"
+ACTIVE_OBJECT_CREATED = "ActiveObjectCreated"
+ACTIVE_OBJECT_CALLED = "ActiveObjectCalled"
+ACTIVE_OBJECT_UPGRADED = "ActiveObjectUpgraded"
+ACTIVE_OBJECT_DELETED = "ActiveObjectDeleted"
+ACTIVE_OBJECT_STATE_SIZES_REPORTED = "ActiveObjectStateSizesReported"
+OBJECT_STATE_HOUR_REPORTED = "ObjectStateHourReported"
+
+
+class ActiveObjectClassRegistered(EventEnvelope):
+    """A new version of an Axo class (its code changed). ``methods`` are the
+    callable ones, as axo_shared.active_objects.MethodInfo dicts."""
+
+    class_name: str
+    version: int
+    code_hash: str
+    methods: List[Dict[str, Any]] = Field(default_factory=list)
+    has_upgrade: bool = False
+    # The class's registration on the endpoints (it runs as a function with
+    # call_style "object") and how it runs (RuntimeSpec.to_dict()).
+    function_id: Optional[str] = None
+    runtime_spec: Optional[Dict[str, Any]] = None
+    # Read from the source when there is one (axo_shared.active_objects.source):
+    # ``__init__``'s parameters (the "New object" form) and the docstring's first line.
+    init: Optional[Dict[str, Any]] = None
+    description: Optional[str] = None
+
+
+class ActiveObjectClassVersionDeleted(EventEnvelope):
+    """A class version no object used was deleted (its code too)."""
+
+    class_name: str
+    version: int
+
+
+class ActiveObjectCreated(EventEnvelope):
+    object_id: str
+    name: str
+    class_name: str
+    class_version: int
+    created_by: Optional[str] = None
+    cloned_from: Optional[str] = None
+
+
+class ActiveObjectCalled(EventEnvelope):
+    """One finished call. ``revision`` is the state after it (the same as
+    before when it failed or changed nothing); ``changed`` / ``deleted`` name
+    the attributes it saved."""
+
+    object_id: str
+    job_id: str
+    trace_id: str
+    method: str
+    class_version: int
+    outcome: JobAttemptOutcome
+    revision: int
+    changed: List[str] = Field(default_factory=list)
+    deleted: List[str] = Field(default_factory=list)
+    size_bytes: int = 0
+    duration_ms: Optional[float] = None
+    failure: Optional[FailureDetail] = None
+
+
+class ActiveObjectUpgraded(EventEnvelope):
+    object_id: str
+    from_version: int
+    to_version: int
+    revision: int
+
+
+class ActiveObjectDeleted(EventEnvelope):
+    object_id: str
+
+
+class ActiveObjectStateSizesReported(EventEnvelope):
+    """Sent hourly per VE: bytes of object state in use, each shared value
+    counted once (billed), and each object's own size (shown)."""
+
+    stored_bytes: int
+    objects: Dict[str, int] = Field(default_factory=dict)
+
+
+class ObjectStateHourReported(EventEnvelope):
+    """VEM -> CP, once per finished hour: the VE's object state size then
+    (the latest the endpoints reported), billed as GB-months on the VE's
+    bill. ``hour_start`` = the hour's start (epoch seconds, UTC)."""
+
+    hour_start: float
+    stored_bytes: int
 
 
 # ── Data & buckets ───────────────────────────────────────────────────────────
@@ -631,84 +800,321 @@ class VirtualEnvironmentLeaderChanged(EventEnvelope):
     leader_endpoint_id: str
 
 
-# ── Choreography (function/bucket workflow graphs) ──────────────────────────
-# Persistence-only -- a Choreography's *run* telemetry is pushed live over a
-# WS channel, not event-sourced, so there are no run-lifecycle events here.
+# ── Choreography (reusable workflow blueprints) ─────────────────────────────
+# A choreography is a DAG of process steps (a function, a method of an
+# existing active object, or another choreography -- a call: it starts a
+# linked run of that one) and storage steps (buckets). Its definition is
+# event-sourced (every edit = a new version); a *run* is a plain record the
+# VEM keeps up to date (step by step) -- only its start and end are events.
 CHOREOGRAPHY_CREATED = "ChoreographyCreated"
 CHOREOGRAPHY_UPDATED = "ChoreographyUpdated"
 CHOREOGRAPHY_DELETED = "ChoreographyDeleted"
+CHOREOGRAPHY_TRIGGER_ADDED = "ChoreographyTriggerAdded"
+CHOREOGRAPHY_TRIGGER_REMOVED = "ChoreographyTriggerRemoved"
+CHOREOGRAPHY_RUN_STARTED = "ChoreographyRunStarted"
+CHOREOGRAPHY_RUN_FINISHED = "ChoreographyRunFinished"
+
+ChoreographyNodeKind = Literal["function", "object", "choreography", "bucket"]
+RetryBackoff = Literal["fixed", "exponential"]
+MergeStrategy = Literal["priority", "from", "random", "first_finished", "last_finished", "collect", "reduce",
+                        "none"]
+MergeReducer = Literal["sum", "min", "max", "concat", "all_equal"]
+# The ``merge`` key that sets the rule for every parameter of a step.
+MERGE_ALL = "*"
 
 
-class ChoreographyNode(BaseModel):
-    """One node on the design canvas: a registered function invocation or a
-    bucket reference. kind-specific fields are optional and only meaningful
-    for the matching kind (same "one shape, optional extra fields" approach
-    IORef uses for its chunk-aware ops)."""
+class ParamMerge(BaseModel):
+    """How a step picks a parameter's value when several previous steps
+    send it (fixed when the choreography is saved):
+
+    - ``priority``: the first step of ``order`` that sent it (default
+      ``order`` = the order the steps were connected);
+    - ``from``: only ``source``, even when others send it too;
+    - ``random``: any of them; the same one every retry / resume of a run;
+    - ``first_finished`` / ``last_finished``: by when they finished (can
+      change from run to run);
+    - ``collect``: every value, ``{step: value}`` (``as_list``: a list in
+      ``order``);
+    - ``reduce``: one value made with ``reducer`` (``all_equal`` fails the
+      step when they differ);
+    - ``none``: not taken from previous steps (still in the event)."""
 
     model_config = {"frozen": True}
 
-    node_id: str
-    kind: Literal["function", "bucket"]
-    position: Dict[str, float]  # {"x": ..., "y": ...} -- vue-flow layout only, not semantic
-    # kind == "function"
+    strategy: MergeStrategy = "priority"
+    order: Optional[List[str]] = None
+    source: Optional[str] = None
+    reducer: Optional[MergeReducer] = None
+    as_list: bool = False
+
+
+class ChoreographyNode(BaseModel):
+    """One step. The same function or object may appear in several steps
+    (each its own ``node_id``). Fields only mean something for their kind.
+
+    Process steps (``function`` / ``object``) get the event of the steps
+    before them; when a previous output is a JSON object its keys fill the
+    step's parameters by name. Priority: ``params`` (set on the step) >
+    the previous output (``merge``: how a parameter is picked when several
+    send it, per parameter or ``"*"`` for all; ``priority`` by default) > the
+    function's own default."""
+
+    model_config = {"frozen": True}
+
+    node_id: str = Field(pattern=r"^[A-Za-z0-9_-]{1,40}$")
+    kind: ChoreographyNodeKind
+    label: Optional[str] = None
+    position: Dict[str, float] = Field(default_factory=dict)   # canvas layout only
+    # kind == "function" (version None = the newest one when the step runs)
     function_id: Optional[str] = None
     function_version: Optional[int] = None
-    # Display-only, captured at design time -- not looked up again, so it can
-    # go stale if the function is later renamed. function_id stays the key.
-    function_name: Optional[str] = None
-    max_retries: int = 3
-    retry_policy: Literal["constant", "exponential_backoff", "jitter"] = "constant"
+    function_name: Optional[str] = None          # display only
+    # kind == "object": an existing object of this VE (it must exist)
+    object_name: Optional[str] = None
+    method: Optional[str] = None                 # None = "run"
+    # kind == "choreography": a call -- a run of that choreography, linked to
+    # this run (its inputs = that choreography's run inputs, its answer =
+    # that run's answer). Version None = the newest when this run starts.
+    choreography_id: Optional[str] = None
+    choreography_version: Optional[int] = None
+    choreography_name: Optional[str] = None      # display only
+    # process steps
+    params: Dict[str, Any] = Field(default_factory=dict)
+    merge: Dict[str, ParamMerge] = Field(default_factory=dict)    # param (or "*") -> how it's picked
+    # "all": runs only when every previous step finished well; "arrived":
+    # runs with what arrived once the others are done, if at least one did.
+    join: Literal["all", "arrived"] = "all"
+    # A step = one job; its attempts like any job's (every try, the first
+    # included). None = the function's own default.
+    max_attempts: Optional[int] = Field(default=None, ge=1, le=10)
+    retry_delay_seconds: Optional[float] = Field(default=None, ge=0, le=3600)
+    retry_backoff: Optional[RetryBackoff] = None
+    timeout_seconds: Optional[float] = Field(default=None, gt=0)
+    max_wait: Optional[float] = None
+    # files coming from a bucket step: "per_file" = one call per file (at most
+    # ``parallelism`` at once; output = the list of what worked, a failed
+    # file makes the step completed_with_errors); "all_at_once" = one call,
+    # ``data`` = the list of every file
+    files_mode: Literal["per_file", "all_at_once"] = "per_file"
+    parallelism: int = Field(default=4, ge=1, le=100)
     # kind == "bucket"
     bucket_name: Optional[str] = None
-    # Items chosen at design time to feed a bucket_to_fn edge, e.g.
-    # [{"name": "...", "version": 1}, ...]; empty/omitted means "all items".
+    # where a previous step's output is saved; {choreography} {run_id} {step}
+    # {source} {item} {date} are filled in
+    key_pattern: Optional[str] = None
+    # files a run started by hand reads from this bucket ([{"name", "version"?}]);
+    # empty = every file in it
     selected_items: Optional[List[Dict[str, Any]]] = None
+    # after a step: also save that step's JSON result as a file (besides the
+    # files its job wrote into the bucket during the run, always passed on)
+    save_result: bool = True
+
+
+ConditionOp = Literal["==", "!=", ">", ">=", "<", "<=", "in", "not_in", "contains", "not_contains",
+                      "exists", "not_exists", "is_true", "is_false", "is_empty", "not_empty"]
+
+
+class ConditionRule(BaseModel):
+    """One comparison on the previous step's output: ``field`` is a path in
+    it (``rows``, ``stats.count``, ``items.0``; empty = the whole output)."""
+
+    model_config = {"frozen": True}
+
+    field: str = ""
+    op: ConditionOp
+    value: Any = None
+
+
+class EdgeCondition(BaseModel):
+    """Rules joined by ``match``: ``all`` (and) or ``any`` (or); a rule can
+    be a group itself."""
+
+    model_config = {"frozen": True}
+
+    match: Literal["all", "any"] = "all"
+    rules: List[Union[ConditionRule, "EdgeCondition"]] = Field(min_length=1)
+
+
+EdgeCondition.model_rebuild()
 
 
 class ChoreographyEdge(BaseModel):
-    """One connection between two nodes. kind is stored explicitly (derived
-    once at design time from the pair of node kinds it joins) so the
-    orchestrator never has to re-derive it by joining back to the node list."""
+    """``source`` sends to ``target``: its event (process → process), its
+    output to be saved (process → bucket) or a file as ``data`` (bucket →
+    process). Bucket → bucket (replication) is not available yet.
+
+    ``condition``: the arrow is followed only when the source's output
+    matches; ``otherwise``: followed only when none of the source's arrows
+    with a condition was. A step no followed arrow reaches is ``not_taken``
+    (and so are the ones after it, unless another arrow reaches them).
+
+    ``on_failure``: followed only when the source FAILS (or, run once per
+    file, some of its files failed): the target gets the error in its event
+    instead of an output, the source's other arrows are broken, and the
+    failure counts as handled (it doesn't stop a run that stops at its
+    first error). Never with a condition, never out of or into a bucket."""
 
     model_config = {"frozen": True}
 
     edge_id: str
     source_node_id: str
     target_node_id: str
-    kind: Literal["fn_to_fn", "fn_to_bucket", "bucket_to_fn"]
-    # kind == "fn_to_fn": which of target's declared params receives source's whole result.
-    target_param: Optional[str] = None
-    # kind == "bucket_to_fn": how many bucket items to process concurrently,
-    # hard-capped at the target function's max_concurrency at validation/run time.
-    parallelism: int = 1
+    condition: Optional[EdgeCondition] = None
+    otherwise: bool = False
+    on_failure: bool = False
+
+
+# Built-in event types (people's own types can't start with these words).
+FILE_WRITTEN = "file.written"
+RESERVED_EVENT_PREFIXES = ("file.", "schedule.", "run.", "axo.")
+
+
+class ChoreographyTrigger(BaseModel):
+    """"Start when ...": an event of ``event_type`` starts a run of the
+    newest version, acting for ``created_by`` (who added the trigger; set by
+    the VEM when the version is saved). ``file.written``: a new file in
+    ``bucket`` whose name starts with ``prefix`` (the starting bucket step
+    of that bucket reads it). Any other type: an event someone sent
+    (``client.emit`` / ``POST /events``); its ``data`` fields reach the
+    first steps' parameters by name, the whole event is ``ctx.event``.
+    ``condition``: rules on the event's ``data`` (like an arrow's).
+    ``targets``: the steps it is drawn connected to."""
+
+    model_config = {"frozen": True}
+
+    trigger_id: str = ""                     # empty = the VEM gives one (the same trigger keeps it)
+    event_type: str = FILE_WRITTEN
+    bucket: Optional[str] = None
+    prefix: Optional[str] = None
+    condition: Optional[EdgeCondition] = None
+    targets: List[str] = Field(default_factory=list)
+    created_by: Optional[str] = None
+    created_at: Optional[str] = None
 
 
 class ChoreographyGraph(BaseModel):
+    """The steps, the arrows, and the triggers that start it -- all saved
+    with each version (only the newest version's triggers are active)."""
+
     model_config = {"frozen": True}
 
     nodes: List[ChoreographyNode] = Field(default_factory=list)
     edges: List[ChoreographyEdge] = Field(default_factory=list)
+    triggers: List[ChoreographyTrigger] = Field(default_factory=list)
+
+
+class ChoreographySettings(BaseModel):
+    """How many runs may go at once (more wait in line, up to
+    ``queue_limit``), and whether a run may end ``completed_with_errors``:
+    on (default), a failed file or branch doesn't stop the rest; off, the
+    first error fails the whole run (what's running is stopped)."""
+
+    model_config = {"frozen": True}
+
+    max_parallel_runs: int = Field(default=10, ge=1, le=1000)
+    queue_limit: int = Field(default=1000, ge=0, le=100000)
+    allow_completed_with_errors: bool = True
+    # How long its steps' answers (= their jobs' results) are kept: 1h / 1d /
+    # 7d / 30d / 90d / 1y / never; None = the VE's default. A run can be
+    # resumed while the answers it needs are kept.
+    keep_results: Optional[Literal["1h", "1d", "7d", "30d", "90d", "1y", "never"]] = None
+    # When another choreography calls this one: the last step whose answer is
+    # the call's answer (None: the only last step's; with several, every last
+    # step's answer by step).
+    answer_step: Optional[str] = None
 
 
 class ChoreographyCreated(EventEnvelope):
     choreography_id: str
     name: str
-    owner_user_id: str
+    description: Optional[str] = None
+    owner_user_id: str                       # who created it
+    version: int = 1
     graph: ChoreographyGraph
+    settings: ChoreographySettings = Field(default_factory=ChoreographySettings)
 
 
 class ChoreographyUpdated(EventEnvelope):
+    """A new version (the graph, the name or the settings changed)."""
+
     choreography_id: str
     name: str
+    description: Optional[str] = None
+    version: int
     graph: ChoreographyGraph
+    settings: ChoreographySettings = Field(default_factory=ChoreographySettings)
 
 
 class ChoreographyDeleted(EventEnvelope):
     choreography_id: str
 
 
+class ChoreographyTriggerAdded(EventEnvelope):
+    """``bucket_object_written``: every new file in ``bucket`` (whose name
+    starts with ``prefix``) starts a run as ``user_id`` (who added it), with
+    the newest version unless ``version`` is pinned."""
+
+    choreography_id: str
+    trigger_id: str
+    kind: Literal["bucket_object_written"] = "bucket_object_written"
+    bucket: str
+    prefix: Optional[str] = None
+    version: Optional[int] = None
+
+
+class ChoreographyTriggerRemoved(EventEnvelope):
+    choreography_id: str
+    trigger_id: str
+
+
+class ChoreographyRunStarted(EventEnvelope):
+    """``user_id`` = who the run acts for."""
+
+    choreography_id: str
+    choreography_name: str
+    run_id: str
+    version: int
+    started_by_type: Literal["user", "trigger", "choreography"]
+    started_by_id: Optional[str] = None          # choreography: the run that called it
+    resumed: bool = False
+    parent_run_id: Optional[str] = None          # called by a step of that run
+    parent_step: Optional[str] = None
+
+
+class ChoreographyRunFinished(EventEnvelope):
+    """status: completed | completed_with_errors | failed | cancelled."""
+
+    choreography_id: str
+    choreography_name: str
+    run_id: str
+    version: int
+    status: str
+    duration_ms: Optional[float] = None
+    steps_completed: int = 0
+    steps_failed: int = 0
+    steps_skipped: int = 0
+
+
 # ── VE settings (inside one VE's own VEM) ───────────────────────────────────
 VE_SETTINGS_CHANGED = "VirtualEnvironmentSettingsChanged"
+RESULT_VISIBILITY_CHANGED = "ResultVisibilityChanged"
+
+
+class ResultVisibilityChanged(EventEnvelope):
+    """Who sees a function's / choreography's / object's runs and results
+    changed: ``runner`` (only who runs it), ``ve`` (everyone in the VE) or
+    ``teams`` (the team ids listed). It applies at once, outside versions."""
+
+    kind: Literal["function", "choreography", "object"]
+    ref: str
+    name: Optional[str] = None
+    mode: Literal["runner", "ve", "teams"]
+    teams: List[str] = Field(default_factory=list)
+    previous_mode: Optional[str] = None
+    previous_teams: List[str] = Field(default_factory=list)
+    function_id: Optional[str] = None
+    choreography_id: Optional[str] = None
+    object_name: Optional[str] = None
 
 
 class VirtualEnvironmentSettingsChanged(EventEnvelope):
@@ -733,6 +1139,20 @@ class VirtualEnvironmentLifecycleChanged(EventEnvelope):
 
     lifecycle: VeLifecycle
     reason: Optional[str] = None
+
+
+VE_REPAIRED = "VirtualEnvironmentRepaired"
+
+
+class VirtualEnvironmentRepaired(EventEnvelope):
+    """The Control Plane's Repair ran (asked by someone, or on its own after
+    the VE was Unavailable a while): each check it made and what it did,
+    then which failed endpoints the VEM tried again."""
+
+    by: Optional[str] = None
+    automatic: bool = False
+    steps: List[Dict[str, Any]] = Field(default_factory=list)
+    retried_endpoints: List[str] = Field(default_factory=list)
 
 
 # ── Scaling policies (inside one VE's own VEM) ──────────────────────────────
@@ -779,6 +1199,7 @@ ENDPOINT_LIFECYCLE_CHANGED = "EndpointLifecycleChanged"
 
 EndpointLifecycleState = Literal[
     "creating", "starting", "running", "sleeping", "draining", "removing", "removed", "stopped", "failed",
+    "forgotten",   # a removed / failed one cleared from the list: it leaves the fleet
 ]
 
 
@@ -821,6 +1242,10 @@ class VirtualEnvironmentHeartbeat(EventEnvelope):
     outbox_pending: int = 0
     vem_version: Optional[str] = None
     endpoint_version: Optional[str] = None
+    # The buckets this VE's choreography triggers watch, each with who added
+    # the trigger ({"bucket", "created_by"}): the CP sends a new file in one
+    # of them on as POST /bucket-events, if that person may read it.
+    triggers: List[Dict[str, str]] = Field(default_factory=list)
 
 
 class MetricSummary(BaseModel):
@@ -843,3 +1268,6 @@ class MetricSummaryReported(EventEnvelope):
     bin_start: float
     bin_width_s: int
     summaries: List[MetricSummary] = Field(default_factory=list)
+    # Which sender process this is from: a bin sent early (its component was
+    # stopping) and again by the restarted one arrives as two parts, both kept.
+    part: Optional[str] = None

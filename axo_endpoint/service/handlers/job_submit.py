@@ -20,10 +20,15 @@ from axo_endpoint.core.functions import FunctionRegistry
 from axo_endpoint.core.functions.params_validation import validate_and_fill_params
 from axo_shared.protocol import Command, CommandHandler, CommandResult
 from axo_endpoint.core.results import FunctionResult, is_json_safe_value
-from axo_endpoint.core.runtime import OUTPUT_BUCKETS_PARAM, FunctionRuntime, FunctionRuntimeError, InvocationHandle, split_output_buckets
+from axo_endpoint.core.runtime import (
+    EVENT_PARAM, OUTPUT_BUCKETS_PARAM, FunctionRuntime, FunctionRuntimeError, InvocationHandle, split_event,
+    split_output_buckets,
+)
 from axo_endpoint.core.runtime.queue_deadlines import QueueDeadlines, WAIT_FOREVER, parse_max_wait
 from axo_endpoint.core.storage.backend import StorageBackend, StorageKey
-from axo_endpoint.core.usage import JobUsageContext, classify_outcome
+from axo_endpoint.core.runtime.attempts import AttemptPolicy, JobAttempts
+from axo_endpoint.core.usage import JobUsageContext, classify_outcome, failure_of
+from axo_shared.runtime.spec import RuntimeSpecError, check_attempts
 from axo_endpoint.log import DumbLogger, Log
 from axo_endpoint.log.catalog import Component, Event
 
@@ -41,6 +46,7 @@ def build_completion_recorder(
     now_fn: Callable[[], float] = time.time,
     logger: _Logger = None,
     replicate_fn: "Optional[Callable[[FunctionResult], None]]" = None,
+    attempt_of: Optional[Callable[[str], Optional[int]]] = None,
 ) -> Callable[[InvocationHandle, "Result[Any, FunctionRuntimeError]", Optional[List[str]]], None]:
     """Creates a function that saves a job's final result and announces that
     it finished. ``replicate_fn``, if given, is called once after the local
@@ -81,6 +87,7 @@ def build_completion_recorder(
             )
             event_type = "JOB_COMPLETED"
             billing_outcome = classify_outcome(None)
+            failure = None
             _logger.info_event(
                 Event.Job.COMPLETED,
                 component=Component.HANDLER_JOB_SUBMIT,
@@ -91,6 +98,7 @@ def build_completion_recorder(
         else:
             err_msg = str(outcome.unwrap_err())
             billing_outcome = classify_outcome(outcome.unwrap_err())
+            failure = failure_of(outcome.unwrap_err())
             result = FunctionResult(
                 job_id=handle.job_id, ok=False, error=err_msg,
                 duration_ms=duration_ms, warnings=warnings,
@@ -117,6 +125,10 @@ def build_completion_recorder(
                     "outcome": billing_outcome,
                     "started_at": handle.started_at,
                     "finished_at": now,
+                    # What went wrong (FailureDetail dict: name, code, message,
+                    # the code's Python type and traceback), for the VEM.
+                    "failure": failure,
+                    "attempt": (attempt_of(handle.job_id) if attempt_of is not None else None) or 1,
                 },
                 timestamp=now,
             )
@@ -143,8 +155,15 @@ def submit_job(
     logger: _Logger = None,
     queue_deadlines: Optional[QueueDeadlines] = None,
     default_max_wait_s: float = WAIT_FOREVER,
+    attempts: Optional[JobAttempts] = None,
 ) -> CommandResult:
     """Validates, records, and invokes one job under the given job_id.
+
+    Its attempts (``max_attempts``, ``retry_delay_seconds``,
+    ``retry_backoff`` -- the envelope's, else the function's own) are
+    handed to ``attempts``, which tries a failed attempt again under the
+    same id. ``attempt`` / ``retried_by`` = a person's retry of a finished
+    job (the VEM numbers it).
 
     ``max_wait`` (envelope, seconds; else ``default_max_wait_s``) bounds how
     long the job may wait for a free runner -- see QueueDeadlines. A
@@ -184,6 +203,9 @@ def submit_job(
     # brings params that already carry it.
     params, output_buckets = split_output_buckets(command.envelope.get("params", {}))
     output_buckets = list(command.envelope.get("output_buckets") or output_buckets)
+    # The choreography event rides the same way (ctx.event / self.event).
+    params, event = split_event(params)
+    event = command.envelope.get("event", event)
     function_ref = StorageKey(id=function_id, version=version, alias=function_id)
 
     lookup_result = function_registry.get(function_ref)
@@ -205,6 +227,21 @@ def submit_job(
         params = validated.unwrap()
     if output_buckets:
         params = {**params, OUTPUT_BUCKETS_PARAM: [str(b) for b in output_buckets]}
+    if event is not None:
+        params = {**params, EVENT_PARAM: event}
+
+    policy = _attempt_policy(command.envelope, record)
+    if isinstance(policy, InvalidFieldError):
+        _logger.info_event(
+            Event.Job.SUBMITTED,
+            component=Component.HANDLER_JOB_SUBMIT,
+            status="error",
+            function_name=name,
+            function_version=version,
+            duration_ms=round((time.monotonic() - t0) * 1000, 2),
+            **policy.to_dict(),
+        )
+        return CommandResult.from_error(policy)
 
     max_wait_s = parse_max_wait(command.envelope.get("max_wait"), default_max_wait_s)
     if max_wait_s is None:
@@ -225,7 +262,8 @@ def submit_job(
 
     submitted_at = now_fn()
     usage = JobUsageContext.from_envelope(
-        {**command.envelope, "function_id": function_ref.id, "function_version": version}, job_id, submitted_at,
+        {**command.envelope, "function_id": function_ref.id, "function_version": version,
+         "max_attempts": policy.max_attempts}, job_id, submitted_at,
         max_wait_s=max_wait_s,
     )
     results.put(StorageKey(id=job_id), FunctionResult(job_id=job_id, ok=False, error=PENDING))
@@ -243,10 +281,14 @@ def submit_job(
 
     if queue_deadlines is not None:
         queue_deadlines.set(job_id, usage.max_wait_s, usage.received_at)
+    if attempts is not None:
+        attempts.begin(job_id, function_ref, params, policy, attempt=usage.attempt, max_wait_s=usage.max_wait_s)
     invoke_result = runtime.invoke(function_ref, job_id, params)
     if invoke_result.is_err:
         if queue_deadlines is not None:
             queue_deadlines.discard(job_id)
+        if attempts is not None:
+            attempts.forget(job_id)
         raw = invoke_result.unwrap_err()
         err = InvocationError(str(raw), context={"job_id": job_id, "function_name": name, "version": version})
         results.put(StorageKey(id=job_id), FunctionResult(job_id=job_id, ok=False, error=err.message))
@@ -275,6 +317,22 @@ def submit_job(
     return CommandResult(ok=True, metadata={"job_id": job_id, "status": "QUEUED"})
 
 
+def _attempt_policy(envelope: Dict[str, Any], record: Any) -> "Union[AttemptPolicy, InvalidFieldError]":
+    """The job's own values, else its function's; a person's retry
+    (``retried_by``) is one attempt -- only the platform's own failures are
+    tried again for it."""
+    spec = record.runtime_spec if record is not None else None
+    max_attempts = 1 if envelope.get("retried_by") else envelope.get("max_attempts",
+                                                                       spec.max_attempts if spec else 1)
+    delay = envelope.get("retry_delay_seconds", spec.retry_delay_seconds if spec else 1.0)
+    backoff = envelope.get("retry_backoff", spec.retry_backoff if spec else "fixed")
+    try:
+        check_attempts(int(max_attempts), float(delay), str(backoff))
+    except (RuntimeSpecError, TypeError, ValueError) as exc:
+        return InvalidFieldError(str(exc), context={"field": "max_attempts"})
+    return AttemptPolicy(max_attempts=int(max_attempts), retry_delay_seconds=float(delay), retry_backoff=str(backoff))
+
+
 class JobSubmitHandler(CommandHandler):
     """Accepts a job to run and returns a job id right away, before it finishes."""
 
@@ -290,8 +348,10 @@ class JobSubmitHandler(CommandHandler):
         queue_deadlines: Optional[QueueDeadlines] = None,
         default_max_wait_s: float = WAIT_FOREVER,
         is_draining: Optional[Callable[[], bool]] = None,
+        attempts: Optional[JobAttempts] = None,
     ) -> None:
         self._runtime = runtime
+        self._attempts = attempts
         self._is_draining = is_draining
         self._queue_deadlines = queue_deadlines
         self._default_max_wait_s = default_max_wait_s
@@ -307,7 +367,9 @@ class JobSubmitHandler(CommandHandler):
 
         A caller may bring its own ``job_id`` (the Control Plane does, for a
         job it accepted while the VE was asleep, so the id the person already
-        got stays the same). Sending the same id twice runs the job once."""
+        got stays the same). Sending the same id twice runs the job once --
+        unless it's a person's retry (``retried_by``) of a job that has
+        finished: that runs it again, as its next attempt."""
         if self._is_draining is not None and self._is_draining():
             return CommandResult.from_error(EndpointDrainingError("endpoint is draining; send the job elsewhere"))
         requested = command.envelope.get("job_id")
@@ -315,9 +377,12 @@ class JobSubmitHandler(CommandHandler):
             if not isinstance(requested, str) or not _JOB_ID_RE.match(requested):
                 return CommandResult.from_error(InvalidFieldError(
                     "job_id must be 8-64 letters, digits, '-' or '_'", context={"job_id": str(requested)[:80]}))
-            existing = self._results.exists(StorageKey(id=requested))
-            if existing.is_ok and existing.unwrap():
-                return CommandResult(ok=True, metadata={"job_id": requested, "status": "DUPLICATE"})
+            existing = self._results.get(StorageKey(id=requested))
+            current = existing.unwrap() if existing.is_ok else None
+            if current is not None:
+                still_going = not current.ok and current.error == PENDING
+                if still_going or not command.envelope.get("retried_by"):
+                    return CommandResult(ok=True, metadata={"job_id": requested, "status": "DUPLICATE"})
         return submit_job(
             command,
             requested or self._job_id_fn(),
@@ -329,4 +394,5 @@ class JobSubmitHandler(CommandHandler):
             self._logger,
             self._queue_deadlines,
             self._default_max_wait_s,
+            self._attempts,
         )

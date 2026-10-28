@@ -9,12 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from axo_vem.infrastructure.auth.service_token import ActingUser
 
-from axo_vem.application.choreography.cancel_choreography_run import CancelChoreographyRunUseCase
-from axo_vem.application.choreography.create_choreography import CreateChoreographyUseCase
-from axo_vem.application.choreography.delete_choreography import DeleteChoreographyUseCase
 from axo_vem.application.choreography.purge_choreography import PurgeChoreographyUseCase
-from axo_vem.application.choreography.run_choreography import RunChoreographyUseCase
-from axo_vem.application.choreography.update_choreography import UpdateChoreographyUseCase
 from axo_vem.application.compute.delete_function import DeleteFunctionUseCase
 from axo_vem.application.compute.purge_function_version import PurgeFunctionVersionUseCase
 from axo_vem.application.compute.register_function import RegisterFunctionUseCase
@@ -23,15 +18,15 @@ from axo_vem.application.compute.update_function import UpdateFunctionUseCase
 from axo_vem.application.virtual_environment.reconciler import Reconciler
 from axo_vem.application.virtual_environment.settings_service import VeSettingsService
 from axo_vem.application.nodes.purge_endpoint import PurgeEndpointUseCase
-from axo_vem.domain.choreography.repository import ChoreographyRepository
-from axo_vem.domain.choreography.run_repository import ChoreographyRunRepository
 from axo_vem.domain.events.stream_admin import StreamAdmin
 from axo_vem.domain.execution.repository import JobRepository
 from axo_vem.infrastructure.database.kurrent.reader import KurrentReader
 from axo_vem.infrastructure.database.mongo.activity_repository import MongoActivityRepository
 from axo_vem.infrastructure.database.mongo.collections import ReadCollections
 from axo_vem.infrastructure.transport.api.controllers import choreographies as choreographies_routes
+from axo_vem.infrastructure.transport.api.controllers import objects as objects_routes
 from axo_vem.infrastructure.transport.api.controllers import consensus as consensus_routes
+from axo_vem.infrastructure.transport.api.controllers import custom_events as custom_events_routes
 from axo_vem.infrastructure.transport.api.controllers import endpoints as endpoints_routes
 from axo_vem.infrastructure.transport.api.controllers import events as events_routes
 from axo_vem.infrastructure.transport.api.controllers import functions as functions_routes
@@ -39,6 +34,7 @@ from axo_vem.infrastructure.transport.api.controllers import history as history_
 from axo_vem.infrastructure.transport.api.controllers import jobs as jobs_routes
 from axo_vem.infrastructure.transport.api.controllers import policies as policies_routes
 from axo_vem.infrastructure.transport.api.controllers import virtual_environment as virtual_environment_routes
+from axo_vem.infrastructure.transport.api.controllers import visibility as visibility_routes
 from axo_vem.infrastructure.transport.api.controllers import websockets as websockets_routes
 from axo_vem.infrastructure.transport.api.errors import register_exception_handlers
 from axo_vem.infrastructure.transport.api.logging_middleware import register_logging_middleware
@@ -88,14 +84,12 @@ def create_app(
     activity_repository: MongoActivityRepository,
     stream_admin: Optional[StreamAdmin] = None,
     job_repository: Optional[JobRepository] = None,
-    choreography_repository: Optional[ChoreographyRepository] = None,
-    choreography_run_repository: Optional[ChoreographyRunRepository] = None,
-    create_choreography_use_case: Optional[CreateChoreographyUseCase] = None,
-    update_choreography_use_case: Optional[UpdateChoreographyUseCase] = None,
-    delete_choreography_use_case: Optional[DeleteChoreographyUseCase] = None,
+    jobs_service=None,
+    function_code_store=None,
+    function_defaults=None,
+    choreography_service=None,
+    choreography_engine=None,
     purge_choreography_use_case: Optional[PurgeChoreographyUseCase] = None,
-    run_choreography_use_case: Optional[RunChoreographyUseCase] = None,
-    cancel_choreography_run_use_case: Optional[CancelChoreographyRunUseCase] = None,
     register_function_use_case: Optional[RegisterFunctionUseCase] = None,
     delete_function_use_case: Optional[DeleteFunctionUseCase] = None,
     update_function_use_case: Optional[UpdateFunctionUseCase] = None,
@@ -110,6 +104,9 @@ def create_app(
     lifecycle_service=None,
     policy_service=None,
     fleet=None,
+    object_service=None,
+    visibility_service=None,
+    events_service=None,
     current_user_dependency: Optional[Callable[..., ActingUser]] = None,
     endpoint_command_timeout_seconds: float = 3.0,
     cors_allow_origins: Optional[List[str]] = None,
@@ -177,6 +174,7 @@ def create_app(
             collections.functions, required_auth_dependency,
             register_function_use_case, delete_function_use_case,
             update_function_use_case, purge_function_version_use_case,
+            code_store=function_code_store, defaults=function_defaults,
         ))
     app.include_router(consensus_routes.build_router(collections.consensus, required_auth_dependency))
     if ve_settings_service is not None:
@@ -190,28 +188,34 @@ def create_app(
     app.include_router(history_routes.build_router(
         activity_repository, required_auth_dependency, retention_cutoff,
     ))
+    if object_service is not None:
+        app.include_router(objects_routes.build_router(
+            object_service, required_auth_dependency, activity_repository, retention_cutoff,
+        ))
     if kurrent_reader is not None:
         app.include_router(events_routes.build_router(kurrent_reader, required_auth_dependency))
     if job_repository is not None:
         app.include_router(jobs_routes.build_router(
             job_repository, required_auth_dependency, collections.endpoints, endpoint_command_timeout_seconds,
-            submit_function_job_use_case,
+            submit_function_job_use_case, jobs_service=jobs_service,
+            run_summaries=(choreography_engine.run_summaries if choreography_engine is not None
+                           and hasattr(choreography_engine, "run_summaries") else None),
+            visibility=visibility_service,
         ))
-    if (
-        choreography_repository is not None
-        and choreography_run_repository is not None
-        and create_choreography_use_case is not None
-        and update_choreography_use_case is not None
-        and delete_choreography_use_case is not None
-        and purge_choreography_use_case is not None
-    ):
+    if choreography_service is not None and choreography_engine is not None:
         app.include_router(choreographies_routes.build_router(
-            choreography_repository, choreography_run_repository, create_choreography_use_case,
-            update_choreography_use_case, delete_choreography_use_case, purge_choreography_use_case,
-            required_auth_dependency,
-            run_use_case=run_choreography_use_case,
-            cancel_run_use_case=cancel_choreography_run_use_case,
+            choreography_service, choreography_engine, required_auth_dependency,
+            purge_use_case=purge_choreography_use_case, retention_cutoff=retention_cutoff,
+            visibility=visibility_service, events=events_service,
         ))
+    if events_service is not None:
+        app.include_router(custom_events_routes.build_router(events_service, required_auth_dependency))
+    if visibility_service is not None:
+        def _resolve(kind: str, ref: str) -> str:
+            if kind == "choreography" and choreography_service is not None:
+                return choreography_service.get(ref).choreography_id
+            return ref
+        app.include_router(visibility_routes.build_router(visibility_service, required_auth_dependency, _resolve))
 
     @app.get("/health")
     def health():

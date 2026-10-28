@@ -692,11 +692,21 @@ class ContainerSummoner:
         return f"tcp://{self._endpoint_host()}:{port}"
 
     def _poll_readiness(self, handle: ContainerHandle) -> None:
-        """Background thread: polls /health until the container is ready or times out."""
+        """Background thread: polls /health until the container is ready or
+        its start fails. Two stages, each with its own limit: getting the
+        runner up (READINESS_TIMEOUT: until it first answers, with its
+        start-up stage) and then fetching / installing packages / loading
+        the code (INSTALL_TIMEOUT), so a big install isn't taken for a
+        container that never started. A runner that reports a failed start
+        (pip's error, the code's import error) or stops while starting ends
+        the wait at once. An older runner image answers only when ready, so
+        for it the first limit covers everything, as before."""
         timeout = self._config.AXO_ENDPOINT_CONTAINER_READINESS_TIMEOUT_SECONDS
+        install_timeout = self._config.AXO_ENDPOINT_CONTAINER_INSTALL_TIMEOUT_SECONDS
         deadline = time.monotonic() + timeout
         url = f"{handle.http_address}/health"
         t0 = time.monotonic()
+        stage: Optional[str] = None
 
         while time.monotonic() < deadline:
             if handle.status in (ContainerStatus.CRASHED, ContainerStatus.DISMISSED):
@@ -724,27 +734,78 @@ class ContainerSummoner:
                         timestamp=time.time(),
                     ))
                     return
+                report = _startup_report(resp)
+                if report is not None:
+                    if report["stage"] == "failed":
+                        self._start_failed(handle, report.get("error") or "the runner couldn't start")
+                        return
+                    if stage is None:
+                        # Alive: from here on the install limit applies.
+                        deadline = time.monotonic() + install_timeout
+                        timeout = install_timeout
+                    if report["stage"] != stage:
+                        stage = report["stage"]
+                        self._logger.info_event(
+                            Event.Container.STARTING,
+                            component=Component.CONTAINER_SPAWNER,
+                            function_id=handle.function_id,
+                            service_name=handle.service_name,
+                            stage=stage,
+                        )
             except requests.RequestException:
-                pass
+                # Once it answered, silence means it stopped (out of memory
+                # while installing, a killed container): no need to wait.
+                state = self._spawner.state(handle.mode, handle.service_name) if stage is not None else "running"
+                if state not in ("running", "created", "restarting"):
+                    self._start_failed(handle, f"the runner stopped while {_stage_text(stage)}")
+                    return
             time.sleep(1.0)
 
-        # Timed out — mark as crashed
+        if stage is None:
+            self._start_failed(handle, f"container did not become ready within {timeout}s")
+        else:
+            self._start_failed(handle, f"container did not finish {_stage_text(stage)} within {timeout}s")
+
+    def _start_failed(self, handle: ContainerHandle, message: str) -> None:
+        """Marks a container whose start failed as crashed and unblocks
+        whoever waits on it; the message is kept for the job's error."""
         with handle._lock:
             handle.status = ContainerStatus.CRASHED
+            handle.start_error = message
         handle.ready_event.set()  # unblock waiters
         self._logger.error_event(
             Event.Container.CRASHED,
             component=Component.CONTAINER_SPAWNER,
             function_id=handle.function_id,
             service_name=handle.service_name,
-            error_message=f"container did not become ready within {timeout}s",
+            error_message=message,
         )
         self._event_bus.emit(BusEvent(
             event_type=CONTAINER_CRASHED_EVENT,
             payload={
                 "function_id": handle.function_id, "version": handle.version,
                 "service_name": handle.service_name,
-                "error_message": f"container did not become ready within {timeout}s",
+                "error_message": message,
             },
             timestamp=time.time(),
         ))
+
+
+# How the runner's start-up stages read in a message.
+_STAGE_TEXT = {"fetching": "fetching its code", "installing": "installing packages", "loading": "loading the code"}
+
+
+def _stage_text(stage: Optional[str]) -> str:
+    return _STAGE_TEXT.get(stage or "", stage or "starting")
+
+
+def _startup_report(resp: Any) -> Optional[Dict[str, Any]]:
+    """The runner's start-up status ({"stage", "error"}) from a not-ready
+    /health answer, or None when the answer isn't one (an older runner)."""
+    try:
+        body = resp.json()
+    except Exception:
+        return None
+    if isinstance(body, dict) and isinstance(body.get("stage"), str):
+        return body
+    return None

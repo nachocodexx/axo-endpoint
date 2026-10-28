@@ -180,6 +180,12 @@ class Config:
         self.AXO_ENDPOINT_CONTAINER_READINESS_TIMEOUT_SECONDS: float = float(
             os.environ.get("AXO_ENDPOINT_CONTAINER_READINESS_TIMEOUT_SECONDS", "60.0")
         )
+        # After a runner first answers (alive), how long it may take to get
+        # its code, install its packages and load it -- kept apart from the
+        # readiness limit above so a big install isn't taken for a crash.
+        self.AXO_ENDPOINT_CONTAINER_INSTALL_TIMEOUT_SECONDS: float = float(
+            os.environ.get("AXO_ENDPOINT_CONTAINER_INSTALL_TIMEOUT_SECONDS", "900.0")
+        )
         self.AXO_ENDPOINT_CONTAINER_PIP_CACHE_VOLUME: str = os.environ.get(
             "AXO_ENDPOINT_CONTAINER_PIP_CACHE_VOLUME", "axo-pip-cache"
         )
@@ -260,6 +266,11 @@ class Config:
         )
 
         # Job result replication (executor -> leader -> every endpoint)
+        # How long a finished job's result stays on this endpoint (the VEM
+        # keeps the result itself in the VE's results bucket).
+        self.AXO_ENDPOINT_RESULT_KEEP_SECONDS: float = float(
+            os.environ.get("AXO_ENDPOINT_RESULT_KEEP_SECONDS", "3600")
+        )
         self.AXO_ENDPOINT_RESULT_REPLICATION_MAX_RETRIES: int = _int(
             "AXO_ENDPOINT_RESULT_REPLICATION_MAX_RETRIES", 5
         )
@@ -274,6 +285,36 @@ class Config:
         )
         self.AXO_ENDPOINT_RESULT_CONSISTENCY_CHECK_CHUNK_SIZE: int = _int(
             "AXO_ENDPOINT_RESULT_CONSISTENCY_CHECK_CHUNK_SIZE", 50
+        )
+
+        # Active objects: state saved by the leader. "memory" everywhere is
+        # for local dev only (state is lost when the leader changes); a VE
+        # uses mongo (manifests, counts, history) + redis (small values) +
+        # axo_storage (big values, bucket axo/ve-<id>-objects).
+        self.AXO_ENDPOINT_OBJECT_MANIFESTS: str = os.environ.get("AXO_ENDPOINT_OBJECT_MANIFESTS", "memory")
+        self.AXO_ENDPOINT_OBJECT_HOT: str = os.environ.get("AXO_ENDPOINT_OBJECT_HOT", "memory")
+        self.AXO_ENDPOINT_OBJECT_BLOBS: str = os.environ.get("AXO_ENDPOINT_OBJECT_BLOBS", "memory")
+        self.AXO_ENDPOINT_OBJECT_MONGO_URI: str = os.environ.get("AXO_ENDPOINT_OBJECT_MONGO_URI", "")
+        self.AXO_ENDPOINT_OBJECT_MONGO_DB: str = os.environ.get("AXO_ENDPOINT_OBJECT_MONGO_DB", "axo_objects")
+        self.AXO_ENDPOINT_OBJECT_REDIS_URI: str = os.environ.get("AXO_ENDPOINT_OBJECT_REDIS_URI", "")
+        self.AXO_ENDPOINT_OBJECT_BLOB_DIR: str = os.environ.get(
+            "AXO_ENDPOINT_OBJECT_BLOB_DIR", "/tmp/axo_endpoint/object_blobs"
+        )
+        # JSON values up to this size are kept hot; bigger ones and pickles are blobs.
+        self.AXO_ENDPOINT_OBJECT_HOT_MAX_BYTES: int = _int("AXO_ENDPOINT_OBJECT_HOT_MAX_BYTES", 4096)
+        # Most state one object may hold (0 = no cap); the VEM sets the plan's.
+        self.AXO_ENDPOINT_OBJECT_MAX_STATE_BYTES: int = _int("AXO_ENDPOINT_OBJECT_MAX_STATE_BYTES", 0)
+        self.AXO_ENDPOINT_OBJECT_KEEP_REVISIONS: int = _int("AXO_ENDPOINT_OBJECT_KEEP_REVISIONS", 10)
+        # The most past revisions an object's own setting may ask for (0 = no ceiling).
+        self.AXO_ENDPOINT_OBJECT_MAX_KEEP_REVISIONS: int = _int("AXO_ENDPOINT_OBJECT_MAX_KEEP_REVISIONS", 0)
+        # Values no revision uses any more are deleted after the grace time.
+        self.AXO_ENDPOINT_OBJECT_SWEEP_INTERVAL_SECONDS: float = _float(
+            "AXO_ENDPOINT_OBJECT_SWEEP_INTERVAL_SECONDS", 300.0
+        )
+        self.AXO_ENDPOINT_OBJECT_SWEEP_GRACE_SECONDS: float = _float("AXO_ENDPOINT_OBJECT_SWEEP_GRACE_SECONDS", 3600.0)
+        # How often the leader reports the stored state size (billing).
+        self.AXO_ENDPOINT_OBJECT_SIZES_INTERVAL_SECONDS: float = _float(
+            "AXO_ENDPOINT_OBJECT_SIZES_INTERVAL_SECONDS", 3600.0
         )
 
     def update(self, **kwargs) -> None:

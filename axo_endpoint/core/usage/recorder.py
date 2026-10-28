@@ -4,10 +4,11 @@ import threading
 import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 from axo_shared.errors import AxoError
 from axo_shared.events import models as event_models
+from axo_shared.runtime.outcomes import outcome_of
 
 from axo_endpoint.core.events.bus import Event as BusEvent
 from axo_endpoint.log import DumbLogger, Log
@@ -15,28 +16,17 @@ from axo_endpoint.log.catalog import Component, Event
 
 _Logger = Union[Log, DumbLogger]
 
-# Error code -> billing outcome. Anything not listed is the platform's fault
-# (worker/container crash, spawn failure, ...) and is never billed.
-_FAILED_USER_CODES = {
-    3002,  # FunctionExecError: the function itself raised
-    3007,  # JobTimeoutError: the function's own max_duration_seconds elapsed
-}
-_CANCELLED_CODES = {3008}            # JobCancelledError
-_TIMED_OUT_IN_QUEUE_CODES = {3009}   # QueueWaitTimeoutError (max_wait elapsed before it ran)
+def failure_of(error: Optional[AxoError], component: str = "runtime") -> Optional[Dict[str, Any]]:
+    """What went wrong, as a FailureDetail dict (the code's traceback and
+    Python type come from the error's context)."""
+    if error is None:
+        return None
+    return event_models.FailureDetail.from_axo_error(error, component).model_dump()
 
 
 def classify_outcome(error: Optional[AxoError]) -> str:
     """The JobAttemptRecorded outcome for a finished attempt (None = success)."""
-    if error is None:
-        return "completed"
-    code = getattr(error, "code", 0)
-    if code in _FAILED_USER_CODES:
-        return "failed_user"
-    if code in _CANCELLED_CODES:
-        return "cancelled"
-    if code in _TIMED_OUT_IN_QUEUE_CODES:
-        return "timed_out_in_queue"
-    return "failed_platform"
+    return outcome_of(None if error is None else getattr(error, "code", 0))
 
 
 @dataclass
@@ -61,6 +51,20 @@ class JobUsageContext:
     # for its dataio: the user themself, an API key's owner, or whoever
     # started the choreography run. "" = unknown (dataio then refuses).
     acting_user_id: str = ""
+    # Set for an active object call: billed per call, shown per object.
+    object_id: Optional[str] = None
+    object_method: Optional[str] = None
+    # A choreography step's job: which run, step and version (step costs).
+    choreography_run_id: Optional[str] = None
+    choreography_step: Optional[str] = None
+    choreography_version: Optional[int] = None
+    # A called run's step: the runs that called it, outermost first.
+    choreography_calls: List[Dict[str, Any]] = field(default_factory=list)
+    # Why this attempt started (attempts.py: first / platform_failed /
+    # code_failed / manual), who retried it by hand, and the job's limit.
+    reason: str = "first"
+    retried_by: Optional[str] = None
+    max_attempts: int = 1
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -87,7 +91,26 @@ class JobUsageContext:
             upstream_waits_ms=dict(envelope.get("layer_waits_ms") or {}),
             max_wait_s=max_wait_s,
             acting_user_id=_acting_user(envelope),
+            object_id=envelope.get("object_id"),
+            object_method=envelope.get("object_method"),
+            choreography_run_id=envelope.get("choreography_run_id"),
+            choreography_step=envelope.get("choreography_step"),
+            choreography_version=envelope.get("choreography_version"),
+            choreography_calls=list(envelope.get("choreography_calls") or []),
+            reason="manual" if envelope.get("retried_by") else (
+                "platform_failed" if envelope.get("reason") == "platform_failed" else "first"),
+            retried_by=envelope.get("retried_by"),
+            max_attempts=int(envelope.get("max_attempts") or 1),
         )
+
+
+@dataclass
+class _IoTally:
+    bytes_read: Dict[str, int] = field(default_factory=dict)
+    bytes_written: Dict[str, int] = field(default_factory=dict)
+    cache_hits: int = 0
+    cache_misses: int = 0
+    files_written: List[Dict[str, Any]] = field(default_factory=list)
 
 
 def _acting_user(envelope: Dict[str, Any]) -> str:
@@ -141,6 +164,9 @@ class UsageRecorder:
         self._stale_after_s = stale_after_s
         self._logger: _Logger = logger or DumbLogger()
         self._contexts: Dict[str, JobUsageContext] = {}
+        # Bytes per bucket and cache hits of the attempt running now (only
+        # where it runs, so never part of a forward).
+        self._io: Dict[str, _IoTally] = {}
         self._lock = threading.Lock()
 
     # ── bus subscribers ──────────────────────────────────────────────────────
@@ -158,26 +184,33 @@ class UsageRecorder:
         payload = event.payload
         with self._lock:
             context = self._contexts.pop(payload["job_id"], None)
+            io = self._io.pop(payload["job_id"], None)
         if context is None:
             return  # submitted before this recorder existed, or forwarded away
         self._record(
             context,
+            io=io,
             outcome=payload.get("outcome", "completed" if event.event_type == "JOB_COMPLETED" else "failed_platform"),
             started_at=payload.get("started_at"),
             finished_at=payload.get("finished_at", event.timestamp),
+            failure=payload.get("failure"),
         )
 
     # ── runtime hooks ────────────────────────────────────────────────────────
-    def on_attempt_retried(self, job_id: str, error: AxoError, started_at: Optional[float]) -> None:
-        """A failed attempt the runtime is about to retry: record it now (it
-        consumed time and may be billable), then count the next attempt."""
+    def on_attempt_failed(self, job_id: str, error: AxoError, started_at: Optional[float], retry_at: float,
+                          next_reason: str) -> None:
+        """A failed attempt that will be tried again (JobAttempts): record it
+        now (it consumed time and may be billable), then count the next one."""
         with self._lock:
             context = self._contexts.get(job_id)
             if context is None:
                 return
             snapshot = JobUsageContext(**context.to_dict())
             context.attempt += 1
-        self._record(snapshot, classify_outcome(error), started_at, self._now_fn())
+            context.reason, context.retried_by = next_reason, None
+            io = self._io.pop(job_id, None)
+        self._record(snapshot, classify_outcome(error), started_at, self._now_fn(), io=io,
+                     failure=failure_of(error), retry_at=retry_at)
 
     def take_for_forward(self, job_id: str) -> Optional[Dict[str, Any]]:
         """Hand a job's context over to the endpoint it's forwarded to (which
@@ -191,6 +224,25 @@ class UsageRecorder:
         restored = JobUsageContext(**context)
         with self._lock:
             self._contexts[restored.job_id] = restored
+
+    def on_io(self, job_id: str, bucket: str, bytes_read: int = 0, bytes_written: int = 0,
+              cache_hit: Optional[bool] = None, file: Optional[Dict[str, Any]] = None) -> None:
+        """One dataio request of a running job (DataIOResolver): bytes per
+        bucket and chunk cache hits / misses go on its attempt record."""
+        with self._lock:
+            if job_id not in self._contexts:
+                return
+            tally = self._io.setdefault(job_id, _IoTally())
+            if bytes_read:
+                tally.bytes_read[bucket] = tally.bytes_read.get(bucket, 0) + int(bytes_read)
+            if bytes_written:
+                tally.bytes_written[bucket] = tally.bytes_written.get(bucket, 0) + int(bytes_written)
+            if file is not None:
+                tally.files_written.append(file)
+            if cache_hit is True:
+                tally.cache_hits += 1
+            elif cache_hit is False:
+                tally.cache_misses += 1
 
     def acting_user(self, job_id: str) -> Optional[str]:
         """Who a running job acts for (for its dataio access checks)."""
@@ -209,10 +261,13 @@ class UsageRecorder:
         cutoff = self._now_fn() - self._stale_after_s
         for job_id in [j for j, c in self._contexts.items() if c.received_at < cutoff]:
             del self._contexts[job_id]
+            self._io.pop(job_id, None)
 
     def _record(
         self, context: JobUsageContext, outcome: str, started_at: Optional[float], finished_at: Optional[float],
+        io: Optional["_IoTally"] = None, failure: Optional[Dict[str, Any]] = None, retry_at: Optional[float] = None,
     ) -> None:
+        io = io or _IoTally()
         waits = dict(context.upstream_waits_ms)
         execution_ms = 0.0
         if started_at is not None:
@@ -239,6 +294,22 @@ class UsageRecorder:
             finished_at=_ts(finished_at),
             layer_waits_ms=waits,
             execution_ms=execution_ms,
+            bytes_read=io.bytes_read,
+            bytes_written=io.bytes_written,
+            cache_hits=io.cache_hits,
+            cache_misses=io.cache_misses,
+            object_id=context.object_id,
+            object_method=context.object_method,
+            choreography_run_id=context.choreography_run_id,
+            choreography_step=context.choreography_step,
+            choreography_version=context.choreography_version,
+            choreography_calls=list(context.choreography_calls),
+            reason=context.reason,
+            retried_by=context.retried_by,
+            max_attempts=context.max_attempts,
+            failure=event_models.FailureDetail(**failure) if failure else None,
+            retry_at=_ts(retry_at),
+            files_written=[event_models.FileWritten(**f) for f in io.files_written],
         )
         self._logger.debug_event(
             Event.Usage.RECORDED,

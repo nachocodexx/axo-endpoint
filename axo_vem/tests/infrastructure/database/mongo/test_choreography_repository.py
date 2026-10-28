@@ -7,78 +7,44 @@ from axo_vem.infrastructure.database.mongo.choreography_repository import MongoC
 
 def _repository():
     db = mongomock.MongoClient()["test"]
-    return MongoChoreographyRepository(db["choreographies"]), db["choreographies"]
+    return MongoChoreographyRepository(db["choreographies"], db["choreography_versions"], db["choreography_names"])
 
 
-def _graph():
-    return ChoreographyGraph(
-        nodes=[ChoreographyNode(node_id="n1", kind="function", position={"x": 0.0, "y": 0.0})], edges=[],
-    )
+def _choreography(version=1, name="pipeline", nodes=1):
+    graph = ChoreographyGraph(nodes=[ChoreographyNode(node_id=f"n{i}", kind="function", function_id="f")
+                                     for i in range(nodes)])
+    return Choreography(choreography_id="c1", name=name, owner_user_id="u1", version=version, graph=graph,
+                        created_at="2026-01-01T00:00:00+00:00", updated_at="2026-01-01T00:00:00+00:00")
 
 
-def _choreography(choreography_id="c1", owner="user-1"):
-    return Choreography(
-        choreography_id=choreography_id, name="pipeline", owner_user_id=owner,
-        graph=_graph(), created_at="2026-01-01T00:00:00Z", updated_at="2026-01-01T00:00:00Z",
-    )
+def test_save_keeps_the_newest_and_every_version():
+    repository = _repository()
+    repository.save(_choreography(1))
+    repository.save(_choreography(2, nodes=2))
+    repository.save(_choreography(1))                      # replayed late: only its version row
+    assert repository.get("c1").version == 2
+    assert repository.get_by_name("pipeline").choreography_id == "c1"
+    assert [v["version"] for v in repository.versions("c1")] == [2, 1]
+    assert len(repository.get_version("c1", 1).graph.nodes) == 1
 
 
-def test_get_returns_none_for_missing_doc():
-    repository, _collection = _repository()
-    assert repository.get("no-such-id") is None
-
-
-def test_get_returns_none_for_soft_deleted_doc():
-    repository, collection = _repository()
+def test_names_and_soft_delete():
+    repository = _repository()
+    assert repository.reserve_name("pipeline", "c1") and repository.reserve_name("pipeline", "c1")
+    assert not repository.reserve_name("pipeline", "c2")
+    repository.release_name("pipeline", "c2")              # not the holder: nothing happens
+    assert not repository.reserve_name("pipeline", "c2")
     repository.save(_choreography())
-    repository.soft_delete("c1", "2026-02-01T00:00:00Z")
+    repository.soft_delete("c1", "2026-01-02T00:00:00+00:00")
+    assert repository.get("c1") is None and repository.list() == []
+    assert repository.raw("c1")["deleted_at"]
 
-    assert repository.get("c1") is None
-    assert collection.find_one({"_id": "c1"}) is not None  # doc itself still exists
 
-
-def test_get_returns_choreography_for_existing_non_deleted_doc():
-    repository, _collection = _repository()
+def test_triggers_survive_new_versions_and_are_found_by_bucket():
+    repository = _repository()
     repository.save(_choreography())
-
-    result = repository.get("c1")
-
-    assert result.choreography_id == "c1"
-    assert result.owner_user_id == "user-1"
-    assert result.graph.nodes[0].node_id == "n1"
-
-
-def test_list_filters_out_soft_deleted_and_scopes_by_owner():
-    repository, _collection = _repository()
-    repository.save(_choreography(choreography_id="c1", owner="user-1"))
-    repository.save(_choreography(choreography_id="c2", owner="user-1"))
-    repository.save(_choreography(choreography_id="c3", owner="user-2"))
-    repository.soft_delete("c2", "2026-02-01T00:00:00Z")
-
-    all_active = {c.choreography_id for c in repository.list()}
-    assert all_active == {"c1", "c3"}
-
-    user_1_only = {c.choreography_id for c in repository.list(owner_user_id="user-1")}
-    assert user_1_only == {"c1"}
-
-
-def test_save_upserts_by_choreography_id():
-    repository, collection = _repository()
-    repository.save(_choreography(choreography_id="c1"))
-    updated = _choreography(choreography_id="c1")
-    updated.name = "renamed"
-    repository.save(updated)
-
-    assert collection.count_documents({"_id": "c1"}) == 1
-    assert repository.get("c1").name == "renamed"
-
-
-def test_soft_delete_sets_deleted_at_without_removing_the_doc():
-    repository, collection = _repository()
-    repository.save(_choreography())
-
-    repository.soft_delete("c1", "2026-02-01T00:00:00Z")
-
-    doc = collection.find_one({"_id": "c1"})
-    assert doc is not None
-    assert doc["deleted_at"] == "2026-02-01T00:00:00Z"
+    repository.set_triggers("c1", [{"trigger_id": "t1", "bucket": "alice/raw"}])
+    repository.save(_choreography(2))
+    assert repository.get("c1").triggers == [{"trigger_id": "t1", "bucket": "alice/raw"}]
+    assert [c.choreography_id for c in repository.triggers_for_bucket("alice/raw")] == ["c1"]
+    assert repository.triggers_for_bucket("bob/raw") == []

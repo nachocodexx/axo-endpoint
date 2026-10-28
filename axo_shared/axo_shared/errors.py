@@ -206,3 +206,80 @@ class StorageUnavailableError(AxoError):
 
     code = 9316
     name = "STORAGE_UNAVAILABLE"
+
+
+# ── 94xx: active objects ──────────────────────────────────────────────────────
+
+class ActiveObjectNotFoundError(AxoError):
+    code = 9401
+    name = "ACTIVE_OBJECT_NOT_FOUND"
+
+
+class ActiveObjectExistsError(AxoError):
+    """Object names are unique inside a VE."""
+
+    code = 9402
+    name = "ACTIVE_OBJECT_EXISTS"
+
+
+class ActiveObjectStateConflictError(AxoError):
+    """The object's state changed since the call read it (another endpoint
+    committed first) -- the call's changes were not saved."""
+
+    code = 9403
+    name = "ACTIVE_OBJECT_STATE_CONFLICT"
+
+
+class ActiveObjectStateTooLargeError(AxoError):
+    """Saving the call's changes would take the object past its size cap."""
+
+    code = 9404
+    name = "ACTIVE_OBJECT_STATE_TOO_LARGE"
+
+
+class ActiveObjectStateUnreadableError(AxoError):
+    """A saved attribute is missing or can't be decoded."""
+
+    code = 9405
+    name = "ACTIVE_OBJECT_STATE_UNREADABLE"
+
+
+class ActiveObjectStateBackendError(AxoError):
+    """The store holding object state (Redis, Mongo, files, buckets) failed."""
+
+    code = 9406
+    name = "ACTIVE_OBJECT_STATE_BACKEND_FAILURE"
+
+
+class ActiveObjectAttributeInvalidError(AxoError):
+    """An attribute has a name that can't be saved or a value that can't be pickled."""
+
+    code = 9407
+    name = "ACTIVE_OBJECT_ATTRIBUTE_INVALID"
+
+
+class ActiveObjectClassNotFoundError(AxoError):
+    code = 9408
+    name = "ACTIVE_OBJECT_CLASS_NOT_FOUND"
+
+
+class ActiveObjectMethodNotFoundError(AxoError):
+    """The class has no @axo_method with that name."""
+
+    code = 9409
+    name = "ACTIVE_OBJECT_METHOD_NOT_FOUND"
+
+
+class ActiveObjectClassInvalidError(AxoError):
+    """The class can't be saved: its source and a pickled copy both failed,
+    or it breaks a rule of Axo classes."""
+
+    code = 9410
+    name = "ACTIVE_OBJECT_CLASS_INVALID"
+
+
+class ActiveObjectClassInUseError(AxoError):
+    """A class version can't be deleted while an object is on it."""
+
+    code = 9411
+    name = "ACTIVE_OBJECT_CLASS_IN_USE"

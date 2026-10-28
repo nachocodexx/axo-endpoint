@@ -1,0 +1,23 @@
+[tool.poetry]
+name = "axo"
+version = "0.1.0a1"
+description = "Active objects and functions on the Axo platform: write a class or a function, run it in your virtual environment."
+authors = ["Ignacio Castillo <ignacio.bcastillo@gmail.com>"]
+readme = "README.md"
+packages = [{ include = "axo" }]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<4"
+cloudpickle = "^3.1.2"
+option = "^2.1.0"
+httpx = "^0.28.1"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.1.1"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

@@ -355,7 +355,7 @@ def test_job_lifecycle_updates_the_jobs_collection_end_to_end():
     started = models.JobStarted(endpoint_id="n0", job_id="job1", function_id="add", version=1)
     apply_event(handlers, models.JOB_STARTED, started.model_dump(mode="json"))
     doc = db["jobs"].find_one({"_id": "job1"})
-    assert doc["status"] == "STARTED"
+    assert doc["status"] == "RUNNING"
     assert doc["params"] == {"a": 1}  # preserved from JobQueued, not carried by JobStarted
 
     completed = models.JobCompleted(endpoint_id="n0", job_id="job1", function_id="add", duration_ms=42.0)
@@ -465,3 +465,26 @@ def test_legacy_event_types_are_skipped_quietly(event_type):
     apply_event(handlers, event_type, {"event_id": "e1", "created_at": "2026-01-01T00:00:00+00:00"})
     assert db["unified_activity"].count_documents({}) == 0
 
+
+
+def test_job_events_only_move_a_job_forward_whatever_order_they_arrive_in():
+    handlers, db = _handlers()
+    failed_1 = models.JobFailed(endpoint_id="n0", job_id="job1", function_id="add", attempt=1,
+                                failure=models.FailureDetail(error_class="FUNCTION_EXEC_ERROR", error_code=3002,
+                                                             component="runtime", message="boom",
+                                                             error_type="KeyError"))
+    started_2 = models.JobStarted(endpoint_id="n1", job_id="job1", function_id="add", version=1, attempt=2)
+    queued_1 = models.JobQueued(endpoint_id="n0", job_id="job1", function_id="add", version=1, params={"a": 1})
+    for event_type, event in ((models.JOB_STARTED, started_2), (models.JOB_FAILED, failed_1),
+                              (models.JOB_QUEUED, queued_1)):
+        apply_event(handlers, event_type, event.model_dump(mode="json"))
+    doc = db["jobs"].find_one({"_id": "job1"})
+    assert (doc["status"], doc["attempt"], doc["endpoint_id"]) == ("RUNNING", 2, "n1")
+    assert doc["params"] == {"a": 1}
+
+    cancelled = models.JobFailed(endpoint_id="n1", job_id="job1", function_id="add", attempt=2,
+                                 failure=models.FailureDetail(error_class="JOB_CANCELLED", error_code=3008,
+                                                              component="runtime", message="stopped"))
+    apply_event(handlers, models.JOB_FAILED, cancelled.model_dump(mode="json"))
+    doc = db["jobs"].find_one({"_id": "job1"})
+    assert (doc["status"], doc["outcome"], doc["error"]["fault"]) == ("CANCELLED", "cancelled", "cancelled")

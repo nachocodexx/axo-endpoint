@@ -14,6 +14,13 @@ from axo_shared.functions.models import FunctionRecord
 from axo_shared.functions.params_schema import params_schema_to_list
 from axo_endpoint.core.events.bus import Event
 from axo_endpoint.core.functions import FunctionRegistry
+from axo_endpoint.core.objects import (
+    ACTIVE_OBJECT_CALLED_EVENT,
+    ACTIVE_OBJECT_CREATED_EVENT,
+    ACTIVE_OBJECT_DELETED_EVENT,
+    ACTIVE_OBJECT_SIZES_EVENT,
+    ACTIVE_OBJECT_UPGRADED_EVENT,
+)
 from axo_endpoint.core.storage.backend import StorageBackend, StorageKey
 from axo_endpoint.log import DumbLogger, Log
 from axo_endpoint.log.catalog import Component, Event as LogEvent
@@ -49,8 +56,10 @@ class ExternalEventForwardingBridge:
         function_registry: FunctionRegistry,
         get_virtual_environment_id: Optional[Callable[[], Optional[str]]] = None,
         logger: _Logger = None,
+        attempt_of: Optional[Callable[[str], Optional[int]]] = None,
     ) -> None:
         self._publisher = publisher
+        self._attempt_of_fn = attempt_of
         self._endpoint_id = endpoint_id
         self._results = results
         self._function_registry = function_registry
@@ -62,6 +71,9 @@ class ExternalEventForwardingBridge:
         # up a callback that always returns None.
         self._get_virtual_environment_id = get_virtual_environment_id or (lambda: None)
         self._logger: _Logger = logger or DumbLogger()
+
+    def _attempt_of(self, job_id: str) -> int:
+        return (self._attempt_of_fn(job_id) if self._attempt_of_fn is not None else None) or 1
 
     def _publish(self, event_type: str, event: event_models.EventEnvelope) -> None:
         event = event.model_copy(update={"virtual_environment_id": self._get_virtual_environment_id()})
@@ -117,7 +129,8 @@ class ExternalEventForwardingBridge:
         function_id = event.payload["function_id"]
         version = event.payload["version"]
         record = self._get_function_record(function_id, version)
-        runtime_spec = record.runtime_spec.to_dict() if record and record.runtime_spec else None
+        # secret env values never leave the endpoints
+        runtime_spec = record.runtime_spec.public_dict() if record and record.runtime_spec else None
         runtime_type = record.runtime_spec.type if record and record.runtime_spec else None
         params_schema = params_schema_to_list(record.params_schema) if record else None
         self._publish(event_models.FUNCTION_REGISTERED, event_models.FunctionRegistered(
@@ -128,6 +141,8 @@ class ExternalEventForwardingBridge:
             runtime_spec=runtime_spec,
             runtime_type=runtime_type,
             params_schema=params_schema,
+            code_format=record.code_format if record else None,
+            code_hash=record.code_hash if record else None,
         ))
 
     def on_function_updated(self, event: Event) -> None:
@@ -139,8 +154,8 @@ class ExternalEventForwardingBridge:
         version = event.payload["version"]
         record = self._get_function_record(function_id, version)
         params_schema = params_schema_to_list(record.params_schema) if record else None
-        env_vars = record.runtime_spec.env_vars if record and record.runtime_spec else None
-        runtime_spec = record.runtime_spec.to_dict() if record and record.runtime_spec else None
+        runtime_spec = record.runtime_spec.public_dict() if record and record.runtime_spec else None
+        env_vars = runtime_spec["env_vars"] if runtime_spec else None
         self._publish(event_models.FUNCTION_UPDATED, event_models.FunctionUpdated(
             endpoint_id=self._endpoint_id, function_id=function_id, version=version,
             params_schema=params_schema, env_vars=env_vars, runtime_spec=runtime_spec,
@@ -328,7 +343,7 @@ class ExternalEventForwardingBridge:
         self._publish(event_models.JOB_STARTED, event_models.JobStarted(
             endpoint_id=self._endpoint_id, job_id=job_id, function_id=function_id,
             version=version, params=event.payload.get("params"),
-            runtime_type=runtime_type,
+            runtime_type=runtime_type, attempt=self._attempt_of(job_id),
         ))
         if version is None:
             self._log_version_unknown(event, function_id)
@@ -358,17 +373,21 @@ class ExternalEventForwardingBridge:
         if event.event_type == "JOB_COMPLETED":
             self._publish(event_models.JOB_COMPLETED, event_models.JobCompleted(
                 endpoint_id=self._endpoint_id, job_id=job_id, function_id=function_id,
-                duration_ms=duration_ms, runtime_type=runtime_type,
+                duration_ms=duration_ms, runtime_type=runtime_type, attempt=event.payload.get("attempt") or 1,
             ))
             state = "COMPLETED"
         else:
-            failure = event_models.FailureDetail(
+            # The traceback goes only on the attempt record (JobAttemptRecorded),
+            # which the VEM keeps for Developers: never into the event log.
+            given = {**event.payload["failure"], "traceback": None} if event.payload.get("failure") else None
+            failure = event_models.FailureDetail(**given) if given else event_models.FailureDetail(
                 error_class="FUNCTION_RUNTIME_ERROR", error_code=0, component="runtime",
                 message=self._get_job_error(job_id),
             )
             self._publish(event_models.JOB_FAILED, event_models.JobFailed(
                 endpoint_id=self._endpoint_id, job_id=job_id, function_id=function_id,
                 failure=failure, duration_ms=duration_ms, runtime_type=runtime_type,
+                attempt=event.payload.get("attempt") or 1,
             ))
             state = "FAILED"
 
@@ -399,6 +418,27 @@ class ExternalEventForwardingBridge:
             is_leader=event.payload["is_leader"],
             leader_ids=list(event.payload["leader_ids"]),
         ))
+
+    def on_active_object_event(self, event: Event) -> None:
+        """Subscribed to the ObjectCoordinator's ACTIVE_OBJECT_*_EVENTs (the
+        leader's): their payloads already hold each typed event's fields."""
+        p = event.payload
+        if event.event_type == ACTIVE_OBJECT_CREATED_EVENT:
+            self._publish(event_models.ACTIVE_OBJECT_CREATED, event_models.ActiveObjectCreated(
+                endpoint_id=self._endpoint_id, user_id=p.get("created_by"), **p))
+        elif event.event_type == ACTIVE_OBJECT_CALLED_EVENT:
+            failure = p.get("failure")
+            self._publish(event_models.ACTIVE_OBJECT_CALLED, event_models.ActiveObjectCalled(
+                endpoint_id=self._endpoint_id, **{**p, "failure": event_models.FailureDetail(**failure) if failure else None}))
+        elif event.event_type == ACTIVE_OBJECT_UPGRADED_EVENT:
+            self._publish(event_models.ACTIVE_OBJECT_UPGRADED, event_models.ActiveObjectUpgraded(
+                endpoint_id=self._endpoint_id, **p))
+        elif event.event_type == ACTIVE_OBJECT_DELETED_EVENT:
+            self._publish(event_models.ACTIVE_OBJECT_DELETED, event_models.ActiveObjectDeleted(
+                endpoint_id=self._endpoint_id, **p))
+        elif event.event_type == ACTIVE_OBJECT_SIZES_EVENT:
+            self._publish(event_models.ACTIVE_OBJECT_STATE_SIZES_REPORTED, event_models.ActiveObjectStateSizesReported(
+                endpoint_id=self._endpoint_id, **p))
 
     def on_cluster_quorum_event(self, event: Event) -> None:
         """Subscribed to CLUSTER_QUORUM_LOST/RESTORED_EVENT and

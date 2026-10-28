@@ -48,6 +48,12 @@ class AxoStorageGateway(StorageGateway):
     def usage_bytes(self, full_name: str) -> int:
         return int(self._ok(self._client.bucket_info(CP_PRINCIPAL, full_name)).get("used_bytes", 0))
 
+    def bucket_stats(self, keys: List[str]) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        for start in range(0, len(keys), 1000):
+            out.update(self._ok(self._client.bucket_stats(CP_PRINCIPAL, keys[start:start + 1000])))
+        return out
+
     def put_object(self, bucket_key: str, name: str, data: bytes) -> None:
         info = self._client.bucket_info(CP_PRINCIPAL, bucket_key)
         if info.is_err:
@@ -57,8 +63,22 @@ class AxoStorageGateway(StorageGateway):
         self._ok(self._client.upload(CP_PRINCIPAL, bucket_key, name, data))
 
     # ── the bucket pages (UI) -- the CP already checked the person's role ────
-    def list_objects(self, acting_user: str, bucket_key: str, prefix: Optional[str] = None) -> List[Dict[str, Any]]:
-        return self._ok(self._client.list(acting_user, bucket_key, prefix))
+    def list_files(self, acting_user: str, bucket_key: str, prefix: str = "", after: Optional[str] = None,
+                   limit: int = 200, folders: bool = True) -> Dict[str, Any]:
+        return self._ok(self._client.list_files(acting_user, bucket_key, prefix, after, limit,
+                                                delimiter="/" if folders else None))
+
+    def versions(self, acting_user: str, bucket_key: str, name: str) -> List[Dict[str, Any]]:
+        return self._ok(self._client.list(acting_user, bucket_key, name))
+
+    def start_upload(self, acting_user: str, bucket_key: str, name: str, size: int, piece_bytes: int) -> Dict[str, Any]:
+        """A new version of ``size`` bytes, sent later in ``piece_bytes`` pieces
+        (any order); it completes by itself with the last one."""
+        return self._ok(self._client.register(acting_user, bucket_key, name, total_size=size, chunk_bytes=piece_bytes))
+
+    def put_piece(self, acting_user: str, bucket_key: str, name: str, version: int, index: int,
+                  data: bytes) -> Dict[str, Any]:
+        return self._ok(self._client.put_chunk(acting_user, bucket_key, name, version, index, data))
 
     def object_info(self, acting_user: str, bucket_key: str, name: str, version: Optional[int]) -> Dict[str, Any]:
         return self._ok(self._client.info(acting_user, bucket_key, name, version))

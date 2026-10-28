@@ -15,12 +15,12 @@ from axo_shared.activity.models import JOB_STARTED_EVENT
 from axo_shared.errors import AxoError
 from axo_shared.runtime.spec import RuntimeSpec
 from axo_endpoint.config import Config
+from axo_endpoint.core.runtime.entry import OBJECT_PARAM
 from axo_endpoint.core.dataio import DataIOResolver, DataIOUnavailableError, IORef
 from axo_endpoint.core.errors import (
     ContainerCrashError,
     ContainerError,
     RunnerBudgetExhaustedError,
-    FunctionExecError,
     InvocationError,
     JobCancelledError,
     JobTimeoutError,
@@ -28,6 +28,7 @@ from axo_endpoint.core.errors import (
 from axo_endpoint.core.events.bus import Event as BusEvent, EventBus
 from axo_endpoint.core.functions import FunctionRegistry
 from axo_endpoint.core.runtime.base import FunctionRuntime, FunctionRuntimeError, InvocationHandle
+from axo_endpoint.core.runtime.failure import exec_error
 from axo_endpoint.core.runtime.queue_deadlines import QueueDeadlines
 from axo_endpoint.core.storage.backend import StorageBackend, StorageKey
 from axo_endpoint.log import DumbLogger, Log
@@ -97,14 +98,6 @@ class ContainerFunctionRuntime(FunctionRuntime):
         self._pump_threads: Dict[str, threading.Thread] = {}
         self._pump_threads_lock = threading.Lock()
 
-        # job_id -> retries already used. Only ever gains an entry the first
-        # time a job needs a retry (a job that never crashes never touches
-        # this) and loses it once that job reaches a terminal outcome --
-        # either it exhausts its retries and fails, or it eventually succeeds
-        # (see _pump_one_job's success branch).
-        self._attempts: Dict[str, int] = {}
-        self._attempts_lock = threading.Lock()
-
         # Cluster-wide placement -- unset until attach_cluster_placement() is
         # called (e.g. by App, once its heartbeat/leader-proxy collaborators
         # exist). Left unset, invoke() falls back to summoner.summon()'s
@@ -114,7 +107,6 @@ class ContainerFunctionRuntime(FunctionRuntime):
         self._concurrency_client: Optional[ConcurrencyClient] = None
         self._forward_job_fn: Optional[ForwardJobFn] = None
         self._on_forwarded: Optional[OnForwarded] = None
-        self._on_attempt_retried: Optional[Callable[[str, AxoError, Optional[float]], None]] = None
 
     def attach_cluster_placement(
         self,
@@ -129,12 +121,6 @@ class ContainerFunctionRuntime(FunctionRuntime):
         self._concurrency_client = concurrency_client
         self._forward_job_fn = forward_job_fn
         self._on_forwarded = on_forwarded
-
-    def attach_usage_hook(self, on_attempt_retried: Callable[[str, AxoError, Optional[float]], None]) -> None:
-        """Called with (job_id, error, started_at) for every failed attempt
-        that is about to be retried, so it can be metered on its own (the
-        final attempt goes through on_complete as usual)."""
-        self._on_attempt_retried = on_attempt_retried
 
     def invoke(
         self,
@@ -173,8 +159,10 @@ class ContainerFunctionRuntime(FunctionRuntime):
         """Picks the container this job runs on: a local handle, None if it
         was forwarded to another endpoint, or RunnerBudgetExhaustedError if
         it must wait for room in this endpoint's runner budget."""
-        if self._concurrency_client is None:
-            # Cluster placement never wired in -- summon() alone still does
+        if self._concurrency_client is None or OBJECT_PARAM in params:
+            # Cluster placement never wired in -- or an active object call,
+            # which always runs here on the leader (its state and per-object
+            # lock live here). summon() alone still does
             # reuse/queue/growth exactly as it always has, unchanged.
             summon_result = self._summoner.summon(function_ref.id, function_ref.version or 0, spec)
             if summon_result.is_err:
@@ -399,13 +387,18 @@ class ContainerFunctionRuntime(FunctionRuntime):
         """Runs on its own daemon thread for a cold-started container. By the
         time this runs, invoke() has already returned Ok(...) -- this is the
         only place a cold-start readiness failure can still be reported."""
-        timeout = self._config.AXO_ENDPOINT_CONTAINER_READINESS_TIMEOUT_SECONDS
+        # Both start-up stages (getting the runner up, then installing and
+        # loading) -- not only the first: the readiness poll sets ready_event
+        # when either ends; this bound only guards a poll that never does.
+        timeout = (self._config.AXO_ENDPOINT_CONTAINER_READINESS_TIMEOUT_SECONDS
+                   + self._config.AXO_ENDPOINT_CONTAINER_INSTALL_TIMEOUT_SECONDS)
         handle.ready_event.wait(timeout=timeout)
         if not handle.ready_event.is_set() or handle.status in (
             ContainerStatus.CRASHED, ContainerStatus.DISMISSED
         ):
+            why = f": {handle.start_error}" if handle.start_error else ""
             err = ContainerError(
-                f"container for {function_id!r} did not become ready",
+                f"container for {function_id!r} did not become ready{why}",
                 context={"function_id": function_id, "status": handle.status},
             )
             self._on_complete(
@@ -471,8 +464,6 @@ class ContainerFunctionRuntime(FunctionRuntime):
                 self._summoner.dismiss(handle, reason="cancelled")
                 if self._concurrency_client is not None:
                     self._concurrency_client.release(handle.function_id, handle.version, handle.pool_index)
-                with self._attempts_lock:
-                    self._attempts.pop(job_id, None)
                 invocation_handle = InvocationHandle(
                     job_id=job_id, function_id=handle.function_id, version=handle.version,
                 )
@@ -720,8 +711,6 @@ class ContainerFunctionRuntime(FunctionRuntime):
                     result_warnings = json.loads(warnings_b.decode("utf-8"))
                 except Exception:
                     result_warnings = []
-                with self._attempts_lock:
-                    self._attempts.pop(job_id, None)
                 handle.current_job_id = None
                 if status == "ok":
                     try:
@@ -731,7 +720,7 @@ class ContainerFunctionRuntime(FunctionRuntime):
                     self._on_complete(inv_handle, Ok(value), result_warnings)
                 else:
                     error_msg = payload_b.decode("utf-8", errors="replace")
-                    self._on_complete(inv_handle, Err(FunctionExecError(error_msg)), result_warnings)
+                    self._on_complete(inv_handle, Err(exec_error(error_msg)), result_warnings)
                 return True
 
             elif tag == b"io_request":
@@ -770,9 +759,8 @@ class ContainerFunctionRuntime(FunctionRuntime):
             # cancel() already finalized (and dismissed) this handle -- the
             # pump thread's blocked recv() waking up to a broken connection
             # here is an expected side effect of that dismissal, not a fresh
-            # crash. Without this guard, _retry_or_finalize below would see
-            # cancel()'s already-cleared _attempts entry as "never tried"
-            # and silently re-invoke a job the caller explicitly cancelled.
+            # crash. Without this guard the cancelled job would end a second
+            # time, as a crash -- which JobAttempts would try again.
             return
         with handle._lock:
             handle.status = ContainerStatus.CRASHED
@@ -864,92 +852,14 @@ class ContainerFunctionRuntime(FunctionRuntime):
                 break
         return drained
 
-    def _max_retries_for(self, function_id: str, version: Optional[int]) -> int:
-        """Fails safe to 0 (no retry) whenever the function's current spec
-        can't be determined -- e.g. it was deleted mid-flight, or (in tests)
-        no registry/spec was wired up at all -- rather than guessing."""
-        if self._registry is None:
-            return 0
-        get_result = self._registry.get(StorageKey(id=function_id, version=version, alias=function_id))
-        if get_result.is_err or get_result.unwrap() is None:
-            return 0
-        spec = get_result.unwrap().runtime_spec
-        if spec is None:
-            return 0
-        return max(0, spec.max_retries)
-
     def _retry_or_finalize(
         self, inv_handle: InvocationHandle, err: FunctionRuntimeError, params: Dict[str, Any],
     ) -> None:
-        """Decides whether a job that just lost its container (crash or
-        timeout) gets another attempt or is failed for good. A retried job
-        is re-invoked through the exact same placement path (local reuse,
-        then leader-driven grow/place) a fresh submission uses -- so it can
-        land on a different container, not just get resent to the one that
-        just died."""
-        job_id = inv_handle.job_id
-        max_retries = self._max_retries_for(inv_handle.function_id, inv_handle.version)
-
-        with self._attempts_lock:
-            attempts = self._attempts.get(job_id, 0)
-            if attempts < max_retries:
-                self._attempts[job_id] = attempts + 1
-                retry_number = attempts + 1
-            else:
-                retry_number = None
-                self._attempts.pop(job_id, None)
-
-        if retry_number is not None:
-            if self._on_attempt_retried is not None:
-                self._on_attempt_retried(job_id, err, inv_handle.started_at)
-            self._logger.info_event(
-                Event.Job.RETRY_SCHEDULED,
-                component=Component.CONTAINER_RUNTIME,
-                job_id=job_id,
-                function_id=inv_handle.function_id,
-                attempt=retry_number,
-                max_retries=max_retries,
-                error_message=str(err),
-            )
-            function_ref = StorageKey(
-                id=inv_handle.function_id, version=inv_handle.version, alias=inv_handle.function_id,
-            )
-            threading.Thread(
-                target=self._perform_retry, args=(function_ref, job_id, params), daemon=True,
-            ).start()
-            return
-
-        self._logger.info_event(
-            Event.Job.RETRY_EXHAUSTED,
-            component=Component.CONTAINER_RUNTIME,
-            job_id=job_id,
-            function_id=inv_handle.function_id,
-            max_retries=max_retries,
-        )
+        """A job that lost its container (crash or timeout) ends this attempt
+        with that error; JobAttempts (in front of on_complete) decides
+        whether it's tried again -- through the same placement path a fresh
+        submission uses, so it can land on another container."""
         self._on_complete(inv_handle, Err(err))
-
-    def _perform_retry(self, function_ref: StorageKey, job_id: str, params: Dict[str, Any]) -> None:
-        """Runs on its own daemon thread so the crashing container's pump
-        thread can finish tearing down instead of blocking on this retry's
-        placement (which may itself do Docker/network I/O)."""
-        retry_result = self.invoke(function_ref, job_id, params)
-        if retry_result.is_err:
-            # The retry attempt couldn't even be placed (e.g. the ledger is
-            # mid-reconciliation) -- finalize now rather than looping.
-            with self._attempts_lock:
-                self._attempts.pop(job_id, None)
-            err = retry_result.unwrap_err()
-            self._logger.info_event(
-                Event.Job.RETRY_EXHAUSTED,
-                component=Component.CONTAINER_RUNTIME,
-                job_id=job_id,
-                function_id=function_ref.id,
-                error_message=str(err),
-            )
-            self._on_complete(
-                InvocationHandle(job_id=job_id, function_id=function_ref.id, version=function_ref.version),
-                Err(err),
-            )
 
     def _alloc_scratch(self, job_id: str) -> str:
         import os

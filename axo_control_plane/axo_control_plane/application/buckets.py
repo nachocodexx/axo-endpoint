@@ -19,6 +19,8 @@ from axo_control_plane.domain.names import (
     check_bucket_name,
     full_bucket_name,
     split_bucket_name,
+    ve_of_objects_bucket,
+    ve_of_results_bucket,
 )
 
 NAME = "name"
@@ -91,23 +93,17 @@ class Buckets:
     def create(self, actor: Actor, name: str, owner_name: Optional[str] = None,
                quota_bytes: Optional[int] = None) -> Dict[str, Any]:
         if actor.is_guest or (actor.key_id is not None and not R.at_least(actor.key_max_role, R.ADMIN)):
-            raise ForbiddenError("guests and lower SDK keys can't create buckets")
+            raise ForbiddenError("guests and lower API keys can't create buckets")
         name = check_bucket_name(name)
         owner = self._owner_for(actor, owner_name)
         quota = self._check_quota(quota_bytes if quota_bytes is not None else self._default_quota)
         bucket_id = f"bkt-{uuid.uuid4().hex[:16]}"
         full_name = full_bucket_name(owner["name"], name)
         self._take_name(full_name, bucket_id, NAME)
+        resource = R.bucket_resource(bucket_id)
         try:
             self._storage.create_bucket(bucket_id, actor.user_id, quota)
-            resource = R.bucket_resource(bucket_id)
-            if owner["kind"] == "user":
-                self._identity.claim(resource, owner["id"], "USER")
-            else:
-                groups = self._teams.groups(owner["id"])
-                self._identity.claim(resource, groups["owner"], "GROUP")
-                self._identity.grant(resource, groups["admins"], "GROUP", R.XOLO_BUCKET_PERMISSIONS[R.WRITER])
-                self._identity.grant(resource, groups["members"], "GROUP", R.XOLO_BUCKET_PERMISSIONS[R.READER])
+            self._claim(resource, owner)
         except Exception:
             self._names_col.delete_one({"_id": full_name})
             raise
@@ -118,6 +114,19 @@ class Buckets:
         self._record(bucket_id, "BucketCreated", actor, full_name=full_name, owner=owner, quota_bytes=quota)
         return self.public(doc)
 
+    def _claim(self, resource: str, owner: Dict[str, str]) -> List[str]:
+        """Makes ``owner`` the resource's owner in Xolo (a team: its owner
+        group, with Writer for its admins and Reader for its members).
+        Returns the principals given access this way."""
+        if owner["kind"] == "user":
+            self._identity.claim(resource, owner["id"], "USER")
+            return [owner["id"]]
+        groups = self._teams.groups(owner["id"])
+        self._identity.claim(resource, groups["owner"], "GROUP")
+        self._identity.grant(resource, groups["admins"], "GROUP", R.XOLO_BUCKET_PERMISSIONS[R.WRITER])
+        self._identity.grant(resource, groups["members"], "GROUP", R.XOLO_BUCKET_PERMISSIONS[R.READER])
+        return list(groups.values())
+
     def require(self, actor: Actor, full_name: str, minimum: str) -> Dict[str, Any]:
         """The bucket, if the caller has at least ``minimum`` on it."""
         doc = self.resolve(full_name)
@@ -127,14 +136,85 @@ class Buckets:
     def get(self, actor: Actor, full_name: str) -> Dict[str, Any]:
         doc = self.resolve(full_name)
         role = self._authz.require_bucket(actor, doc["_id"], R.READER)
-        return {**self.public(doc), "my_role": role}
+        return {**self.public(doc), **self._stats([doc["_id"]]).get(doc["_id"], {}), "my_role": role,
+                "relation": self._relation(actor, doc)}
 
     def list_for(self, actor: Actor) -> List[Dict[str, Any]]:
+        """Every bucket the person can reach, with its figures (one storage
+        call for all) and how they reach it: ``mine`` (they own it), ``team``
+        (one of their teams does) or ``shared`` (shared with them).
+        Platform buckets (``axo/...``) are never listed: people reach their
+        contents through the pages that use them (job results, code)."""
         ids = [r.split(":", 1)[1] for r in self._access.visible_resources(actor.user_id) if r.startswith("bucket:")]
+        docs = [d for d in self._col.find({"_id": {"$in": ids}, "deleted": {"$ne": True}}).sort("full_name", 1)
+                if d["owner"].get("name") != PLATFORM_OWNER]
+        stats = self._stats([d["_id"] for d in docs])
+        return [{**self.public(doc), **stats.get(doc["_id"], {}), "my_role": self._authz.bucket_role(actor, doc["_id"]),
+                 "relation": self._relation(actor, doc)} for doc in docs]
+
+    def _stats(self, keys: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Used bytes, files and last change; nothing (the page shows "—")
+        when storage doesn't answer -- the list itself still loads."""
+        if not keys:
+            return {}
+        try:
+            return self._storage.bucket_stats(keys)
+        except Exception:
+            return {}
+
+    def _relation(self, actor: Actor, doc: Dict[str, Any]) -> str:
+        owner = doc["owner"]
+        if owner["kind"] == "user":
+            return "mine" if owner["id"] == actor.user_id else "shared"
+        return "team" if self._teams.role_of(actor.user_id, owner["id"]) is not None else "shared"
+
+    def _owns(self, actor: Actor, doc: Dict[str, Any]) -> bool:
+        """Owner of a deleted bucket (no Xolo resource any more): the person
+        it belonged to, or the Team Owner of the team it belonged to."""
+        owner = doc["owner"]
+        if owner["kind"] == "user":
+            return owner["id"] == actor.user_id
+        return self._teams.role_of(actor.user_id, owner["id"]) == R.OWNER
+
+    def list_deleted(self, actor: Actor) -> List[Dict[str, Any]]:
+        """Deleted buckets the person owns and can still restore."""
         out = []
-        for doc in self._col.find({"_id": {"$in": ids}, "deleted": {"$ne": True}}).sort("full_name", 1):
-            out.append({**self.public(doc), "my_role": self._authz.bucket_role(actor, doc["_id"])})
+        for doc in self._col.find({"deleted": True, "purged": {"$ne": True}}).sort("deleted_at", -1):
+            if self._owns(actor, doc):
+                out.append({**self.public(doc), "deleted_at": doc["deleted_at"], "purge_after": doc["purge_after"],
+                            "deleted_by": doc.get("deleted_by"), "my_role": R.OWNER,
+                            "relation": "mine" if doc["owner"]["kind"] == "user" else "team"})
         return out
+
+    def _deleted(self, actor: Actor, bucket_id: str) -> Dict[str, Any]:
+        doc = self._col.find_one({"_id": bucket_id, "deleted": True, "purged": {"$ne": True}})
+        if doc is None or not self._owns(actor, doc):
+            raise NotFoundError("no deleted bucket to restore with that id")
+        return doc
+
+    def restore(self, actor: Actor, bucket_id: str) -> Dict[str, Any]:
+        """Back as it was: its files (never removed), names, size limit and
+        everyone's access (saved when it was deleted)."""
+        doc = self._deleted(actor, bucket_id)
+        resource = R.bucket_resource(bucket_id)
+        given = set(self._claim(resource, doc["owner"]))
+        for grant in doc.get("saved_access") or []:
+            if grant["principal_id"] not in given:
+                self._identity.grant(resource, grant["principal_id"], grant["principal_type"],
+                                     frozenset(grant["permissions"]))
+        self._col.update_one({"_id": bucket_id}, {"$set": {"deleted": False},
+                                                   "$unset": {"deleted_at": "", "deleted_by": "", "purge_after": "",
+                                                              "saved_access": ""}})
+        self._access.changed_resource(resource)
+        self._record(bucket_id, "BucketRestored", actor, full_name=doc["full_name"])
+        return self.public(self._col.find_one({"_id": bucket_id}))
+
+    def delete_permanently(self, actor: Actor, bucket_id: str) -> None:
+        """A deleted bucket's files go now instead of after the grace period;
+        its names are free again."""
+        doc = self._deleted(actor, bucket_id)
+        self._purge(doc)
+        self._record(bucket_id, "BucketPurged", actor, full_name=doc["full_name"])
 
     def public(self, doc: Dict[str, Any]) -> Dict[str, Any]:
         aliases = [a["_id"] for a in self._names_col.find({"bucket_id": doc["_id"], "kind": ALIAS})]
@@ -209,15 +289,6 @@ class Buckets:
         self._access.changed_resource(resource)
         self._record(doc["_id"], "BucketUnshared", actor, principal_id=principal_id)
 
-    def access_list(self, actor: Actor, full_name: str) -> List[Dict[str, Any]]:
-        doc = self.resolve(full_name)
-        self._authz.require_bucket(actor, doc["_id"], R.OWNER)
-        out = []
-        for grant in self._access.grants(R.bucket_resource(doc["_id"])):
-            role = R.bucket_role_from_permissions(grant.permissions, grant.is_owner)
-            out.append({"principal_id": grant.principal_id, "principal_type": grant.principal_type, "role": role})
-        return out
-
     def complete_transfer(self, bucket_id: str, new_owner: Dict[str, str], by: str) -> Dict[str, Any]:
         """Both sides agreed (see Transfers). The bucket gets the new owner's
         name; the old full name stays as an alias so nothing breaks."""
@@ -248,9 +319,12 @@ class Buckets:
         doc = self.resolve(full_name)
         self._authz.require_bucket(actor, doc["_id"], R.OWNER)
         now = self._now_fn()
-        self._col.update_one({"_id": doc["_id"]}, {"$set": {"deleted": True, "deleted_at": now,
-                                                           "purge_after": now + self._grace_s}})
         resource = R.bucket_resource(doc["_id"])
+        # Who had access, so a restore gives it back without new invitations.
+        saved = [{"principal_id": g.principal_id, "principal_type": g.principal_type,
+                  "permissions": sorted(g.permissions)} for g in self._access.grants(resource) if not g.is_owner]
+        self._col.update_one({"_id": doc["_id"]}, {"$set": {"deleted": True, "deleted_at": now, "deleted_by": actor.user_id,
+                                                           "purge_after": now + self._grace_s, "saved_access": saved}})
         try:
             self._identity.delete_resource(resource)
         finally:
@@ -261,11 +335,14 @@ class Buckets:
         """Objects of buckets deleted more than the grace period ago."""
         purged = []
         for doc in self._col.find({"deleted": True, "purged": {"$ne": True}, "purge_after": {"$lte": self._now_fn()}}):
-            self._storage.purge_bucket(doc["_id"])
-            self._names_col.delete_many({"bucket_id": doc["_id"]})
-            self._col.update_one({"_id": doc["_id"]}, {"$set": {"purged": True}})
+            self._purge(doc)
             purged.append(doc["_id"])
         return purged
+
+    def _purge(self, doc: Dict[str, Any]) -> None:
+        self._storage.purge_bucket(doc["_id"])
+        self._names_col.delete_many({"bucket_id": doc["_id"]})
+        self._col.update_one({"_id": doc["_id"]}, {"$set": {"purged": True}, "$unset": {"saved_access": ""}})
 
     def _record(self, bucket_id: str, event_type: str, actor: Actor, **data: Any) -> None:
         self._history.append(f"bucket-{bucket_id}", event_type,
@@ -280,7 +357,11 @@ class StorageAccess:
       Reader+, write needs Writer+;
     - when a job asks (a VE is named), the user is also Developer+ there;
     - platform buckets (``axo/...``): a VE's code bucket only for that VE's
-      own VEM, anything else only for platform services.
+      own VEM; its results bucket (every job's result) written only by
+      that VEM (``vem:<ve>``) and read by it and anyone with a role in the
+      VE (Viewer+); its objects bucket (big active-object values) only by
+      that VE's endpoints (``endpoint:<ve>``), for nobody else; anything
+      else only for platform services.
 
     The answer carries the bucket's storage key (names and aliases resolve
     to it) and size limit. Unknown and deleted buckets are refused."""
@@ -307,7 +388,7 @@ class StorageAccess:
             except InvalidError:
                 return {"allowed": False, "reason": "bucket names are written as owner/bucket"}
             if owner == PLATFORM_OWNER:
-                return self._platform_bucket(bucket, name, virtual_environment_id)
+                return self._platform_bucket(bucket, name, virtual_environment_id, user_id, mode)
             try:
                 doc = self._buckets.resolve(bucket)
             except NotFoundError:
@@ -324,8 +405,25 @@ class StorageAccess:
                         "bucket_key": doc["_id"], "quota_bytes": doc["quota_bytes"]}
         return {"allowed": True, "reason": "granted", "bucket_key": doc["_id"], "quota_bytes": doc["quota_bytes"]}
 
-    @staticmethod
-    def _platform_bucket(full_name: str, name: str, virtual_environment_id: Optional[str]) -> Dict[str, Any]:
+    def _platform_bucket(self, full_name: str, name: str, virtual_environment_id: Optional[str], user_id: str,
+                         mode: str) -> Dict[str, Any]:
+        results_ve = ve_of_results_bucket(full_name)
+        if results_ve is not None and virtual_environment_id is not None:
+            granted = {"allowed": True, "bucket_key": full_name}
+            if virtual_environment_id != results_ve:
+                return {"allowed": False, "reason": "another VE's results bucket"}
+            if user_id == f"vem:{results_ve}":
+                return {**granted, "reason": "the VE's own VEM"}
+            if mode == "write":
+                return {"allowed": False, "reason": "only the VE's VEM writes its results bucket"}
+            if R.at_least(self._access.ve_role(user_id, results_ve), R.VIEWER):
+                return {**granted, "reason": "a role in the VE"}
+            return {"allowed": False, "reason": "the user has no role in this VE"}
+        objects_ve = ve_of_objects_bucket(full_name)
+        if objects_ve is not None and virtual_environment_id is not None:
+            if virtual_environment_id == objects_ve and user_id == f"endpoint:{objects_ve}":
+                return {"allowed": True, "reason": "the VE's own endpoints", "bucket_key": full_name}
+            return {"allowed": False, "reason": "only the VE's endpoints use its objects bucket"}
         if name.startswith("ve-") and name.endswith("-functions"):
             owner_ve = name[len("ve-"):-len("-functions")]
             if virtual_environment_id in (None, owner_ve):

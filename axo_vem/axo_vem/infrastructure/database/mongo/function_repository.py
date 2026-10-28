@@ -77,11 +77,20 @@ class MongoFunctionRepository(FunctionRepository):
         key = f"{data['function_id']}:{data['version']}"
         self._collection.update_one({"_id": key}, {"$pull": {"endpoint_id": data["endpoint_id"]}})
 
+    def find_by_code_hash(self, function_id: str, code_hash: str) -> Optional[Function]:
+        doc = self._collection.find_one(
+            {"function_id": function_id, "code_hash": code_hash, "deleted_at": None}, sort=[("version", -1)])
+        return _doc_to_function(doc) if doc is not None else None
+
     def list_by_endpoint_id(self, endpoint_id: str) -> List[Function]:
         # Equality match against an array field means "array contains" in
         # Mongo, so this needs no change for endpoint_id's string -> list migration.
         docs = self._collection.find({"endpoint_id": endpoint_id, "deleted_at": None})
         return [_doc_to_function(doc) for doc in docs]
+
+    def latest(self, function_id: str) -> Optional[Function]:
+        doc = self._collection.find_one({"function_id": function_id, "deleted_at": None}, sort=[("version", -1)])
+        return _doc_to_function(doc) if doc is not None else None
 
     def list_active(self) -> List[Function]:
         """Every function version not soft-deleted, oldest version first per
@@ -102,4 +111,6 @@ def _doc_to_function(doc: Dict[str, Any]) -> Function:
         container_status=doc.get("container_status"),
         name=doc.get("name"),
         params_schema=doc.get("params_schema"),
+        code_format=doc.get("code_format"),
+        code_hash=doc.get("code_hash"),
     )

@@ -133,7 +133,10 @@ def run_consensus_tick(
                     timestamp=now,
                 ))
 
-    if view.term != previous_view.term:
+    # The first tick also announces the starting view: a lone endpoint stays
+    # leader at term 0 for good, and the VEM must still learn it has one.
+    first_tick = previous_member_ids is None
+    if view.term != previous_view.term or first_tick:
         logger.info_event(
             Event.Consensus.LEADER_ELECTED,
             component=Component.CONSENSUS,

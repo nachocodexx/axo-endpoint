@@ -12,6 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY pyproject.toml poetry.lock* ./
 COPY axo_endpoint/ ./axo_endpoint/
 COPY axo_shared/ ./axo_shared/
+# The axo library: Axo classes and @axo_function code are run through it.
+COPY axo/pyproject.toml axo/README.md ./axo/
+COPY axo/axo/ ./axo/axo/
 
 # Install dependencies only -- axo_endpoint/ is already copied in as plain
 # files above and importable via WORKDIR, so there's no need for poetry to

@@ -40,12 +40,25 @@ class StackSettings:
     storage_uri: str
     cp_intake_uri: str
     container_backend: str = "docker"
+    # The VE's Redis: small active-object values (kept on disk too: they're state).
+    redis_image: str = "redis:8-alpine"
     vem_token_fn: Callable[[str], str] = lambda ve_id: ""
     storage_token_fn: Callable[[str], str] = lambda ve_id: ""
     platform_limits: Dict[str, Any] = field(default_factory=dict)
     # Creates the VE's platform code bucket (axo/ve-<id>-functions) in
     # axo_storage; the VEM only reaches it with its own VE token.
     ensure_code_bucket: Callable[[str], None] = lambda ve_id: None
+    # The VE's results bucket (axo/ve-<id>-results: every job's result,
+    # billed to the VE's owner): created with the VE, removed when it's deleted.
+    ensure_results_bucket: Callable[[str], None] = lambda ve_id: None
+    drop_results_bucket: Callable[[str], None] = lambda ve_id: None
+    # The VE's objects bucket (axo/ve-<id>-objects: big active-object values,
+    # only its endpoints use it); removed with the volumes after the grace period.
+    ensure_objects_bucket: Callable[[str], None] = lambda ve_id: None
+
+
+# The VE's own data services, started before its VEM.
+BACKING_ROLES = ("kurrent", "mongo", "redis")
 
 
 def labels_for(ve_id: str, role: str) -> Dict[str, str]:
@@ -94,6 +107,8 @@ class Provisioner:
         self._salvage = salvage
         self._now_fn = now_fn
         self.last_errors: Dict[str, str] = {}
+        # Called after each step of a VE that should run (the automatic Repair).
+        self.after_running: Optional[Callable[[VirtualEnvironment], Any]] = None
 
     # ── loop ─────────────────────────────────────────────────────────────────
     def run_forever(self, stop_event: threading.Event, interval_s: float = 5.0) -> None:
@@ -119,8 +134,13 @@ class Provisioner:
         return worked
 
     def step(self, ve: VirtualEnvironment) -> None:
+        doc = self._col.find_one({"_id": ve.ve_id}, {"repair_running_until": 1}) or {}
+        if (doc.get("repair_running_until") or 0.0) > self._now_fn():
+            return                            # a Repair is working on it right now
         if ve.desired == V.DESIRED_RUNNING:
             self._bring_up(ve)
+            if self.after_running is not None:
+                self.after_running(self._reload(ve.ve_id))
         elif ve.desired in (V.DESIRED_STOPPED, V.DESIRED_SLEEPING):
             self._wind_down(ve)
         elif ve.desired == V.DESIRED_DELETED:
@@ -131,11 +151,17 @@ class Provisioner:
         d = self._driver
         d.ensure_network(ve.network, labels_for(ve.ve_id, "network"))
         d.connect(ve.network, self._s.storage_container)
-        doc = self._col.find_one({"_id": ve.ve_id}, {"code_bucket": 1}) or {}
+        doc = self._col.find_one({"_id": ve.ve_id}, {"code_bucket": 1, "results_bucket": 1, "objects_bucket": 1}) or {}
         if not doc.get("code_bucket"):
             self._s.ensure_code_bucket(ve.ve_id)
             self._col.update_one({"_id": ve.ve_id}, {"$set": {"code_bucket": True}})
-        for role in ("kurrent", "mongo"):
+        if not doc.get("results_bucket"):
+            self._s.ensure_results_bucket(ve.ve_id)
+            self._col.update_one({"_id": ve.ve_id}, {"$set": {"results_bucket": True}})
+        if not doc.get("objects_bucket"):
+            self._s.ensure_objects_bucket(ve.ve_id)
+            self._col.update_one({"_id": ve.ve_id}, {"$set": {"objects_bucket": True}})
+        for role in BACKING_ROLES:
             self._ensure_container(ve, role)
         fresh_vem = self._ensure_container(ve, "vem")
         if fresh_vem:
@@ -148,6 +174,13 @@ class Provisioner:
         if doc.get("limits_dirty"):
             self._vem.set_limits(ve.ve_id, self.vem_limits(ve), by="control-plane")
             self._col.update_one({"_id": ve.ve_id}, {"$set": {"limits_dirty": False}})
+        pending = doc.get("repair_unreported")
+        if pending:
+            # A Repair ran while the VEM was down: now it answers, it retries
+            # its failed endpoints and records the repair in the VE's history.
+            self._vem.repair(ve.ve_id, pending.get("by") or "control-plane", pending.get("steps") or [],
+                             bool(pending.get("automatic")))
+            self._col.update_one({"_id": ve.ve_id}, {"$unset": {"repair_unreported": ""}})
         vem_lifecycle = (ve.heartbeat or {}).get("lifecycle")
         if vem_lifecycle in (V.STOPPED, V.FAILED):
             # Containers are back after a stop / sleep: the VEM restarts its
@@ -169,17 +202,41 @@ class Provisioner:
 
     def _ensure_container(self, ve: VirtualEnvironment, role: str) -> bool:
         """True if the container was just created or started."""
+        return self.ensure_role(ve, role) != "running"
+
+    def ensure_role(self, ve: VirtualEnvironment, role: str) -> str:
+        """One of the VE's containers running: "running" (it was),
+        "started" (it was stopped) or "created" (it was missing)."""
         name = ve.container(role)
         state = self._driver.state(name)
         if state == "running":
-            return False
+            return "running"
         if state is None:
             self._driver.run(self._spec(ve, role))
         else:
             self._driver.start(name)
         if role == "vem":
             self._update(ve.ve_id, vem_started_at=self._now_fn())
-        return True
+        return "created" if state is None else "started"
+
+    def image_of(self, ve: VirtualEnvironment, role: str) -> str:
+        return self._spec(ve, role).image
+
+    def recreate(self, ve: VirtualEnvironment, role: str) -> None:
+        """The container again from its image as it is now; its data is in
+        its volume, so nothing is lost."""
+        if role == "vem":
+            self.recreate_vem(ve)
+            return
+        self._driver.remove(ve.container(role))
+        self.ensure_role(ve, role)
+
+    def recreate_vem(self, ve: VirtualEnvironment) -> None:
+        """A new VEM container; its data is in the VE's Kurrent / Mongo and
+        its outbox volume, so nothing is lost."""
+        self._driver.remove(ve.container("vem"))
+        self.ensure_role(ve, "vem")
+        self._update(ve.ve_id, vem_down_since=None, vem_started_at=self._now_fn())
 
     def _vem_alive(self, ve: VirtualEnvironment) -> bool:
         """Heartbeats are the VEM's sign of life. No heartbeat for a while =
@@ -198,12 +255,11 @@ class Provisioner:
         down_since = ve.vem_down_since or now
         if ve.vem_down_since is None:
             self._update(ve.ve_id, vem_down_since=now, health="Unavailable",
-                         lifecycle_reason="the VE manager is not responding")
+                         lifecycle_reason=V.VEM_DOWN_REASON)
             self._history.append(f"ve-{ve.ve_id}", "VemDown", {"ve_id": ve.ve_id, "at": now})
         elif now - down_since >= self._vem_recreate_after_s:
-            self._driver.remove(ve.container("vem"))
-            self._ensure_container(ve, "vem")
-            self._update(ve.ve_id, vem_down_since=None, vem_started_at=now, step="vem recreated")
+            self.recreate_vem(ve)
+            self._update(ve.ve_id, step="vem recreated")
             self._history.append(f"ve-{ve.ve_id}", "VemRecreated", {"ve_id": ve.ve_id, "at": now})
         return False
 
@@ -221,7 +277,7 @@ class Provisioner:
                     self._update(ve.ve_id, step="vem stopping endpoints")
                 return
             # Stopped (or unreachable: nothing to drain through it).
-        for role in ("vem", "mongo", "kurrent"):
+        for role in ("vem", "redis", "mongo", "kurrent"):
             if self._driver.state(ve.container(role)) == "running":
                 self._driver.stop(ve.container(role))
         if ve.lifecycle != target:
@@ -239,7 +295,7 @@ class Provisioner:
         if self._driver.state(vem_name) is not None and not doc.get("vem_settled"):
             if self._driver.state(vem_name) != "running":
                 self._driver.start(vem_name)
-                for role in ("kurrent", "mongo"):
+                for role in BACKING_ROLES:
                     self._ensure_container(ve, role)
                 return
             status = self._vem_status_or_none(ve)
@@ -265,6 +321,10 @@ class Provisioner:
                 self._driver.remove(info.name)
         self._driver.disconnect(ve.network, self._s.storage_container)
         self._driver.remove_network(ve.network)
+        if doc.get("results_bucket"):
+            # the jobs are gone with the VE: stop paying for their results
+            self._s.drop_results_bucket(ve.ve_id)
+            self._col.update_one({"_id": ve.ve_id}, {"$set": {"results_bucket": False}})
         self._capacity.release(ve.reserved)
         try:
             self._identity.delete_resource(R.ve_resource(ve.ve_id))
@@ -292,6 +352,14 @@ class Provisioner:
             "max_endpoints": plan.max_endpoints,
             "policies_allowed": plan.policies_allowed,
             "max_retention_days": plan.max_retention_days,
+            "object_max_state_bytes": plan.object_max_state_bytes,
+            "object_hot_max_bytes": plan.object_hot_max_bytes,
+            "object_keep_revisions": plan.object_keep_revisions,
+            "object_max_keep_revisions": plan.object_max_keep_revisions,
+            "runner_cpu_cores": plan.runner_cpu_cores,
+            "runner_memory_mb": plan.runner_memory_mb,
+            "runner_max_cpu_cores": plan.runner_max_cpu_cores,
+            "runner_max_memory_mb": plan.runner_max_memory_mb,
             "quota_cpu_cores": ve.quota.cpu_cores,
             "quota_memory_mb": ve.quota.memory_mb,
             **self._s.platform_limits,
@@ -312,6 +380,14 @@ class Provisioner:
                 volumes={f"ve-{ve.ve_id}-kurrent-data": "/var/lib/eventstore"},
                 cpu_cores=round(base.cpu_cores * 0.4, 2), memory_mb=int(base.memory_mb * 0.4),
             )
+        if role == "redis":
+            # Small object values are state: append-only file on a volume.
+            return ContainerRun(
+                name=ve.container(role), image=self._s.redis_image, networks=[ve.network], labels=labels,
+                command=["redis-server", "--appendonly", "yes", "--save", "60 1"],
+                volumes={f"ve-{ve.ve_id}-redis-data": "/data"},
+                cpu_cores=round(base.cpu_cores * 0.1, 2), memory_mb=int(base.memory_mb * 0.15),
+            )
         if role == "mongo":
             return ContainerRun(
                 name=ve.container(role), image=self._s.mongo_image, networks=[ve.network], labels=labels,
@@ -331,6 +407,14 @@ class Provisioner:
             "AXO_VEM_PLAN_MAX_ENDPOINTS": str(limits["max_endpoints"]),
             "AXO_VEM_PLAN_POLICIES_ALLOWED": str(limits["policies_allowed"]).lower(),
             "AXO_VEM_PLAN_MAX_RETENTION_DAYS": str(limits["max_retention_days"]),
+            "AXO_VEM_PLAN_OBJECT_MAX_STATE_BYTES": str(limits["object_max_state_bytes"]),
+            "AXO_VEM_PLAN_OBJECT_HOT_MAX_BYTES": str(limits["object_hot_max_bytes"]),
+            "AXO_VEM_PLAN_OBJECT_KEEP_REVISIONS": str(limits["object_keep_revisions"]),
+            "AXO_VEM_PLAN_OBJECT_MAX_KEEP_REVISIONS": str(limits["object_max_keep_revisions"]),
+            "AXO_VEM_PLAN_RUNNER_CPU_CORES": str(limits["runner_cpu_cores"]),
+            "AXO_VEM_PLAN_RUNNER_MEMORY_MB": str(limits["runner_memory_mb"]),
+            "AXO_VEM_PLAN_RUNNER_MAX_CPU_CORES": str(limits["runner_max_cpu_cores"]),
+            "AXO_VEM_PLAN_RUNNER_MAX_MEMORY_MB": str(limits["runner_max_memory_mb"]),
             "AXO_VEM_QUOTA_CPU_CORES": str(limits["quota_cpu_cores"]),
             "AXO_VEM_QUOTA_MEMORY_MB": str(limits["quota_memory_mb"]),
             "AXO_VEM_INITIAL_SETTINGS": _json({
@@ -345,6 +429,11 @@ class Provisioner:
             "AXO_VEM_STORAGE_URI": self._s.storage_uri,
             "AXO_VEM_NODE_STORAGE_URI": self._s.storage_uri,
             "AXO_VEM_VE_STORAGE_TOKEN": self._s.storage_token_fn(ve.ve_id),
+            # Active-object state of every endpoint: the VE's own Mongo, Redis
+            # and objects bucket, so it survives a leader change.
+            "AXO_VEM_NODE_OBJECT_MONGO_URI": f"mongodb://{ve.container('mongo')}:27017",
+            "AXO_VEM_NODE_OBJECT_REDIS_URI": f"redis://{ve.container('redis')}:6379/0",
+            "AXO_VEM_NODE_OBJECT_BLOBS": "axo_storage",
             "AXO_VEM_NODE_IMAGE": self._s.endpoint_image,
             "AXO_VEM_NODE_NETWORK": ve.network,
             "AXO_VEM_DOCKER_MODE": self._s.container_backend,
@@ -355,6 +444,8 @@ class Provisioner:
             env["AXO_VEM_PLATFORM_MAX_QUEUE_LIMIT"] = str(limits["max_queue_limit"])
         if limits.get("max_wait_seconds"):
             env["AXO_VEM_PLATFORM_MAX_WAIT_SECONDS"] = str(limits["max_wait_seconds"])
+        if limits.get("history_grace_days") is not None:
+            env["AXO_VEM_HISTORY_GRACE_DAYS"] = str(limits["history_grace_days"])
         return ContainerRun(
             name=ve.container("vem"), image=self._s.vem_image, env=env,
             networks=[ve.network, self._s.control_network], labels=labels,

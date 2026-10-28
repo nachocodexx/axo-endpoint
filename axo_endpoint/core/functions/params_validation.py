@@ -48,7 +48,9 @@ def validate_and_fill_params(
                     f"missing required param '{spec.name}'",
                     context={"field": spec.name},
                 ))
-            filled[spec.name] = spec.default
+            if spec.default is not None:
+                filled[spec.name] = spec.default
+            # optional with no default recorded: left out, so the code's own default applies
             continue
 
         value = params[spec.name]

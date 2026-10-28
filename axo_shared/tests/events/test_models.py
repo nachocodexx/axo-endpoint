@@ -53,6 +53,10 @@ def test_event_type_constants_are_distinct():
         models.CHOREOGRAPHY_CREATED,
         models.CHOREOGRAPHY_UPDATED,
         models.CHOREOGRAPHY_DELETED,
+        models.CHOREOGRAPHY_TRIGGER_ADDED,
+        models.CHOREOGRAPHY_TRIGGER_REMOVED,
+        models.CHOREOGRAPHY_RUN_STARTED,
+        models.CHOREOGRAPHY_RUN_FINISHED,
     ]
     assert len(constants) == len(set(constants))
 
@@ -261,20 +265,14 @@ def test_endpoint_virtual_environment_detached_fields():
 def _choreography_graph() -> models.ChoreographyGraph:
     return models.ChoreographyGraph(
         nodes=[
-            models.ChoreographyNode(
-                node_id="n1", kind="function", position={"x": 0.0, "y": 0.0},
-                function_id="add", function_version=1,
-            ),
-            models.ChoreographyNode(
-                node_id="n2", kind="bucket", position={"x": 100.0, "y": 0.0},
-                bucket_name="inputs",
-            ),
+            models.ChoreographyNode(node_id="n1", kind="function", function_id="add", function_version=1,
+                                    params={"b": 2}),
+            models.ChoreographyNode(node_id="n2", kind="bucket", bucket_name="alice/inputs"),
+            models.ChoreographyNode(node_id="n3", kind="object", object_name="counter-1", method="add"),
         ],
         edges=[
-            models.ChoreographyEdge(
-                edge_id="e1", source_node_id="n2", target_node_id="n1",
-                kind="bucket_to_fn", parallelism=2,
-            ),
+            models.ChoreographyEdge(edge_id="e1", source_node_id="n2", target_node_id="n1"),
+            models.ChoreographyEdge(edge_id="e2", source_node_id="n1", target_node_id="n3"),
         ],
     )
 
@@ -285,14 +283,19 @@ def test_choreography_created_fields():
     )
     assert event.choreography_id == "c1"
     assert event.owner_user_id == "u1"
-    assert len(event.graph.nodes) == 2
-    assert event.graph.edges[0].kind == "bucket_to_fn"
+    assert event.version == 1
+    assert event.settings.max_parallel_runs == 10
+    assert len(event.graph.nodes) == 3
+    assert event.graph.nodes[0].max_attempts is None and event.graph.nodes[0].join == "all"
 
 
 def test_choreography_updated_fields():
-    event = models.ChoreographyUpdated(choreography_id="c1", name="pipeline-v2", graph=_choreography_graph())
+    event = models.ChoreographyUpdated(choreography_id="c1", name="pipeline-v2", version=2,
+                                       graph=_choreography_graph(),
+                                       settings=models.ChoreographySettings(max_parallel_runs=3))
     assert event.name == "pipeline-v2"
-    assert event.graph.nodes[0].function_id == "add"
+    assert event.version == 2 and event.settings.max_parallel_runs == 3
+    assert event.graph.nodes[2].object_name == "counter-1"
 
 
 def test_choreography_deleted_fields():
@@ -300,23 +303,33 @@ def test_choreography_deleted_fields():
     assert event.choreography_id == "c1"
 
 
+def test_choreography_trigger_and_run_events():
+    added = models.ChoreographyTriggerAdded(choreography_id="c1", trigger_id="t1", bucket="alice/raw", user_id="u1")
+    assert added.kind == "bucket_object_written" and added.version is None
+    started = models.ChoreographyRunStarted(choreography_id="c1", choreography_name="etl", run_id="r1",
+                                            version=2, started_by_type="trigger", started_by_id="t1")
+    finished = models.ChoreographyRunFinished(choreography_id="c1", choreography_name="etl", run_id="r1",
+                                              version=2, status="completed_with_errors", steps_failed=1)
+    assert started.resumed is False and finished.steps_failed == 1
+
+
 def test_choreography_node_rejects_unknown_kind():
     with pytest.raises(ValidationError):
-        models.ChoreographyNode(node_id="n1", kind="not_a_kind", position={"x": 0.0, "y": 0.0})
+        models.ChoreographyNode(node_id="n1", kind="not_a_kind")
 
 
-def test_choreography_node_rejects_unknown_retry_policy():
+def test_choreography_node_rejects_unknown_retry_backoff_and_attempts():
     with pytest.raises(ValidationError):
-        models.ChoreographyNode(
-            node_id="n1", kind="function", position={"x": 0.0, "y": 0.0}, retry_policy="not_a_policy",
-        )
-
-
-def test_choreography_edge_rejects_unknown_kind():
+        models.ChoreographyNode(node_id="n1", kind="function", retry_backoff="jitter")
     with pytest.raises(ValidationError):
-        models.ChoreographyEdge(
-            edge_id="e1", source_node_id="n1", target_node_id="n2", kind="not_a_kind",
-        )
+        models.ChoreographyNode(node_id="n1", kind="function", max_attempts=0)
+
+
+def test_choreography_node_rejects_bad_ids_and_join():
+    with pytest.raises(ValidationError):
+        models.ChoreographyNode(node_id="has space", kind="function")
+    with pytest.raises(ValidationError):
+        models.ChoreographyNode(node_id="n1", kind="function", join="any")
 
 
 def test_choreography_node_is_frozen():

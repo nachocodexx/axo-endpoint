@@ -148,6 +148,12 @@ class VeSettingsService:
         return updated
 
     def retention_cutoff(self) -> Optional[datetime]:
-        """Records older than this are hidden (never deleted). None = keep showing everything."""
+        """Records older than this are hidden. None = keep showing everything."""
         days = self.current().effective_retention_days(self._limits)
         return self._now_fn() - timedelta(days=days) if days is not None else None
+
+    def deletion_cutoff(self) -> Optional[datetime]:
+        """Records older than this are deleted for good: the retention plus
+        the platform's grace days. None = no retention, nothing is deleted."""
+        cutoff = self.retention_cutoff()
+        return cutoff - timedelta(days=max(self._limits.history_grace_days, 0)) if cutoff is not None else None

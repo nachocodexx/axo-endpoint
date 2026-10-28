@@ -64,4 +64,11 @@ def stream_name_for(event_type: str, endpoint_id: str, data: Dict[str, Any]) -> 
         # data, giving it its own single-item stream.
         bucket = data["name"].split("/", 1)[0] if "/" in data["name"] else data["name"]
         return f"buckets-{bucket}"
+    if event_type in (models.ACTIVE_OBJECT_CREATED, models.ACTIVE_OBJECT_CALLED,
+                      models.ACTIVE_OBJECT_UPGRADED, models.ACTIVE_OBJECT_DELETED):
+        return f"objects-{data['object_id']}"
+    if event_type in (models.ACTIVE_OBJECT_CLASS_REGISTERED, models.ACTIVE_OBJECT_CLASS_VERSION_DELETED):
+        return f"object-classes-{data['class_name']}"
+    if event_type == models.ACTIVE_OBJECT_STATE_SIZES_REPORTED:
+        return f"object-sizes-{endpoint_id}"
     raise ValueError(f"unknown event_type: {event_type!r}")

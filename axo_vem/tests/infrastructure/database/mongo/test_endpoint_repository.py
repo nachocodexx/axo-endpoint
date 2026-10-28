@@ -75,3 +75,17 @@ def test_list_all_tie_breaks_by_endpoint_id_ascending():
     endpoints = repository.list_all()
 
     assert [e.endpoint_id for e in endpoints] == ["n1", "n9"]
+
+
+def test_a_reading_updates_the_figures_but_an_older_resent_one_changes_nothing():
+    repository = _repository()
+    repository.apply_event_data("n0", {"status": "running", "created_at": "2026-01-02T00:00:00Z"})
+    repository.apply_reading("n0", {"metrics": {"queue_depth": 4}, "created_at": "2026-01-02T00:00:10Z"})
+    repository.apply_reading("n0", {"metrics": {"queue_depth": 9}, "created_at": "2026-01-02T00:00:05Z"})
+    repository.apply_reading("gone", {"metrics": {"queue_depth": 1}, "created_at": "2026-01-02T00:00:05Z"})
+
+    doc = repository._collection.find_one({"_id": "n0"})
+    assert doc["metrics"] == {"queue_depth": 4} and doc["status"] == "running"
+    assert doc["created_at"] == "2026-01-02T00:00:10Z"
+    # Never listed (or forgotten): a reading doesn't bring it back.
+    assert repository._collection.find_one({"_id": "gone"}) is None

@@ -1,0 +1,27 @@
+"""Every endpoint error a person can see is in the shared error catalog
+(axo_shared/error_catalog.py) with the same number and name."""
+import importlib
+import inspect
+import pkgutil
+
+from axo_shared import error_catalog as C
+from axo_shared.errors import AxoError
+
+import axo_endpoint
+
+# Not the active code (old/), or modules that run on import (CLI entry points).
+_SKIP = (".old", ".runner", "__main__", ".cli", ".main", ".client_cli")
+
+
+def test_every_endpoint_error_class_is_in_the_catalog():
+    missing = []
+    for info in pkgutil.walk_packages(axo_endpoint.__path__, "axo_endpoint."):
+        if any(part in info.name for part in _SKIP):
+            continue
+        module = importlib.import_module(info.name)
+        for _, cls in inspect.getmembers(module, inspect.isclass):
+            if issubclass(cls, AxoError) and cls.__module__ == module.__name__:
+                entry = C.BY_CODE.get(cls.code)
+                if entry is None or entry.name != cls.name:
+                    missing.append(f"{cls.__module__}.{cls.__name__} ({cls.code} {cls.name})")
+    assert sorted(missing) == []

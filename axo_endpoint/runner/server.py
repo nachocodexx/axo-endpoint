@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from axo_endpoint.core.dataio import DataIOError, DataIOTimeoutError, IORef
 from axo_endpoint.core.results import is_json_safe_value
 from axo_endpoint.core.runtime import InvocationContext, build_invocation
+from axo_endpoint.core.runtime.failure import report_exception
 from axo_endpoint.dataio import bind_channel, reset_channel
 from axo_endpoint.runner.job_store import JobStore
 
@@ -163,7 +164,7 @@ class RunnerServer:
                 warnings_payload = json.dumps(ctx.warnings).encode("utf-8")
                 sock.send_multipart([identity, b"result", job_id_b, b"ok", payload, warnings_payload])
             except Exception as exc:
-                error = str(exc)
+                error = report_exception(exc)
                 logger.warning("zmq job failed job_id=%s error=%s", job_id, error)
                 self._store.set_result(job_id, ok=False, error=error, warnings=ctx.warnings)
                 warnings_payload = json.dumps(ctx.warnings).encode("utf-8")
@@ -229,7 +230,7 @@ class RunnerServer:
                     store.set_result(job_id, ok=True, output=output, warnings=ctx.warnings)
                     push_result(job_id, "ok", _encode_result(result))
                 except Exception as exc:
-                    error = str(exc)
+                    error = report_exception(exc)
                     store.set_result(job_id, ok=False, error=error, warnings=ctx.warnings)
                     push_result(job_id, "err", error.encode())
 

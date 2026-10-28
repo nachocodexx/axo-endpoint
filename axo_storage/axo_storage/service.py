@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import threading
 import time
 from typing import Any, Callable, Dict, Optional, Union
 
@@ -28,6 +29,7 @@ from axo_storage.catalog import COMPLETE, FAILED, UPLOADING, ObjectRow, StorageC
 from axo_storage.chunk_store import ChunkStore, chunk_path
 from axo_storage.log import DumbLogger, Log
 from axo_storage.log.catalog import Component, Event
+from axo_storage.usage import UsageMeter
 
 _Logger = Union[Log, DumbLogger]
 
@@ -36,6 +38,14 @@ _Logger = Union[Log, DumbLogger]
 _BUCKET_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]{0,37}[a-z0-9])?/)?[a-z0-9][a-z0-9._-]{0,62}$")
 _NAME_RE = re.compile(r"^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$")
 MAX_CHUNK_BYTES = 64 * 1024 * 1024
+# Bucket create / delete are the Control Plane's own housekeeping: never
+# counted as a billable request.
+_NOT_METERED = {wire.BUCKET_CREATE, wire.BUCKET_DELETE}
+# One billed request per object operation, like S3 (upgrade.md 13.3): a
+# write = its OBJECT_REGISTER, a read = its first chunk, plus list / delete.
+# The calls that make up a read or write (other chunks, finalize, info /
+# status checks) are free; their bytes are still counted.
+_ONE_REQUEST = {wire.OBJECT_REGISTER, wire.OBJECT_LIST, wire.OBJECT_DELETE}
 
 
 class StorageService:
@@ -45,7 +55,10 @@ class StorageService:
 
     Objects live in buckets, by (bucket, name, version). A version never
     changes once complete; writing again creates the next version, and a
-    read without a version gets the latest complete one."""
+    read without a version gets the latest complete one.
+
+    With a ``meter``, every request that succeeded is counted for billing
+    (bucket, VE, user, bytes read / written)."""
 
     def __init__(
         self,
@@ -55,8 +68,15 @@ class StorageService:
         access: AccessChecker,
         now_fn: Callable[[], float] = time.time,
         logger: _Logger = None,
+        meter: Optional[UsageMeter] = None,
+        on_written: Optional[Callable[[ObjectRow, Caller], None]] = None,
     ) -> None:
         self._catalog = catalog
+        # Called once a version is complete ("object written": the CP sends
+        # it on to the VEs with a trigger on that bucket).
+        self._on_written = on_written
+        self._meter = meter
+        self._request = threading.local()   # the bucket key this request resolved to
         self._chunks = chunks
         self._auth = authenticator
         self._access = access
@@ -66,6 +86,7 @@ class StorageService:
             wire.BUCKET_CREATE: self._bucket_create,
             wire.BUCKET_INFO:     self._bucket_info,
             wire.BUCKET_DELETE:   self._bucket_delete,
+            wire.BUCKET_STATS:    self._bucket_stats,
             wire.OBJECT_REGISTER:   self._data_register,
             wire.OBJECT_CHUNK_PUT:  self._chunk_put,
             wire.OBJECT_FINALIZE:   self._finalize,
@@ -93,9 +114,12 @@ class StorageService:
         if caller_result.is_err:
             return self._fail(command, caller_result.unwrap_err(), t0)
         caller = caller_result.unwrap()
+        self._request.bucket_key = None
+        self._request.caller = caller
         result = handler(caller, command)
         if result.is_err:
             return self._fail(command, result.unwrap_err(), t0, caller)
+        self._meter_request(caller, command, result.unwrap())
         self._logger.debug_event(
             Event.Request.HANDLED,
             component=Component.SERVICE,
@@ -105,6 +129,18 @@ class StorageService:
             duration_ms=round((time.monotonic() - t0) * 1000, 2),
         )
         return result.unwrap()
+
+    def _meter_request(self, caller: Caller, command: Command, result: CommandResult) -> None:
+        key = getattr(self._request, "bucket_key", None)
+        if self._meter is None or key is None or command.operation in _NOT_METERED:
+            return
+        read = len(result.payload or b"") if command.operation == wire.OBJECT_CHUNK_GET else 0
+        written = len(command.payload or b"") if command.operation == wire.OBJECT_CHUNK_PUT else 0
+        first_chunk = command.operation == wire.OBJECT_CHUNK_GET and \
+            int((command.envelope or {}).get("chunk_index") or 0) == 0
+        requests = 1 if command.operation in _ONE_REQUEST or first_chunk else 0
+        if requests or read or written:
+            self._meter.record(key, caller, bytes_read=read, bytes_written=written, requests=requests)
 
     def _fail(self, command: Command, err: AxoError, t0: float, caller: Optional[Caller] = None) -> CommandResult:
         self._logger.info_event(
@@ -146,6 +182,7 @@ class StorageService:
         row = self._catalog.get_bucket(key)
         if row.is_err:
             return Err(row.unwrap_err())
+        self._request.bucket_key = key
         return Ok((key, row.unwrap(), decision.unwrap()))
 
     # ── ops ──────────────────────────────────────────────────────────────────
@@ -180,6 +217,16 @@ class StorageService:
             "quota_bytes": self._quota(decision, bucket.quota_bytes),
             "used_bytes": self._catalog.bucket_usage(key),
         }))
+
+    def _bucket_stats(self, caller: Caller, command: Command) -> Result[CommandResult, AxoError]:
+        """Platform services only (the bucket list): used bytes, files and
+        last change of every bucket in ``names`` (storage keys), in one go."""
+        if caller.kind != SERVICE:
+            return Err(StorageUnauthenticatedError("only a platform service can read every bucket's figures"))
+        names = command.envelope.get("names")
+        if not isinstance(names, list) or not all(isinstance(n, str) for n in names) or len(names) > 1000:
+            return Err(_invalid("names", "a list of up to 1000 bucket keys"))
+        return Ok(CommandResult(ok=True, metadata={"buckets": self._catalog.bucket_stats(names)}))
 
     def _bucket_delete(self, caller: Caller, command: Command) -> Result[CommandResult, AxoError]:
         """Platform services only (the Control Plane, once a deleted bucket's
@@ -238,6 +285,7 @@ class StorageService:
             declared_hash=env.get("content_hash"), content_hash=None,
             hash_algo=str(env.get("content_hash_algo") or "sha256"),
             state=UPLOADING, created_at=now, created_by=caller.user_id,
+            source=str(env["source"])[:200] if env.get("source") else None,
         )
         inserted = self._catalog.insert_object(row)
         if inserted.is_err:
@@ -382,6 +430,18 @@ class StorageService:
         if opened.is_err:
             return Err(opened.unwrap_err())
         key = opened.unwrap()[0]
+        if command.envelope.get("files"):
+            # One row per file (its newest version), folders from the
+            # delimiter, a page at a time: the bucket pages.
+            env = command.envelope
+            prefix, after, limit = env.get("prefix") or "", env.get("after"), env.get("limit") or 200
+            delimiter = env.get("delimiter", "/")
+            if not isinstance(prefix, str) or (after is not None and not isinstance(after, str)):
+                return Err(_invalid("prefix/after", "strings"))
+            if not isinstance(limit, int) or not 0 < limit <= 1000:
+                return Err(_invalid("limit", "between 1 and 1000"))
+            page = self._catalog.list_files(key, prefix, delimiter or None, after, limit)
+            return Ok(CommandResult(ok=True, metadata={"bucket": bucket, **page}))
         rows = self._catalog.list_objects(key, name if isinstance(name, str) else None)
         return Ok(CommandResult(ok=True, metadata={"bucket": bucket, "objects": [r.to_dict() for r in rows]}))
 
@@ -471,6 +531,12 @@ class StorageService:
             Event.Object.COMPLETED, component=Component.SERVICE, **_ident(row),
             total_size=total_size, total_chunks=len(sizes),
         )
+        if self._on_written is not None:
+            try:
+                self._on_written(finished.unwrap(), getattr(self._request, "caller", None))
+            except Exception as exc:  # the write itself already succeeded
+                self._logger.warning_event(Event.Object.WRITTEN_REPORT_FAILED, component=Component.SERVICE,
+                                           **_ident(row), error=repr(exc))
         return finished
 
     def _bucket_quota(self, bucket: str) -> Optional[int]:

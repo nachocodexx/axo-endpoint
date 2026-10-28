@@ -1,13 +1,31 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
+from pymongo import DESCENDING
 from pymongo.collection import Collection
+
+from axo_shared.events.models import ENDPOINT_METRICS_REPORTED
 
 from axo_vem.domain.events.activity_recorder import ActivityRecorder
 
 _ENVELOPE_TOP_LEVEL_FIELDS = frozenset({"user_id", "virtual_environment_id", "endpoint_id", "runtime_type"})
+
+# What the Activity page filters by (axo-ui utils/activity.ts names the same
+# areas): event type prefix -> area; anything else is about the VE itself.
+AREAS = ("job", "function", "object", "choreography", "endpoint", "ve")
+_AREA_PREFIXES = (
+    ("Job", "job"), ("Function", "function"), ("ActiveObject", "object"), ("Choreography", "choreography"),
+    ("Endpoint", "endpoint"), ("Leader", "endpoint"), ("Consensus", "endpoint"), ("Cluster", "endpoint"),
+)
+
+
+def area_of(event_type: str) -> str:
+    for prefix, area in _AREA_PREFIXES:
+        if event_type.startswith(prefix):
+            return area
+    return "ve"
 
 
 def _doc_to_dict(doc: Dict[str, Any]) -> Dict[str, Any]:
@@ -49,13 +67,27 @@ class MongoActivityRepository(ActivityRecorder):
 
     def __init__(self, collection: Collection) -> None:
         self._collection = collection
-        self._collection.create_index("user_id")
-        self._collection.create_index("virtual_environment_id")
-        self._collection.create_index("endpoint_id")
-        self._collection.create_index("meta.function_id")
-        self._collection.create_index("meta.active_object_id")
+        # Every read is "newest first, maybe of one area / endpoint / function
+        # / object, older than the last row shown": each index ends in
+        # (created_at, _id) so the newest page is read straight off it.
+        newest = [("created_at", DESCENDING), ("_id", DESCENDING)]
+        self._collection.create_index(newest)
+        for field in ("area", "endpoint_id", "meta.function_id", "meta.object_id", "meta.choreography_id", "user_id"):
+            self._collection.create_index([(field, 1), *newest])
         self._collection.create_index("meta.function_version")
-        self._collection.create_index("meta.duration_ms")
+        self._backfill()
+
+    def _backfill(self) -> None:
+        """Rows saved before areas existed get theirs; the endpoints' old
+        metric readings (never shown, no longer saved) go. Once done, rows
+        without an area never come back, so later starts stop at the check."""
+        if self._collection.find_one({"area": {"$exists": False}}, {"_id": 1}) is None:
+            return
+        self._collection.delete_many({"event_type": ENDPOINT_METRICS_REPORTED})
+        for prefix, area in _AREA_PREFIXES:
+            self._collection.update_many({"area": {"$exists": False}, "event_type": {"$regex": f"^{prefix}"}},
+                                         {"$set": {"area": area}})
+        self._collection.update_many({"area": {"$exists": False}}, {"$set": {"area": "ve"}})
 
     def record(self, event_type: str, data: Dict[str, Any]) -> None:
         meta = {
@@ -64,6 +96,7 @@ class MongoActivityRepository(ActivityRecorder):
         }
         doc = {
             "event_type": event_type,
+            "area": area_of(event_type),
             "created_at": _parse_created_at(data["created_at"]),
             "user_id": data.get("user_id"),
             "virtual_environment_id": data.get("virtual_environment_id"),
@@ -81,14 +114,22 @@ class MongoActivityRepository(ActivityRecorder):
         endpoint_id: Optional[str] = None,
         function_id: Optional[str] = None,
         active_object_id: Optional[str] = None,
+        choreography_id: Optional[str] = None,
         since: Optional[datetime] = None,
         limit: int = 100,
+        exclude_types: Sequence[str] = (),
+        areas: Sequence[str] = (),
+        before: Optional[datetime] = None,
+        before_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Newest-first, optionally filtered along any combination of the
-        five indexed dimensions. function_id/active_object_id filter on
+        indexed dimensions. function_id/active_object_id filter on
         their nested meta.* location -- see record()'s top-level/meta split.
         ``since`` (the VE's retention, or a narrower caller window) excludes
-        anything older -- rows are never deleted for retention, only hidden."""
+        anything older (hidden; rows go for good later, see delete_before).
+        ``areas`` keeps only those areas (AREAS). ``before`` / ``before_id``
+        = the last row already shown (its created_at and event_id): the
+        next page starts right after it ("Load more")."""
         query: Dict[str, Any] = {}
         if user_id is not None:
             query["user_id"] = user_id
@@ -99,12 +140,26 @@ class MongoActivityRepository(ActivityRecorder):
         if function_id is not None:
             query["meta.function_id"] = function_id
         if active_object_id is not None:
-            query["meta.active_object_id"] = active_object_id
+            query["meta.object_id"] = active_object_id
+        if choreography_id is not None:
+            query["meta.choreography_id"] = choreography_id
         if since is not None:
             query["created_at"] = {"$gte": since}
+        if exclude_types:
+            query["event_type"] = {"$nin": list(exclude_types)}
+        if areas:
+            query["area"] = {"$in": list(areas)}
+        if before is not None:
+            older = {"created_at": {"$lt": before}}
+            query["$or"] = [older, {"created_at": before, "_id": {"$lt": before_id}}] if before_id else [older]
 
-        cursor = self._collection.find(query).sort("created_at", -1).limit(limit)
+        cursor = self._collection.find(query).sort([("created_at", -1), ("_id", -1)]).limit(limit)
         return [_doc_to_dict(doc) for doc in cursor]
+
+    def delete_before(self, cutoff: datetime) -> int:
+        """Deletes every row older than ``cutoff`` for good (the VE's
+        retention plus the grace days)."""
+        return self._collection.delete_many({"created_at": {"$lt": cutoff}}).deleted_count
 
     def purge(
         self,

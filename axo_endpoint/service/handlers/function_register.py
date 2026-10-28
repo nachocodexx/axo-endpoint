@@ -76,6 +76,7 @@ class FunctionRegisterHandler(CommandHandler):
             code_format=code_format,
             params_schema=params_schema,
             restore_version=restore_version,
+            code_hash=command.envelope.get("code_hash") or None,
         )
         if result.is_err:
             raw = result.unwrap_err()

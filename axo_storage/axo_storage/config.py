@@ -71,6 +71,15 @@ class Config:
         self.AXO_STORAGE_CP_URI: str = os.environ.get("AXO_STORAGE_CP_URI", "")
         self.AXO_STORAGE_CP_CHECK_TOKEN: str = os.environ.get("AXO_STORAGE_CP_CHECK_TOKEN", "")
 
+        # Billing: every request is counted and sent to the Control Plane's
+        # intake (ZMQ, the same ROUTER the VEMs report to) once a minute, plus
+        # every bucket's size once an hour. Empty = nothing is sent (local dev).
+        self.AXO_STORAGE_CP_INTAKE_URI: str = os.environ.get("AXO_STORAGE_CP_INTAKE_URI", "")
+        # Unsent reports survive a restart here (SQLite journal).
+        self.AXO_STORAGE_USAGE_OUTBOX_PATH: str = os.environ.get("AXO_STORAGE_USAGE_OUTBOX_PATH",
+                                                                 ".axo_storage/outbox")
+        self.AXO_STORAGE_INSTANCE_ID: str = os.environ.get("AXO_STORAGE_INSTANCE_ID", "axo-storage")
+
         # Logging
         self.AXO_STORAGE_LOG_LEVEL: int = _level("AXO_STORAGE_LOG_LEVEL", "INFO")
         self.AXO_STORAGE_LOG_DISABLED: bool = _bool("AXO_STORAGE_LOG_DISABLED", "false")

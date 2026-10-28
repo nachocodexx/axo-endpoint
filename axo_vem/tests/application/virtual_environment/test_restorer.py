@@ -106,3 +106,18 @@ def test_restore_is_safe_to_repeat_and_reports_what_failed(code_store, monkeypat
 
     assert progress.restored == 1                      # already back counts as restored
     assert progress.failed[0]["function_id"] == "lost"  # no saved code
+
+
+def test_restoring_sends_back_the_code_format_and_hash(code_store, monkeypatch):
+    """A pickled function or an Axo class comes back exactly as it came."""
+    code_store.save("cls-1", 2, b"pickled-bytes")
+    sent = []
+    monkeypatch.setattr(restorer_module, "send_command",
+                        lambda rpc_uri, command, timeout: sent.append(command) or Ok(CommandResult(ok=True)))
+    function = Function(function_id="cls-1", version=2, name="Counter", code_format="cloudpickle",
+                        code_hash="abc", runtime_spec={"call_style": "object"})
+    VeRestorer(_Functions([function]), code_store, EndpointPicker(_Endpoints())).restore()
+    envelope = sent[0].envelope
+    assert (envelope["code_format"], envelope["code_hash"], envelope["runtime_spec"]) == (
+        "cloudpickle", "abc", {"call_style": "object"})
+    assert sent[0].payload == b"pickled-bytes"

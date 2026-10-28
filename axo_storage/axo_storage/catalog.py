@@ -4,7 +4,7 @@ import os
 import sqlite3
 import threading
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from option import Err, Ok, Result
 
@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS objects (
     created_at    REAL NOT NULL,
     created_by    TEXT NOT NULL,
     completed_at  REAL,
+    source        TEXT,
     PRIMARY KEY (bucket, name, version)
 );
 CREATE TABLE IF NOT EXISTS chunks (
@@ -87,6 +88,10 @@ class ObjectRow:
     created_at: float
     created_by: str
     completed_at: Optional[float] = None
+    # What wrote it, when the writer says (e.g. "choreography:<id>"): the
+    # "object written" report carries it, so a choreography's own writes
+    # don't trigger it again.
+    source: Optional[str] = None
 
     @property
     def streamed(self) -> bool:
@@ -110,6 +115,9 @@ class StorageCatalog:
         if path != ":memory:":
             self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.executescript(_SCHEMA)
+        columns = {r["name"] for r in self._conn.execute("PRAGMA table_info(objects)")}
+        if "source" not in columns:                       # a catalog from before the column
+            self._conn.execute("ALTER TABLE objects ADD COLUMN source TEXT")
         self._lock = threading.Lock()
 
     def close(self) -> None:
@@ -158,6 +166,76 @@ class StorageCatalog:
                 (bucket,),
             ).fetchone()[0]
         return int(declared) + int(streamed)
+
+    def bucket_stats(self, buckets: List[str]) -> Dict[str, Dict[str, Any]]:
+        """{bucket key: {used_bytes, files, last_change}} in one go (the
+        bucket list): files = names with a complete version, last_change =
+        the newest version's time."""
+        out: Dict[str, Dict[str, Any]] = {}
+        for bucket in buckets:
+            with self._lock:
+                files, last = self._conn.execute(
+                    "SELECT COUNT(DISTINCT CASE WHEN state = ? THEN name END), "
+                    "MAX(COALESCE(completed_at, created_at)) FROM objects WHERE bucket = ?",
+                    (COMPLETE, bucket),
+                ).fetchone()
+            out[bucket] = {"used_bytes": self.bucket_usage(bucket), "files": int(files or 0), "last_change": last}
+        return out
+
+    def list_files(self, bucket: str, prefix: str = "", delimiter: Optional[str] = "/", after: Optional[str] = None,
+                   limit: int = 200) -> Dict[str, Any]:
+        """One row per file under ``prefix`` (its newest version, how many
+        versions, whether one is complete), folders first when ``delimiter``
+        splits the names, ``limit`` entries per page from ``after`` (the
+        ``next`` of the page before)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT name, COUNT(*) AS versions, MAX(version) AS latest, "
+                "MAX(CASE WHEN state = ? THEN version END) AS latest_complete "
+                "FROM objects WHERE bucket = ? AND substr(name, 1, ?) = ? GROUP BY name ORDER BY name",
+                (COMPLETE, bucket, len(prefix), prefix),
+            ).fetchall()
+        entries: List[Tuple[str, Dict[str, Any]]] = []
+        folders: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            rest = row["name"][len(prefix):]
+            cut = rest.find(delimiter) if delimiter else -1
+            if cut >= 0:
+                folder = prefix + rest[:cut + 1]
+                entry = folders.get(folder)
+                if entry is None:
+                    entry = folders[folder] = {"kind": "folder", "name": folder, "files": 0}
+                    entries.append((folder, entry))
+                entry["files"] += 1
+            else:
+                entries.append((row["name"], {"kind": "file", "name": row["name"], "versions": row["versions"],
+                                              "latest": row["latest"], "latest_complete": row["latest_complete"]}))
+        # Folders first, each group by name. A folder's name ends with the
+        # delimiter (a file's never does at this level), so ``after`` alone
+        # says which group it was in.
+        def order(name: str) -> Tuple[bool, str]:
+            return (not (delimiter and name.endswith(delimiter)), name)
+
+        entries.sort(key=lambda e: order(e[0]))
+        start = 0
+        if after is not None:
+            start = next((i for i, e in enumerate(entries) if order(e[0]) > order(after)), len(entries))
+        page = entries[start:start + limit]
+        files = []
+        for _, entry in page:
+            if entry["kind"] == "file":
+                newest = self.get_object(bucket, entry["name"], entry["latest"]).unwrap()
+                entry.update(newest.to_dict())
+                entry["version"] = newest.version
+            files.append(entry)
+        more = start + limit < len(entries)
+        return {"entries": files, "next": page[-1][0] if more and page else None}
+
+    def all_bucket_sizes(self) -> Dict[str, int]:
+        """{bucket key: bytes used} for every bucket (hourly, for billing)."""
+        with self._lock:
+            names = [r[0] for r in self._conn.execute("SELECT name FROM buckets").fetchall()]
+        return {name: self.bucket_usage(name) for name in names}
 
     # ── objects ─────────────────────────────────────────────────────────────
     def next_version(self, bucket: str, name: str) -> int:

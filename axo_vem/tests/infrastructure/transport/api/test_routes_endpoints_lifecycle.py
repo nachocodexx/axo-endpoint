@@ -73,3 +73,66 @@ def test_restart_and_unknown_endpoints(world):
     assert client.post("/endpoints/ep-1/restart").json()["lifecycle"] == "starting"
     assert client.post("/endpoints/nope/restart").status_code == 404
     assert client.delete("/endpoints/nope").status_code == 404
+
+
+@pytest.fixture
+def forget_world(collections, activity_repository):
+    """The same world, plus the event log and read collections, with ep-1 removed and ep-2 running."""
+    clock = Clock()
+    log = _Log(clock)
+    settings = VeSettingsService("ve", PlanLimits(max_endpoints=3), log)
+    fleet = FleetService("ve", log, now_fn=clock)
+    ops = FakeOps(clock)
+    reconciler = Reconciler(settings, fleet, ops, JobTracker(now_fn=clock), now_fn=clock)
+    app = create_app(
+        collections=collections, activity_repository=activity_repository,
+        current_user_dependency=build_service_token_dependency(SERVICE_TOKEN),
+        ve_settings_service=settings, reconciler=reconciler, fleet=fleet,
+    )
+    client = TestClient(app, headers=CP_HEADERS)
+    settings.change({"target_endpoints": 2})
+    reconciler.tick()
+    clock.advance(1)
+    ops.report_in("ep-1", "ep-2")
+    reconciler.tick()
+    client.delete("/endpoints/ep-1")
+    reconciler.tick()
+    assert client.get("/endpoints/ep-1").json()["lifecycle"] == "removed"
+    return client, log, collections
+
+
+def _listed(client):
+    return {e["endpoint_id"] for e in client.get("/endpoints", params={"include_removed": "true"}).json()}
+
+
+def test_forgetting_a_removed_endpoint_drops_it_from_the_fleet_for_good(forget_world):
+    client, log, _ = forget_world
+    assert client.delete("/endpoints/ep-2/purge").status_code == 409     # still running
+    assert client.delete("/endpoints/ep-1/purge").status_code == 200
+    assert _listed(client) == {"ep-2"}
+    # Rebuilt from the VEM's log (a restart): still gone.
+    rebuilt = FleetService("ve", log)
+    rebuilt.load(log)
+    assert [e.endpoint_id for e in rebuilt.all()] == ["ep-2"]
+
+
+def test_purging_a_reported_endpoint_also_forgets_it(forget_world):
+    client, _, db = forget_world
+    db.endpoints.insert_one({"_id": "ep-1", "endpoint_id": "ep-1", "status": "stopped"})
+    assert client.delete("/endpoints/ep-1/purge").status_code == 200
+    assert _listed(client) == {"ep-2"}
+    assert db.endpoints.find_one({"_id": "ep-1"}) is None
+
+
+def test_a_forgotten_endpoint_never_comes_back_but_its_history_stays(forget_world, activity_repository):
+    client, _, db = forget_world
+    db.endpoints.insert_one({"_id": "ep-1", "endpoint_id": "ep-1", "status": "stopped"})
+    activity_repository.record("EndpointStopped", {"event_id": "e1", "created_at": "2026-01-01T00:00:00+00:00",
+                                                   "endpoint_id": "ep-1"})
+    assert client.delete("/endpoints/ep-1/purge").status_code == 200
+    # A projector rebuild replays its EndpointStarted / Stopped: the doc is back, the endpoint isn't.
+    db.endpoints.insert_one({"_id": "ep-1", "endpoint_id": "ep-1", "status": "stopped"})
+    assert _listed(client) == {"ep-2"}
+    assert client.get("/endpoints/ep-1").status_code == 404
+    # Who started / removed it stays in the VE's history (retention deletes it later).
+    assert [e["event_id"] for e in client.get("/endpoints/ep-1/history").json()] == ["e1"]

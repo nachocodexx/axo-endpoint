@@ -47,6 +47,9 @@ class InvocationContext:
     # Buckets this job's choreography node is connected to (FN -> bucket
     # edges): the function may write its own objects there via dataio.
     output_buckets: List[str] = field(default_factory=list)
+    # What started this call in a choreography (the run, the previous
+    # steps' params and outputs, the bucket file); None for a direct call.
+    event: Any = None
 
     def warn(self, message: str) -> None:
         """Records a warning that travels back with this job's result."""
@@ -56,6 +59,7 @@ class InvocationContext:
 # Travels inside the params so every transport (pipe, container, JOB_FORWARD)
 # carries it unchanged; the worker takes it out before calling the function.
 OUTPUT_BUCKETS_PARAM = "__axo_output_buckets__"
+EVENT_PARAM = "__axo_event__"
 
 
 def split_output_buckets(params: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
@@ -67,10 +71,18 @@ def split_output_buckets(params: Dict[str, Any]) -> Tuple[Dict[str, Any], List[s
     return rest, [str(b) for b in buckets] if isinstance(buckets, list) else []
 
 
+def split_event(params: Dict[str, Any]) -> Tuple[Dict[str, Any], Any]:
+    """(params without the reserved key, the choreography event or None)."""
+    if not isinstance(params, dict) or EVENT_PARAM not in params:
+        return params, None
+    return {k: v for k, v in params.items() if k != EVENT_PARAM}, params[EVENT_PARAM]
+
+
 def build_invocation(job_id: str, scratch_dir: str, params: Dict[str, Any]) -> Tuple[InvocationContext, Dict[str, Any]]:
     """The ctx and the params a function is actually called with."""
     params, buckets = split_output_buckets(params)
-    return InvocationContext(job_id=job_id, scratch_dir=scratch_dir, output_buckets=buckets), params
+    params, event = split_event(params)
+    return InvocationContext(job_id=job_id, scratch_dir=scratch_dir, output_buckets=buckets, event=event), params
 
 
 class FunctionRuntime(ABC):

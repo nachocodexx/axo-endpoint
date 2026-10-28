@@ -17,6 +17,11 @@ class HistoryLog(ABC):
     @abstractmethod
     def append(self, stream: str, event_type: str, data: Dict[str, Any]) -> None: ...
 
+    @abstractmethod
+    def read(self, stream: str, limit: int = 100) -> List[Dict[str, Any]]:
+        """A stream's newest ``limit`` events, newest first: ``{type, data}``
+        ([] when the stream doesn't exist)."""
+
 
 class InMemoryHistory(HistoryLog):
     def __init__(self) -> None:
@@ -24,6 +29,10 @@ class InMemoryHistory(HistoryLog):
 
     def append(self, stream: str, event_type: str, data: Dict[str, Any]) -> None:
         self.events.append({"stream": stream, "type": event_type, "data": dict(data)})
+
+    def read(self, stream: str, limit: int = 100) -> List[Dict[str, Any]]:
+        found = [{"type": e["type"], "data": e["data"]} for e in self.events if e["stream"] == stream]
+        return list(reversed(found))[:limit]
 
     def of_type(self, event_type: str) -> List[Dict[str, Any]]:
         return [e["data"] for e in self.events if e["type"] == event_type]
@@ -67,13 +76,15 @@ class StackDriver(ABC):
     to repeat (creating what exists / removing what's gone is a no-op)."""
 
     @abstractmethod
-    def ensure_network(self, name: str, labels: Dict[str, str]) -> None: ...
+    def ensure_network(self, name: str, labels: Dict[str, str]) -> bool:
+        """True if it had to be created."""
 
     @abstractmethod
     def remove_network(self, name: str) -> None: ...
 
     @abstractmethod
-    def connect(self, network: str, container: str) -> None: ...
+    def connect(self, network: str, container: str) -> bool:
+        """True if the container had to be attached."""
 
     @abstractmethod
     def disconnect(self, network: str, container: str) -> None: ...
@@ -81,6 +92,11 @@ class StackDriver(ABC):
     @abstractmethod
     def state(self, name: str) -> Optional[str]:
         """None = no such container."""
+
+    @abstractmethod
+    def image_outdated(self, name: str, image: str) -> bool:
+        """True if the container runs an older build than ``image`` is now
+        (e.g. after ``deploy.sh build``). False when either is unknown."""
 
     @abstractmethod
     def run(self, spec: ContainerRun) -> None: ...
@@ -126,6 +142,12 @@ class VemGateway(ABC):
 
     @abstractmethod
     def set_limits(self, ve_id: str, limits: Dict[str, Any], by: str) -> None: ...
+
+    @abstractmethod
+    def repair(self, ve_id: str, by: str, steps: List[Dict[str, Any]], automatic: bool) -> Dict[str, Any]:
+        """POST /ve/repair: failed endpoints tried again now, the CP's checks
+        recorded in the VE's history. Raises UnavailableError if the VEM
+        can't be reached."""
 
     @abstractmethod
     def endpoint_ids(self, ve_id: str) -> Dict[str, str]:
@@ -248,6 +270,10 @@ class StorageGateway(ABC):
 
     @abstractmethod
     def usage_bytes(self, full_name: str) -> int: ...
+
+    @abstractmethod
+    def bucket_stats(self, keys: List[str]) -> Dict[str, Dict[str, Any]]:
+        """{key: {used_bytes, files, last_change}} of many buckets in one call."""
 
     @abstractmethod
     def put_object(self, bucket_key: str, name: str, data: bytes) -> None:

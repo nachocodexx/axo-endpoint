@@ -13,6 +13,8 @@ class Component:
     STORAGE      = "storage"
     FRONT_DOOR   = "front_door"
     BOOTSTRAP    = "bootstrap"
+    RENTALS      = "rentals"
+    METRICS      = "metrics"
 
 
 class Event:
@@ -48,6 +50,12 @@ class Event:
         REMOVED       = "CLEANUP.REMOVED"
         REMOVE_FAILED = "CLEANUP.REMOVE_FAILED"
         SKIPPED_VE    = "CLEANUP.SKIPPED_VE"
+
+    class Rental:
+        RENEWALS_FAILED = "RENTAL.RENEWALS_FAILED"
+
+    class Metrics:
+        ROLLUP_FAILED = "METRICS.ROLLUP_FAILED"
 
     class Auth:
         UNAUTHORIZED  = "AUTH.UNAUTHORIZED"
